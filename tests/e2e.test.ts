@@ -236,6 +236,26 @@ function assistantMessage(
   }
 }
 
+function toolCallingAssistantMessage(turn: number, text: string): unknown {
+  return {
+    type: 'assistant/message',
+    seq: turn * 2,
+    time: Date.now(),
+    surfaceOp: 'append',
+    data: {
+      turn,
+      step: 1,
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text },
+          { type: 'tool-call', id: 'call-1', name: 'exec_command', arguments: '{}' },
+        ],
+      },
+    },
+  }
+}
+
 function flushDeliveries(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve))
 }
@@ -940,6 +960,65 @@ test('e2e: streamed reasoning and text are throttled into the turn card', async 
   assert.match(encoded, /Final answer/)
   assert.doesNotMatch(encoded, /partial answer/)
   assert.ok(client.updated.length <= 3)
+  await bridge.stop()
+})
+
+test('e2e: streaming and tool-step text stay in execution until a final message arrives', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner'],
+    streamUpdateIntervalMs: 100,
+  })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'inspect then answer'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'assistant/chunk', time: 1_100,
+    data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'I will inspect first.' } },
+  })
+  await waitFor(() => client.updated.length > 0)
+
+  const streaming = client.updated.at(-1)?.card as {
+    body?: { elements?: Array<{ element_id?: string }> }
+  }
+  assert.equal(streaming.body?.elements?.some((element) => element.element_id === 'answer'), false)
+  assert.match(JSON.stringify(streaming.body?.elements?.find((element) => element.element_id === 'execution_panel')), /I will inspect first/)
+
+  host.emit('lark:chat-a', toolCallingAssistantMessage(1, 'I will inspect first.'))
+  await waitFor(() => client.updated.length > 1)
+  const toolStep = client.updated.at(-1)?.card as {
+    body?: { elements?: Array<{ element_id?: string }> }
+  }
+  assert.equal(toolStep.body?.elements?.some((element) => element.element_id === 'answer'), false)
+  assert.match(JSON.stringify(toolStep.body?.elements?.find((element) => element.element_id === 'execution_panel')), /I will inspect first/)
+
+  host.emit('lark:chat-a', assistantMessage(1, 'Inspection complete.'))
+  await waitFor(() => JSON.stringify(client.updated.at(-1)?.card).includes('Inspection complete.'))
+  const final = client.updated.at(-1)?.card as {
+    body?: { elements?: Array<{ element_id?: string; content?: string }> }
+  }
+  assert.match(final.body?.elements?.find((element) => element.element_id === 'answer')?.content ?? '', /Inspection complete/)
+  await bridge.stop()
+})
+
+test('e2e: plain-text fallback sends only final assistant messages', async () => {
+  const client = createClient()
+  delete client.sendCard
+  delete client.updateCard
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'inspect then answer'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', toolCallingAssistantMessage(1, 'I will inspect first.'))
+  host.emit('lark:chat-a', assistantMessage(1, 'Inspection complete.'))
+  await flushDeliveries()
+
+  assert.deepEqual(client.sent, [{ chatId: 'chat-a', text: 'Inspection complete.' }])
   await bridge.stop()
 })
 

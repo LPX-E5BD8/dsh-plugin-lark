@@ -144,13 +144,23 @@ function boundedText(value: string, limit: number): string {
   return runes.length <= limit ? value : runes.slice(0, limit).join('')
 }
 
+function tailBoundedText(value: string, limit: number): string {
+  const runes = [...value]
+  return runes.length <= limit ? value : runes.slice(-limit).join('')
+}
+
 function appendAnswer(current: string | undefined, next: string): string {
   const combined = current === undefined || current === '' ? next : `${current}\n\n${next}`
   return boundedText(combined, CARD_LIMITS.maxAnswerRunes)
 }
 
 function appendDelta(current: string | undefined, delta: string, limit: number): string {
-  return boundedText(`${current ?? ''}${delta}`, limit)
+  return tailBoundedText(`${current ?? ''}${delta}`, limit)
+}
+
+function appendProcessText(current: string | undefined, next: string): string {
+  const combined = current === undefined || current === '' ? next : `${current}\n\n${next}`
+  return tailBoundedText(combined, CARD_LIMITS.maxReasoningRunes)
 }
 
 function compactJson(value: string): string {
@@ -984,13 +994,17 @@ export class LarkBridge {
     }
     state.usage = mergedUsage(state.usage, event.data.usage)
     state.updatedAt = eventTime(event.time)
-    if (text !== undefined) state.answer = appendAnswer(state.answer, text)
+    const callsTool = event.data.message.content.some((block) => block.type === 'tool-call')
+    if (text !== undefined) {
+      if (callsTool) state.reasoning = appendProcessText(state.reasoning, text)
+      else state.answer = appendAnswer(state.answer, text)
+    }
     state.streamingAnswer = undefined
     if (this.canRenderTurnCards()) {
       if (state.deliveryDisabled !== true) this.queueTurnCard(state)
       return
     }
-    if (text !== undefined) this.trackDelivery(this.safeSend(state.route.chatId, text))
+    if (text !== undefined && !callsTool) this.trackDelivery(this.safeSend(state.route.chatId, text))
   }
 
   private turnState(sessionId: string, turn: number): TurnState | undefined {
@@ -1009,7 +1023,7 @@ export class LarkBridge {
     if (state === undefined) return
     const chunk = event.data.chunk
     if (chunk.type === 'text-delta') {
-      state.streamingAnswer = appendDelta(state.streamingAnswer, chunk.text, CARD_LIMITS.maxAnswerRunes)
+      state.streamingAnswer = appendDelta(state.streamingAnswer, chunk.text, CARD_LIMITS.maxReasoningRunes)
     } else if (chunk.type === 'reasoning-delta') {
       state.reasoning = appendDelta(state.reasoning, chunk.text, CARD_LIMITS.maxReasoningRunes)
     } else {
@@ -1126,13 +1140,10 @@ export class LarkBridge {
   }
 
   private turnCard(state: TurnState): TurnCard {
-    const answer = state.streamingAnswer === undefined
-      ? state.answer
-      : appendAnswer(state.answer, state.streamingAnswer)
     return {
       locale: this.locale,
       status: state.status,
-      answer,
+      answer: state.answer,
       error: state.error,
       tools: state.tools,
       startedAt: state.startedAt,
@@ -1141,7 +1152,9 @@ export class LarkBridge {
       contextWindow: state.contextWindow,
       loadingImageKey: this.client.loadingImageKey,
       stopRequestId: state.stopRequestId,
-      reasoning: state.reasoning,
+      reasoning: state.streamingAnswer === undefined
+        ? state.reasoning
+        : appendProcessText(state.reasoning, state.streamingAnswer),
       todos: state.todos,
     }
   }
