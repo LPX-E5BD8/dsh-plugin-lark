@@ -78,6 +78,10 @@ Every event in the installed DSH session catalog has an explicit render, consume
 
 The first release accepts text messages only. Group messages require a bot mention or slash command. Attachments, an administration UI, and a generic card framework are intentionally out of scope.
 
+## Roadmap
+
+See [ROADMAP.md](./ROADMAP.md) for planned reliability, conversation, and release work.
+
 ## Development
 
 ```sh
@@ -90,4 +94,4 @@ npm run test:pack
 
 ## License
 
-MIT
+Apache-2.0
