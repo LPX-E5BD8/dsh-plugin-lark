@@ -38,6 +38,7 @@ function createClient(): TestClient {
 
 interface TestPersistence {
   readonly sessions: Set<string>
+  contextWindow?: number
   resumeError?: Error
   flushError?: Error
   flushWait?: Promise<void>
@@ -48,6 +49,7 @@ function createHost(persistence?: TestPersistence) {
   let createCount = 0
   let resumeCount = 0
   let flushCount = 0
+  let cancelCount = 0
   const createdSessionIds: string[] = []
   const resumedSessionIds: string[] = []
   const disposedSessionIds: string[] = []
@@ -98,7 +100,14 @@ function createHost(persistence?: TestPersistence) {
             }
           },
           agent: {
-            session: { id: sessionId },
+            session: {
+              id: sessionId,
+              requestContext: () => persistence?.contextWindow === undefined
+                ? undefined
+                : { provider: 'provider', model: 'model', contextWindow: persistence.contextWindow },
+            },
+            status: 'running',
+            cancel() { cancelCount += 1 },
             followup() { persistence?.sessions.add(sessionId) },
           },
         }
@@ -115,7 +124,14 @@ function createHost(persistence?: TestPersistence) {
           sessionId,
           async dispose() { disposedSessionIds.push(sessionId) },
           agent: {
-            session: { id: sessionId },
+            session: {
+              id: sessionId,
+              requestContext: () => persistence.contextWindow === undefined
+                ? undefined
+                : { provider: 'provider', model: 'model', contextWindow: persistence.contextWindow },
+            },
+            status: 'running',
+            cancel() { cancelCount += 1 },
             followup() { persistence.sessions.add(sessionId) },
           },
         }
@@ -142,6 +158,7 @@ function createHost(persistence?: TestPersistence) {
     createCount() { return createCount },
     resumeCount() { return resumeCount },
     flushCount() { return flushCount },
+    cancelCount() { return cancelCount },
     createdSessionIds() { return createdSessionIds },
     resumedSessionIds() { return resumedSessionIds },
     disposedSessionIds() { return disposedSessionIds },
@@ -177,7 +194,34 @@ function requestId(card: unknown): string {
   return buttons?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
 }
 
-function assistantMessage(turn: number, text: string): unknown {
+function stopRequestId(card: unknown): string {
+  const payload = card as {
+    body?: {
+      elements?: Array<{
+        element_id?: string
+        columns?: Array<{
+          elements?: Array<{
+            behaviors?: Array<{ value?: { request_id?: string } }>
+          }>
+        }>
+      }>
+    }
+  }
+  const actions = payload.body?.elements?.find((element) => element.element_id === 'turn_stop')
+  return actions?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
+}
+
+function assistantMessage(
+  turn: number,
+  text: string,
+  usage?: {
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens?: number
+    cacheWriteTokens?: number
+    reasoningTokens?: number
+  },
+): unknown {
   return {
     type: 'assistant/message',
     seq: turn * 2,
@@ -187,6 +231,7 @@ function assistantMessage(turn: number, text: string): unknown {
       turn,
       step: 1,
       message: { role: 'assistant', content: [{ type: 'text', text }] },
+      ...(usage === undefined ? {} : { usage }),
     },
   }
 }
@@ -276,6 +321,24 @@ test('e2e: a persisted chat session resumes after bridge restart', async () => {
   assert.equal(secondHost.createCount(), 0)
   assert.deepEqual(secondHost.resumedSessionIds(), ['lark:chat-a'])
   await secondBridge.stop()
+})
+
+test('e2e: a resumed session restores its advertised context window', async () => {
+  const persistence: TestPersistence = {
+    sessions: new Set(['lark:chat-a']),
+    contextWindow: 1_000_000,
+  }
+  const client = createClient()
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'continue'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  await flushDeliveries()
+
+  assert.match(JSON.stringify(client.cards.at(-1)?.card), /Ctx 1M/)
+  await bridge.stop()
 })
 
 test('e2e: /new remains active across restart before the next message', async () => {
@@ -528,6 +591,48 @@ test('e2e: a turn updates one execution card across the tool lifecycle', async (
   const encoded = JSON.stringify(payload)
   assert.match(encoded, /exec.*command/)
   assert.match(encoded, /Repository inspection complete/)
+  await bridge.stop()
+})
+
+test('e2e: stop cancels only the originating active turn', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner', 'other'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run until stopped'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  await flushDeliveries()
+  const requestId = stopRequestId(client.cards[0]?.card)
+  assert.notEqual(requestId, '')
+
+  const wrong = await client.cardHandler?.({
+    openId: 'other', chatId: 'chat-a', messageId: 'card-1',
+    value: { action: 'turn_stop', request_id: requestId },
+  })
+  assert.equal(wrong?.toast.type, 'error')
+  assert.equal(host.cancelCount(), 0)
+
+  const stopped = await client.cardHandler?.({
+    openId: 'owner', chatId: 'chat-a', messageId: 'card-1',
+    value: { action: 'turn_stop', request_id: requestId },
+  })
+  assert.equal(stopped?.toast.type, 'success')
+  assert.equal(host.cancelCount(), 1)
+
+  const duplicate = await client.cardHandler?.({
+    openId: 'owner', chatId: 'chat-a', messageId: 'card-1',
+    value: { action: 'turn_stop', request_id: requestId },
+  })
+  assert.equal(duplicate?.toast.type, 'info')
+  assert.equal(host.cancelCount(), 1)
+
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_500,
+    data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } },
+  })
+  await flushDeliveries()
+  assert.equal(stopRequestId(client.updated.at(-1)?.card), '')
   await bridge.stop()
 })
 
@@ -838,6 +943,78 @@ test('e2e: streamed reasoning and text are throttled into the turn card', async 
   await bridge.stop()
 })
 
+test('e2e: footer separates cache usage and reports context occupancy', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'show usage'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'request/context', seq: 2, time: 1_100,
+    data: { provider: 'provider', model: 'model', contextWindow: 128_000 },
+  })
+  host.emit('lark:chat-a', assistantMessage(1, 'Done.', {
+    inputTokens: 3_000,
+    cacheReadTokens: 100_000,
+    cacheWriteTokens: 3_000,
+    outputTokens: 3_600,
+    reasoningTokens: 800,
+  }))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 2_000,
+    data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await flushDeliveries()
+
+  const encoded = JSON.stringify(client.updated.at(-1)?.card)
+  assert.match(encoded, /完成 · 1\.0s · Ctx 109\.6K\/128K \(85\.6%\) · In 3K/)
+  assert.match(encoded, /In 3K/)
+  assert.match(encoded, /Hit 100K \(94\.3%\)/)
+  assert.match(encoded, /Wr 3K/)
+  assert.match(encoded, /Out 3\.6K/)
+  assert.match(encoded, /Rsn 800/)
+  await bridge.stop()
+})
+
+test('e2e: a model switch never pairs previous usage with the new context window', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'switch models'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'request/context', time: 1_100,
+    data: { provider: 'provider-a', model: 'model-a', contextWindow: 128_000 },
+  })
+  host.emit('lark:chat-a', assistantMessage(1, '', {
+    inputTokens: 3_000,
+    cacheReadTokens: 100_000,
+    outputTokens: 3_600,
+  }))
+  host.emit('lark:chat-a', {
+    type: 'request/context', time: 1_300,
+    data: { provider: 'provider-b', model: 'model-b', contextWindow: 256_000 },
+  })
+  await flushDeliveries()
+
+  const betweenCalls = JSON.stringify(client.updated.at(-1)?.card)
+  assert.match(betweenCalls, /Ctx 106\.6K\/128K \(83\.3%\)/)
+  assert.doesNotMatch(betweenCalls, /106\.6K\/256K/)
+
+  host.emit('lark:chat-a', assistantMessage(1, 'Done.', {
+    inputTokens: 1_000,
+    cacheReadTokens: 200_000,
+    outputTokens: 1_000,
+  }))
+  await flushDeliveries()
+  assert.match(JSON.stringify(client.updated.at(-1)?.card), /Ctx 202K\/256K \(78\.9%\)/)
+  await bridge.stop()
+})
+
 test('e2e: todo and extended lifecycle events share the execution card', async () => {
   const client = createClient()
   const host = createHost()
@@ -932,12 +1109,13 @@ test('e2e: todo and extended lifecycle events share the execution card', async (
 
   const encoded = JSON.stringify(client.updated.at(-1)?.card)
   for (const expected of [
-    'Inspect repository', 'Run checks', '模型重试', 'read.*file', '命令 /status',
+    'Inspect repository', 'Run checks', '2 个更早的工具调用已折叠', '命令 /status',
     '压缩上下文', 'Ship the bridge', 'Hook PreToolUse', '工作流 release', '子任务 Review',
     'Workflow complete',
   ]) {
     assert.match(encoded, new RegExp(expected))
   }
+  assert.doesNotMatch(encoded, /模型重试|read.*file/)
   await bridge.stop()
 })
 

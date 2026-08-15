@@ -61,7 +61,13 @@ function requestIdOf(card: unknown): string {
   return buttons?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
 }
 
-function fakeCtx(followups: unknown[]) {
+function fakeCtx(
+  followups: unknown[],
+  commands?: {
+    list(agent: unknown): ReadonlyArray<{ name: string; description: string; input?: { hint: string } }>
+    execute(agent: unknown, line: string, signal: AbortSignal): Promise<unknown>
+  },
+) {
   let creates = 0
   const sessionListeners: Array<(s: { id: string }, e: unknown) => void> = []
   const approvalListeners: Array<(
@@ -79,6 +85,7 @@ function fakeCtx(followups: unknown[]) {
     },
     get(name: string) {
       if (name === 'approval') return { present: true }
+      if (name === 'commands') return commands
       return undefined
     },
     approval: { present: true },
@@ -90,10 +97,14 @@ function fakeCtx(followups: unknown[]) {
           sessionId: id,
           dispose: async () => {},
           agent: {
+            session: { id, requestContext: () => undefined },
             followup(msg: unknown) { followups.push(msg) },
           },
         }
       },
+    },
+    sessions: {
+      async flush() { return true },
     },
     emit(sessionId: string, event: unknown) {
       for (const fn of sessionListeners) fn({ id: sessionId }, event)
@@ -158,6 +169,38 @@ test('SDK startup failures reject client startup', async () => {
     })
     await assert.rejects(client.start(), /startup unavailable/)
   } finally {
+    prototype.request = request
+    Lark.WSClient.prototype.start = start
+  }
+})
+
+test('SDK client can reply while the optional loading image is still uploading', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  const start = Lark.WSClient.prototype.start
+  const loading = Promise.withResolvers<void>()
+  prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  Lark.WSClient.prototype.start = async function startReady() {
+    const client = this as unknown as { onReady?: () => void }
+    client.onReady?.()
+  }
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const internals = client as unknown as {
+    prepareLoadingImage: () => Promise<void>
+    sendImpl?: unknown
+  }
+  internals.prepareLoadingImage = () => loading.promise
+  try {
+    const starting = client.start()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(typeof internals.sendImpl, 'function')
+    loading.resolve()
+    await starting
+  } finally {
+    loading.resolve()
+    await client.stop()
     prototype.request = request
     Lark.WSClient.prototype.start = start
   }
@@ -383,6 +426,83 @@ test('/help does not followup', async () => {
   }))
   assert.equal(followups.length, 0)
   assert.ok(client.sent.some((s) => s.includes('/new')))
+  await bridge.stop()
+})
+
+test('registered DSH slash commands appear in help and execute natively', async () => {
+  const client = fakeClient()
+  const followups: unknown[] = []
+  const executed: string[] = []
+  const ctx = fakeCtx(followups, {
+    list: () => [
+      {
+        name: 'feedback',
+        description: 'record feedback about this session',
+        input: { hint: '<text>' },
+      },
+      {
+        name: 'goal',
+        description: 'set or view the goal for a long-running task',
+        input: { hint: '[<objective>|clear]' },
+      },
+    ],
+    async execute(_agent, line) {
+      executed.push(line)
+      if (line === '/broken') return { commandId: 'command-2', result: { kind: 'error' } }
+      return { commandId: 'command-1', result: { kind: 'success', text: 'Goal updated.' } }
+    },
+  })
+  const bridge = new LarkBridge(ctx as never, { client, allowAllUsers: true })
+  bridge.start()
+
+  await bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/help', messageId: 'help' }))
+  assert.match(client.sent.at(-1) ?? '', /\/goal \[<objective>\|clear\] — 查看或设置长任务目标/)
+  assert.doesNotMatch(client.sent.at(-1) ?? '', /feedback/)
+
+  await bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/goal edit ship it', messageId: 'goal' }))
+  assert.deepEqual(executed, ['/goal edit ship it'])
+  assert.equal(client.sent.at(-1), 'Goal updated.')
+
+  await bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/feedback private', messageId: 'feedback' }))
+  assert.deepEqual(executed, ['/goal edit ship it'])
+  assert.match(client.sent.at(-1) ?? '', /未知命令 \/feedback/)
+
+  await bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/broken', messageId: 'broken' }))
+  assert.equal(client.sent.at(-1), '命令执行失败，请重试。')
+  assert.equal(followups.length, 0)
+  await bridge.stop()
+})
+
+test('runtime slash commands block only their own concurrent session reset', async () => {
+  const client = fakeClient()
+  const followups: unknown[] = []
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const ctx = fakeCtx(followups, {
+    list: () => [{ name: 'compact', description: 'compact history' }],
+    async execute() {
+      entered.resolve()
+      await release.promise
+      return { commandId: 'command-1', result: { kind: 'success', text: 'Compacted.' } }
+    },
+  })
+  const bridge = new LarkBridge(ctx as never, { client, allowAllUsers: true })
+  bridge.start()
+
+  const command = bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/compact', messageId: 'compact' }))
+  await entered.promise
+  const otherChat = bridge.handleInbound(inbound({ chatId: 'oc_2', text: 'hello', messageId: 'hello' }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(followups.length, 1)
+  await otherChat
+
+  const reset = bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/new', messageId: 'new' }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(ctx.createCount(), 2)
+
+  release.resolve()
+  await Promise.all([command, reset])
+  assert.equal(ctx.createCount(), 3)
   await bridge.stop()
 })
 

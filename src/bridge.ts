@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
-import type { AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
-import { CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCard } from './cards.ts'
+import { CARD_ACTIONS, CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCard } from './cards.ts'
 import type { ToolCardItem, TurnCard, TurnCardStatus, TurnCardTodo, TurnCardUsage } from './cards.ts'
 import { DEFAULT_CONFIG, MIN_STREAM_UPDATE_INTERVAL_MS } from './config.ts'
 import { projectActivity, sessionEventPolicy } from './events.ts'
@@ -43,6 +43,19 @@ interface SessionPersistenceLike {
   list(): Promise<ReadonlyArray<{ id: ReturnType<typeof SessionId> }>>
 }
 
+interface CommandRuntimeLike {
+  list(agent: Agent): ReadonlyArray<{
+    readonly name: string
+    readonly description: string
+    readonly input?: { readonly hint: string }
+  }>
+  execute(
+    agent: Agent,
+    line: string,
+    signal: AbortSignal,
+  ): Promise<{ readonly result: { readonly kind: 'success' | 'error'; readonly text?: string } } | undefined>
+}
+
 interface MessageRoute {
   readonly chatId: string
   readonly openId: string
@@ -63,6 +76,8 @@ interface TurnState {
   error?: string
   updatedAt: number
   usage?: TurnCardUsage
+  contextWindow?: number
+  readonly stopRequestId: string
   reasoning?: string
   streamingAnswer?: string
   todos?: TurnCardTodo[]
@@ -84,9 +99,18 @@ interface PendingApproval {
   readonly toolName: string
 }
 
+interface PendingStop {
+  readonly sessionId: string
+  readonly chatId: string
+  readonly openId: string
+  stopping: boolean
+}
+
 const SESSION_RESET_SEPARATOR = ':'
 const RECENT_INBOUND_LIMIT = 1024
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear'])
+const UNSUPPORTED_RUNTIME_COMMANDS = new Set(['feedback', 'export'])
 
 const APPROVAL_DECISION = {
   allowOnce: 'allowed-once',
@@ -109,6 +133,10 @@ function assistantText(event: Extract<SessionEvent, { type: 'assistant/message' 
 
 function eventTime(time: number): number {
   return Number.isSafeInteger(time) && time >= 0 ? time : Date.now()
+}
+
+function validContextWindow(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
 function boundedText(value: string, limit: number): string {
@@ -148,10 +176,15 @@ function contentText(content: readonly ContentBlock[]): string | undefined {
 
 function mergedUsage(current: TurnCardUsage | undefined, usage: TokenUsage | undefined): TurnCardUsage | undefined {
   if (usage === undefined) return current
-  const input = usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+  const cacheReadTokens = usage.cacheReadTokens ?? 0
+  const cacheWriteTokens = usage.cacheWriteTokens ?? 0
   return {
-    inputTokens: (current?.inputTokens ?? 0) + input,
+    inputTokens: (current?.inputTokens ?? 0) + usage.inputTokens,
     outputTokens: (current?.outputTokens ?? 0) + usage.outputTokens,
+    cacheReadTokens: (current?.cacheReadTokens ?? 0) + cacheReadTokens,
+    cacheWriteTokens: (current?.cacheWriteTokens ?? 0) + cacheWriteTokens,
+    reasoningTokens: (current?.reasoningTokens ?? 0) + (usage.reasoningTokens ?? 0),
+    contextTokens: usage.inputTokens + cacheReadTokens + cacheWriteTokens + usage.outputTokens,
   }
 }
 
@@ -262,11 +295,14 @@ export class LarkBridge {
   private readonly queuedRoutes = new Map<string, RouteQueue>()
   private readonly turns = new Map<string, Map<number, TurnState>>()
   private readonly activeRoutes = new Map<string, MessageRoute>()
+  private readonly contextWindows = new Map<string, number>()
   private readonly pending = new Map<string, PendingApproval>()
+  private readonly pendingStops = new Map<string, PendingStop>()
   private readonly deliveryTasks = new Set<Promise<void>>()
   private readonly warnedEventTypes = new Set<string>()
   private readonly inboundTasks = new Map<string, Promise<void>>()
   private readonly completedInboundKeys: string[] = []
+  private readonly sessionOperations = new Map<string, Promise<void>>()
   private sharedSessionId: string | undefined
   private lastSessionGeneration = 0
   private disposeEvents: (() => void) | undefined
@@ -275,6 +311,7 @@ export class LarkBridge {
   private startPromise: Promise<void> | undefined
   private clientStarted = false
   private stopping = false
+  private commandAbort = new AbortController()
   // Resets are rare; use per-session barriers only if contention is measured.
   private resetBarrier: Promise<void> = Promise.resolve()
 
@@ -301,6 +338,7 @@ export class LarkBridge {
     if (this.disposeEvents !== undefined) return this.startPromise ?? Promise.resolve()
     this.stopping = false
     this.clientStarted = false
+    this.commandAbort = new AbortController()
     this.disposeEvents = this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       this.handleSessionEvent(session, event)
     })
@@ -317,6 +355,7 @@ export class LarkBridge {
   async stop(): Promise<void> {
     const failures: unknown[] = []
     this.stopping = true
+    this.commandAbort.abort()
     if (this.disposeEvents !== undefined) {
       this.disposeEvents()
       this.disposeEvents = undefined
@@ -328,6 +367,7 @@ export class LarkBridge {
     this.approvalWaterfallBound = false
     for (const pending of this.pending.values()) pending.resolve(APPROVAL_OUTCOME.cancelled)
     this.pending.clear()
+    this.pendingStops.clear()
     const start = this.startPromise
     this.startPromise = undefined
     if (!this.clientStarted) {
@@ -409,6 +449,7 @@ export class LarkBridge {
       if (action.chatId !== '') await this.safeSend(action.chatId, this.text.denied)
       return actionToast('error', this.text.approvalUnauthorized)
     }
+    if (action.value.action === CARD_ACTIONS.turnStop) return this.handleStopAction(action)
     const requestId = String(action.value.request_id ?? '')
     const decision = String(action.value.decision ?? '')
     const outcome = approvalOutcome(decision)
@@ -429,6 +470,38 @@ export class LarkBridge {
       ? this.text.approvalAllowed
       : this.text.approvalRejected
     return actionToast('success', content)
+  }
+
+  private async handleStopAction(action: LarkCardAction): Promise<LarkCardActionResult> {
+    const requestId = String(action.value.request_id ?? '')
+    if (requestId === '') return actionToast('error', this.text.stopUnavailable)
+    await this.resetBarrier
+    const pending = this.pendingStops.get(requestId)
+    if (pending === undefined) return actionToast('info', this.text.stopExpired)
+    if (pending.chatId !== action.chatId || pending.openId !== action.openId) {
+      this.ctx.logger.warn('[lark] rejected stop from a different chat or user')
+      return actionToast('error', this.text.stopWrongContext)
+    }
+    if (pending.stopping) return actionToast('info', this.text.stopRequested)
+    const handle = this.handles.get(pending.sessionId)
+    if (handle === undefined) {
+      this.pendingStops.delete(requestId)
+      return actionToast('info', this.text.stopExpired)
+    }
+    pending.stopping = true
+    try {
+      const resolved = await handle
+      if (resolved.agent.status !== 'running') {
+        this.pendingStops.delete(requestId)
+        return actionToast('info', this.text.stopExpired)
+      }
+      resolved.agent.cancel({ kind: 'user' })
+      return actionToast('success', this.text.stopRequested)
+    } catch (error) {
+      this.pendingStops.delete(requestId)
+      this.ctx.logger.error('[lark] stop failed: %s', messageOf(error))
+      return actionToast('error', this.text.stopUnavailable)
+    }
   }
 
   private authorized(openId: string): boolean {
@@ -549,20 +622,94 @@ export class LarkBridge {
       case '/start':
       case '/help':
         await this.resetBarrier
-        await this.ensureChat(chatId)
-        await this.safeSend(chatId, this.text.help)
+        await this.safeSend(chatId, this.commandHelp((await this.ensureChat(chatId)).handle.agent))
         break
       case '/new':
       case '/clear':
         await this.scheduleReset(chatId)
         break
       default:
-        await this.safeSend(chatId, this.text.unknownCommand(command))
+        await this.executeRuntimeCommand(chatId, text, command)
     }
   }
 
+  private commandRuntime(): CommandRuntimeLike | undefined {
+    try {
+      const runtime = this.ctx.get('commands') as CommandRuntimeLike | undefined
+      return runtime !== undefined && typeof runtime.list === 'function' && typeof runtime.execute === 'function'
+        ? runtime
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private commandHelp(agent: Agent): string {
+    const runtime = this.commandRuntime()
+    if (runtime === undefined) return this.text.help
+    const commands = runtime.list(agent).filter(({ name }) => (
+      !BRIDGE_COMMANDS.has(name) && !UNSUPPORTED_RUNTIME_COMMANDS.has(name)
+    )).map((descriptor) => {
+      const input = descriptor.input === undefined ? '' : ` ${descriptor.input.hint}`
+      return `/${descriptor.name}${input} — ${this.text.commandDescription(descriptor.name, descriptor.description)}`
+    })
+    return commands.length === 0 ? this.text.help : `${this.text.help}\n${commands.join('\n')}`
+  }
+
+  private executeRuntimeCommand(chatId: string, text: string, command: string): Promise<void> {
+    let operation: Promise<void> = Promise.resolve()
+    const admission = this.resetBarrier.then(async () => {
+      const chat = await this.ensureChat(chatId)
+      operation = this.enqueueSessionOperation(
+        chat.sessionId,
+        () => this.executeRuntimeCommandNow(chat, text, command),
+      )
+    })
+    this.resetBarrier = admission.catch(() => {})
+    return admission.then(() => operation)
+  }
+
+  private async executeRuntimeCommandNow(chat: ChatSession, text: string, command: string): Promise<void> {
+    if (UNSUPPORTED_RUNTIME_COMMANDS.has(command.slice(1).toLowerCase())) {
+      await this.safeSend(chat.chatId, this.text.unknownCommand(command))
+      return
+    }
+    const runtime = this.commandRuntime()
+    if (runtime === undefined) {
+      await this.safeSend(chat.chatId, this.text.unknownCommand(command))
+      return
+    }
+    try {
+      const execution = await runtime.execute(chat.handle.agent, text, this.commandAbort.signal)
+      if (execution === undefined) {
+        await this.safeSend(chat.chatId, this.text.unknownCommand(command))
+      } else if (execution.result.text !== undefined && execution.result.text !== '') {
+        await this.safeSend(chat.chatId, execution.result.text)
+      } else if (execution.result.kind === 'error') {
+        await this.safeSend(chat.chatId, this.text.commandFailed)
+      }
+    } catch (error) {
+      this.ctx.logger.error('[lark] command failed: %s', messageOf(error))
+      await this.safeSend(chat.chatId, this.text.commandFailed)
+    }
+  }
+
+  private enqueueSessionOperation<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+    const operation = (this.sessionOperations.get(sessionId) ?? Promise.resolve()).then(task)
+    const tail = operation.then(() => {}, () => {})
+    this.sessionOperations.set(sessionId, tail)
+    void tail.then(() => {
+      if (this.sessionOperations.get(sessionId) === tail) this.sessionOperations.delete(sessionId)
+    })
+    return operation
+  }
+
   private scheduleReset(chatId: string): Promise<void> {
-    const reset = this.resetBarrier.then(() => this.resetChat(chatId))
+    const reset = this.resetBarrier.then(async () => {
+      const chat = await this.ensureChat(chatId)
+      await this.sessionOperations.get(chat.sessionId)
+      await this.resetChat(chatId)
+    })
     this.resetBarrier = reset.catch(() => {})
     return reset
   }
@@ -657,7 +804,11 @@ export class LarkBridge {
         })
     this.handles.set(key, opened)
     try {
-      return await opened
+      const handle = await opened
+      const contextWindow = validContextWindow(handle.agent.session.requestContext()?.contextWindow)
+      if (contextWindow === undefined) this.contextWindows.delete(key)
+      else this.contextWindows.set(key, contextWindow)
+      return handle
     } catch (error) {
       if (this.handles.get(key) === opened) this.handles.delete(key)
       throw error
@@ -690,6 +841,9 @@ export class LarkBridge {
         return
       case 'todo/write':
         this.handleTodoWrite(session.id, event)
+        return
+      case 'request/context':
+        this.handleRequestContext(session.id, event)
         return
       default:
         this.handleCatalogEvent(session.id, event as unknown as CatalogSessionEvent)
@@ -725,6 +879,7 @@ export class LarkBridge {
     const route = this.dequeueRoute(sessionId)
     if (route === undefined) return
     const startedAt = eventTime(time)
+    const stopRequestId = randomUUID()
     const state: TurnState = {
       route,
       tools: [],
@@ -732,11 +887,21 @@ export class LarkBridge {
       startedAt,
       updatedAt: startedAt,
       status: 'running',
+      stopRequestId,
       delivery: Promise.resolve(),
+      ...(this.contextWindows.get(sessionId) === undefined
+        ? {}
+        : { contextWindow: this.contextWindows.get(sessionId) }),
     }
     const turns = this.turns.get(sessionId) ?? new Map<number, TurnState>()
     turns.set(turn, state)
     this.turns.set(sessionId, turns)
+    this.pendingStops.set(stopRequestId, {
+      sessionId,
+      chatId: route.chatId,
+      openId: route.openId,
+      stopping: false,
+    })
     this.activeRoutes.set(sessionId, route)
     this.queueTurnCard(state)
   }
@@ -749,6 +914,7 @@ export class LarkBridge {
     this.clearStreamTimer(state)
     state.status = terminal.status
     state.error = terminal.error
+    this.pendingStops.delete(state.stopRequestId)
     state.updatedAt = eventTime(event.time)
     this.queueTurnCard(state)
     this.fallbackFailedCard(state)
@@ -763,13 +929,17 @@ export class LarkBridge {
     const state = this.turnState(sessionId, event.data.turn)
     if (state === undefined) return
     const id = String(event.data.callId)
+    const index = state.toolIndexes.get(id)
+    const previous = index === undefined ? undefined : state.tools[index]
+    const time = eventTime(event.time)
     const tool: ToolCardItem = {
       id,
       name: event.data.name,
       detail: compactJson(event.data.arguments),
       status: 'running',
+      startedAt: previous?.startedAt ?? time,
+      updatedAt: time,
     }
-    const index = state.toolIndexes.get(id)
     if (index === undefined) {
       state.toolIndexes.set(id, state.tools.length)
       state.tools.push(tool)
@@ -793,6 +963,7 @@ export class LarkBridge {
       ...previous,
       detail: failed ? (result ?? previous?.detail) : previous?.detail,
       status: failed ? 'failed' : 'completed',
+      updatedAt: eventTime(event.time),
     }
     state.updatedAt = eventTime(event.time)
     this.queueTurnCard(state)
@@ -806,6 +977,11 @@ export class LarkBridge {
     if (state === undefined) return
     this.clearStreamTimer(state)
     const text = assistantText(event)
+    if (event.data.usage !== undefined) {
+      const contextWindow = this.contextWindows.get(sessionId)
+      if (contextWindow === undefined) delete state.contextWindow
+      else state.contextWindow = contextWindow
+    }
     state.usage = mergedUsage(state.usage, event.data.usage)
     state.updatedAt = eventTime(event.time)
     if (text !== undefined) state.answer = appendAnswer(state.answer, text)
@@ -878,6 +1054,24 @@ export class LarkBridge {
     this.queueTurnCard(state)
   }
 
+  private handleRequestContext(
+    sessionId: string,
+    event: Extract<SessionEvent, { type: 'request/context' }>,
+  ): void {
+    const contextWindow = validContextWindow(event.data.contextWindow)
+    if (contextWindow === undefined) {
+      this.contextWindows.delete(sessionId)
+    } else {
+      this.contextWindows.set(sessionId, contextWindow)
+    }
+    const state = this.activeTurnState(sessionId)
+    if (state === undefined || state.usage !== undefined) return
+    if (contextWindow === undefined) delete state.contextWindow
+    else state.contextWindow = contextWindow
+    state.updatedAt = eventTime(event.time)
+    this.queueTurnCard(state)
+  }
+
   private handleCatalogEvent(sessionId: string, event: CatalogSessionEvent): void {
     const policy = sessionEventPolicy(event.type)
     if (policy === undefined) {
@@ -902,11 +1096,14 @@ export class LarkBridge {
   private applyActivity(state: TurnState, activity: ActivityProjection, time: number): void {
     const index = state.toolIndexes.get(activity.id)
     const previous = index === undefined ? undefined : state.tools[index]
+    const timestamp = eventTime(time)
     const item: ToolCardItem = {
       id: activity.id,
       name: activity.name ?? previous?.name ?? activity.id,
       detail: activity.detail ?? previous?.detail,
       status: activity.status,
+      startedAt: previous?.startedAt ?? timestamp,
+      updatedAt: timestamp,
     }
     if (index === undefined) {
       state.toolIndexes.set(activity.id, state.tools.length)
@@ -941,6 +1138,9 @@ export class LarkBridge {
       startedAt: state.startedAt,
       updatedAt: state.updatedAt,
       usage: state.usage,
+      contextWindow: state.contextWindow,
+      loadingImageKey: this.client.loadingImageKey,
+      stopRequestId: state.stopRequestId,
       reasoning: state.reasoning,
       todos: state.todos,
     }
@@ -1023,6 +1223,10 @@ export class LarkBridge {
     for (const state of this.turns.get(sessionId)?.values() ?? []) this.clearStreamTimer(state)
     this.turns.delete(sessionId)
     this.activeRoutes.delete(sessionId)
+    this.contextWindows.delete(sessionId)
+    for (const [requestId, pending] of this.pendingStops) {
+      if (pending.sessionId === sessionId) this.pendingStops.delete(requestId)
+    }
     for (const pending of this.pending.values()) {
       if (pending.sessionId !== sessionId) continue
       const messageId = pending.messageId
@@ -1041,6 +1245,9 @@ export class LarkBridge {
     this.queuedRoutes.clear()
     this.turns.clear()
     this.activeRoutes.clear()
+    this.contextWindows.clear()
+    this.pendingStops.clear()
+    this.sessionOperations.clear()
   }
 
   private clearAllStreamTimers(): void {

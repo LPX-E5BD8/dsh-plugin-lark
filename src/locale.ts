@@ -18,6 +18,12 @@ interface LocaleCopy {
     readonly blocked: string
     readonly cancelled: string
     readonly freshSession: string
+    readonly stopRequested: string
+    readonly stopExpired: string
+    readonly stopUnavailable: string
+    readonly stopWrongContext: string
+    readonly commandFailed: string
+    commandDescription(name: string, fallback: string): string
     unknownCommand(command: string): string
     unknownTurnEnd(kind: string): string
   }
@@ -30,9 +36,14 @@ interface LocaleCopy {
     readonly cancelled: string
     readonly limited: string
     readonly earlierTools: string
+    readonly seconds: string
+    readonly context: string
     readonly inputTokens: string
     readonly outputTokens: string
-    readonly tokenUnit: string
+    readonly cacheReadTokens: string
+    readonly cacheWriteTokens: string
+    readonly reasoningTokens: string
+    readonly stop: string
     readonly approvalTitle: string
     readonly approvalSummary: string
     readonly approvalTool: string
@@ -81,21 +92,37 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       blocked: '执行被阻塞。',
       cancelled: '执行已取消。',
       freshSession: '已开始新会话。',
+      stopRequested: '正在停止。',
+      stopExpired: '该执行已结束或停止。',
+      stopUnavailable: '暂时无法停止。',
+      stopWrongContext: '只能由发起用户在原会话中停止。',
+      commandFailed: '命令执行失败，请重试。',
+      commandDescription: (name, fallback) => ({
+        compact: '整理较早的会话上下文',
+        goal: '查看或设置长任务目标',
+        permission: '查看或切换权限预设',
+        plan: '进入或退出计划模式',
+      } satisfies Record<string, string>)[name] ?? fallback,
       unknownCommand: (command) => `未知命令 ${command}，发送 /help 查看帮助。`,
       unknownTurnEnd: (kind) => `无法识别的执行结果：${kind}`,
     },
     card: {
       executionTitle: '🧠 **执行过程**',
-      running: '正在处理',
-      completed: '已完成',
+      running: '运行',
+      completed: '完成',
       failed: '执行失败',
       blocked: '执行受阻',
       cancelled: '已取消',
       limited: '达到输出上限',
       earlierTools: '个更早的工具调用已折叠',
-      inputTokens: '输入',
-      outputTokens: '输出',
-      tokenUnit: 'Token',
+      seconds: 's',
+      context: 'Ctx',
+      inputTokens: 'In',
+      outputTokens: 'Out',
+      cacheReadTokens: 'Hit',
+      cacheWriteTokens: 'Wr',
+      reasoningTokens: 'Rsn',
+      stop: '停止执行',
       approvalTitle: '需要你的确认',
       approvalSummary: '需要确认',
       approvalTool: '工具',
@@ -142,6 +169,12 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       blocked: 'Execution was blocked.',
       cancelled: 'Execution was cancelled.',
       freshSession: 'Started a fresh session.',
+      stopRequested: 'Stopping.',
+      stopExpired: 'This run has already ended or stopped.',
+      stopUnavailable: 'Unable to stop this run.',
+      stopWrongContext: 'Only the initiating user can stop this run in the original chat.',
+      commandFailed: 'Command execution failed. Please try again.',
+      commandDescription: (_name, fallback) => fallback,
       unknownCommand: (command) => `Unknown command ${command}. Send /help.`,
       unknownTurnEnd: (kind) => `Unknown execution result: ${kind}`,
     },
@@ -154,9 +187,14 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       cancelled: 'Cancelled',
       limited: 'Output limit reached',
       earlierTools: 'earlier tool calls folded',
-      inputTokens: 'Input',
-      outputTokens: 'Output',
-      tokenUnit: 'tokens',
+      seconds: 's',
+      context: 'Ctx',
+      inputTokens: 'In',
+      outputTokens: 'Out',
+      cacheReadTokens: 'Hit',
+      cacheWriteTokens: 'Wr',
+      reasoningTokens: 'Rsn',
+      stop: 'Stop',
       approvalTitle: 'Your confirmation is required',
       approvalSummary: 'Confirmation required',
       approvalTool: 'Tool',

@@ -131,6 +131,54 @@ test('quality: rendered cards stay within the Lark byte limit', () => {
   assert.match(encoded, /…/)
 })
 
+test('quality: running cards nest tools and bound reasoning', () => {
+  const payload = renderTurnCard({
+    status: 'running',
+    tools: [{
+      id: 'tool-1',
+      name: 'bash',
+      detail: '{"cmd":"pwd"}',
+      status: 'running',
+      startedAt: 1_000,
+      updatedAt: 1_000,
+    }],
+    reasoning: '思'.repeat(CARD_LIMITS.maxReasoningRunes + 100),
+    loadingImageKey: 'img_test',
+    startedAt: 1_000,
+    updatedAt: 2_000,
+  }) as {
+    body?: { elements?: Array<{
+      element_id?: string
+      elements?: Array<{
+        tag?: string
+        expanded?: boolean
+        header?: { icon?: { token?: string }; title?: { content?: string } }
+        icon?: { token?: string; img_key?: string }
+        text?: { content?: string; lines?: number }
+      }>
+    }> }
+  }
+  const execution = payload.body?.elements?.find((element) => element.element_id === 'execution_panel')
+  const reasoning = execution?.elements?.find((element) => element.tag === 'div')
+  const tool = execution?.elements?.find((element) => element.tag === 'collapsible_panel')
+  assert.equal(reasoning?.icon?.img_key, 'img_test')
+  assert.equal(reasoning?.text?.lines, CARD_LIMITS.maxReasoningLines)
+  assert.equal(reasoning?.text?.content, `${'思'.repeat(CARD_LIMITS.maxReasoningRunes)}…`)
+  assert.equal(tool?.expanded, true)
+  assert.equal(tool?.header?.icon?.token, 'down-small-ccm_outlined')
+  assert.match(tool?.header?.title?.content ?? '', /⏳.*⌨️.*bash.*1\.0s/)
+
+  const completed = renderTurnCard({
+    status: 'completed',
+    tools: [],
+    reasoning: 'done',
+    startedAt: 1,
+    updatedAt: 2,
+  }) as { body?: { elements?: Array<{ elements?: Array<{ tag?: string; icon?: { token?: string } }> }> } }
+  const completedReasoning = completed.body?.elements?.[0]?.elements?.find((element) => element.tag === 'div')
+  assert.equal(completedReasoning?.icon?.token, 'done_outlined')
+})
+
 test('quality: model output cannot inject Lark platform tags', () => {
   const payload = renderTurnCard({
     status: 'completed',
@@ -144,6 +192,36 @@ test('quality: model output cannot inject Lark platform tags', () => {
   assert.match(encoded, /\*\*safe markdown\*\*/)
   assert.doesNotMatch(encoded, /<at id=all>/)
   assert.match(encoded, /&lt;at id=all&gt;/)
+})
+
+test('quality: answer headings stay compact without rewriting code fences', () => {
+  const payload = renderTurnCard({
+    status: 'completed',
+    answer: '# Large title\n\n## Small title\n\n```sh\n# shell comment\n```',
+    tools: [],
+    startedAt: 1,
+    updatedAt: 2,
+  })
+  const encoded = JSON.stringify(payload)
+  assert.match(encoded, /\*\*Large title\*\*/)
+  assert.match(encoded, /\*\*Small title\*\*/)
+  assert.match(encoded, /# shell comment/)
+  assert.doesNotMatch(encoded, /# Large title|## Small title/)
+  assert.match(encoded, /"mobile":"normal"/)
+})
+
+test('quality: shorter fence markers cannot close a longer code fence', () => {
+  const payload = renderTurnCard({
+    status: 'completed',
+    answer: '````md\n```\n# still code\n```\n````\n# Real heading',
+    tools: [],
+    startedAt: 1,
+    updatedAt: 2,
+  })
+  const encoded = JSON.stringify(payload)
+  assert.match(encoded, /# still code/)
+  assert.doesNotMatch(encoded, /\*\*still code\*\*/)
+  assert.match(encoded, /\*\*Real heading\*\*/)
 })
 
 test('quality: supported locales cover cards and extended events', () => {

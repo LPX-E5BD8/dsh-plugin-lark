@@ -2,7 +2,16 @@
   "name": "dsh-plugin-lark",
   "description": "Feishu/Lark bridge for DeepSeek Harness with turn, tool, and approval cards",
   "version": "0.1.0",
+  "author": "LPX-E5BD8",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LPX-E5BD8/dsh-plugin-lark.git"
+  },
+  "homepage": "https://github.com/LPX-E5BD8/dsh-plugin-lark#readme",
+  "bugs": {
+    "url": "https://github.com/LPX-E5BD8/dsh-plugin-lark/issues"
+  },
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
@@ -13,10 +22,12 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "assets",
     "lib",
     "cordis.patch.yml",
     "LICENSE",
-    "ROADMAP.md"
+    "ROADMAP.md",
+    "SECURITY.md"
   ],
   "license": "Apache-2.0",
   "keywords": [

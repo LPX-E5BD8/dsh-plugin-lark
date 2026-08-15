@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises'
 import { DEFAULT_CONFIG } from './config.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
@@ -30,6 +31,7 @@ export interface LarkCardActionResult {
 }
 
 export interface LarkClientLike {
+  readonly loadingImageKey?: string
   start(): Promise<void>
   stop(): Promise<void>
   sendText(chatId: string, text: string): Promise<void>
@@ -149,12 +151,16 @@ type LarkRest = {
         patch?: (opts: unknown) => Promise<unknown>
         update?: (opts: unknown) => Promise<unknown>
       }
+      image?: {
+        create: (opts: unknown) => Promise<{ image_key?: string } | null>
+      }
     }
   }
 }
 
 /** Real WS long-connection client via official Node SDK. */
 export class LarkSdkClient implements LarkClientLike {
+  loadingImageKey: string | undefined
   private handler: ((msg: LarkInbound) => Promise<void>) | undefined
   private cardHandler: ((action: LarkCardAction) => Promise<LarkCardActionResult>) | undefined
   private ws: { close?: (params?: { force?: boolean }) => void } | undefined
@@ -260,9 +266,12 @@ export class LarkSdkClient implements LarkClientLike {
           },
         })
       }
+      await this.prepareLoadingImage(rest)
     } catch (error) {
       this.ws?.close?.({ force: true })
       this.ws = undefined
+      this.rest = undefined
+      this.sendImpl = undefined
       throw error
     } finally {
       this.cancelStart = undefined
@@ -272,6 +281,22 @@ export class LarkSdkClient implements LarkClientLike {
   async sendText(chatId: string, text: string): Promise<void> {
     if (this.sendImpl === undefined) throw new Error('lark client not started')
     for (const chunk of splitText(neutralizeTextMentions(text))) await this.sendImpl(chatId, chunk)
+  }
+
+  private async prepareLoadingImage(rest: LarkRest): Promise<void> {
+    if (this.loadingImageKey !== undefined || rest.im.v1.image === undefined) return
+    try {
+      const image = await readFile(new URL('../assets/loading.gif', import.meta.url))
+      const uploaded = await withTimeout(
+        rest.im.v1.image.create({ data: { image_type: 'message', image } }),
+        'lark: loading image upload timed out',
+      )
+      if (uploaded?.image_key !== undefined && uploaded.image_key !== '') {
+        this.loadingImageKey = uploaded.image_key
+      }
+    } catch {
+      // Cosmetic asset: keep the native static loading icon when upload is unavailable.
+    }
   }
 
   async sendCard(chatId: string, card: unknown): Promise<string | undefined> {

@@ -6,12 +6,13 @@ export const CARD_LIMITS = {
   maxBytes: 28 * 1024,
   maxSummaryRunes: 100,
   maxAnswerRunes: 6_000,
-  maxVisibleTools: 12,
+  maxVisibleTools: 6,
   maxToolNameRunes: 80,
   maxToolDetailRunes: 240,
   maxErrorRunes: 600,
   maxApprovalReasonRunes: 1_000,
-  maxReasoningRunes: 2_000,
+  maxReasoningRunes: 360,
+  maxReasoningLines: 6,
   maxVisibleTodos: 20,
   maxTodoRunes: 240,
 } as const
@@ -32,7 +33,7 @@ const CARD_STYLE = {
   normalText: 'normal_v2',
   metaText: 'notation',
   defaultTextSize: 'normal',
-  mobileTextSize: 'heading',
+  mobileTextSize: 'normal',
   direction: 'vertical',
   alignLeft: 'left',
   alignTop: 'top',
@@ -42,6 +43,7 @@ const CARD_STYLE = {
   flexNone: 'none',
   noMargin: '0px 0px 0px 0px',
   tagMarkdown: 'markdown',
+  tagDiv: 'div',
   tagDivider: 'hr',
   tagPanel: 'collapsible_panel',
   tagColumnSet: 'column_set',
@@ -65,10 +67,12 @@ const CARD_ELEMENT = {
   approval: 'approval',
   approvalButtons: 'approval_buttons',
   plan: 'plan',
+  stop: 'turn_stop',
 } as const
 
-const CARD_ACTION = {
+export const CARD_ACTIONS = {
   toolApproval: 'tool_approval',
+  turnStop: 'turn_stop',
 } as const
 
 const MILLISECONDS_PER_SECOND = 1_000
@@ -82,11 +86,17 @@ export interface ToolCardItem {
   readonly name: string
   readonly detail?: string
   readonly status: ToolCardStatus
+  readonly startedAt?: number
+  readonly updatedAt?: number
 }
 
 export interface TurnCardUsage {
   readonly inputTokens: number
   readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+  readonly reasoningTokens: number
+  readonly contextTokens: number
 }
 
 export interface TurnCard {
@@ -98,6 +108,9 @@ export interface TurnCard {
   readonly startedAt: number
   readonly updatedAt: number
   readonly usage?: TurnCardUsage
+  readonly contextWindow?: number
+  readonly loadingImageKey?: string
+  readonly stopRequestId?: string
   readonly reasoning?: string
   readonly todos?: readonly TurnCardTodo[]
 }
@@ -114,10 +127,10 @@ export interface ApprovalCard {
   readonly reason?: string
 }
 
-const TOOL_STATUS: Record<ToolCardStatus, { icon: string; color: string }> = {
-  running: { icon: '⏳', color: 'blue' },
-  completed: { icon: '✅', color: 'green' },
-  failed: { icon: '❌', color: 'red' },
+const TOOL_STATUS: Record<ToolCardStatus, { mark: string; color: string; icon: string }> = {
+  running: { mark: '⏳', color: 'blue', icon: 'loading_outlined' },
+  completed: { mark: '✓', color: 'green', icon: 'done_outlined' },
+  failed: { mark: '✕', color: 'red', icon: 'close_outlined' },
 }
 
 function attentionHeader(
@@ -153,6 +166,28 @@ function escapeMarkdown(value: string): string {
     .replaceAll('_', '\\_')
 }
 
+function compactMarkdownHeadings(value: string): string {
+  let fence: { marker: '`' | '~'; length: number } | undefined
+  return value.split('\n').map((line) => {
+    const match = /^(\s{0,3})(`{3,}|~{3,})(.*)$/.exec(line)
+    const run = match?.[2]
+    if (fence !== undefined) {
+      if (run?.[0] === fence.marker && run.length >= fence.length && match?.[3]?.trim() === '') {
+        fence = undefined
+      }
+      return line
+    }
+    if (run !== undefined) {
+      fence = { marker: run[0] as '`' | '~', length: run.length }
+      return line
+    }
+    const heading = /^(\s{0,3})#{1,6}\s+(.+?)\s*$/.exec(line)
+    if (heading === null) return line
+    const content = (heading[2] ?? '').replace(/\s+#+\s*$/, '')
+    return `${heading[1] ?? ''}${content.startsWith('**') && content.endsWith('**') ? content : `**${content}**`}`
+  }).join('\n')
+}
+
 function normalizedTools(tools: readonly ToolCardItem[]): ToolCardItem[] {
   return tools.slice(-CARD_LIMITS.maxVisibleTools).map((tool) => ({
     id: tool.id,
@@ -161,11 +196,35 @@ function normalizedTools(tools: readonly ToolCardItem[]): ToolCardItem[] {
       ? undefined
       : truncateRunes(tool.detail, CARD_LIMITS.maxToolDetailRunes),
     status: tool.status,
+    startedAt: tool.startedAt,
+    updatedAt: tool.updatedAt,
   }))
 }
 
+function toolEmoji(name: string): string {
+  const normalized = name.toLowerCase()
+  if (/job|output/.test(normalized)) return '📤'
+  if (/bash|shell|exec|command|terminal/.test(normalized)) return '⌨️'
+  if (/read|view|inspect/.test(normalized)) return '📖'
+  if (/write|create/.test(normalized)) return '📝'
+  if (/edit|patch|replace/.test(normalized)) return '✏️'
+  if (/search|find|grep|query/.test(normalized)) return '🔎'
+  if (/browser|web|fetch|http/.test(normalized)) return '🌐'
+  if (/agent|task|workflow/.test(normalized)) return '🧩'
+  return '🛠️'
+}
+
+function toolDuration(tool: ToolCardItem, now: number): string | undefined {
+  if (tool.startedAt === undefined) return undefined
+  const end = tool.status === 'running' ? now : tool.updatedAt
+  if (end === undefined) return undefined
+  return `${(Math.max(0, end - tool.startedAt) / MILLISECONDS_PER_SECOND).toFixed(1)}s`
+}
+
 function cardSummary(card: TurnCard): string {
-  const answer = card.answer?.replace(/\s+/g, ' ').trim()
+  const answer = card.answer === undefined
+    ? undefined
+    : compactMarkdownHeadings(card.answer).replaceAll('**', '').replace(/\s+/g, ' ').trim()
   const summary = answer === undefined || answer === ''
     ? statusText(card.status, card.locale ?? DEFAULT_CONFIG.locale)
     : answer
@@ -191,6 +250,24 @@ function markdownElement(
   }
 }
 
+function loadingIcon(imageKey: string | undefined): Record<string, unknown> {
+  return imageKey === undefined
+    ? { tag: CARD_STYLE.tagStandardIcon, token: TOOL_STATUS.running.icon, color: TOOL_STATUS.running.color }
+    : { tag: 'custom_icon', img_key: imageKey }
+}
+
+function turnStatusIcon(card: TurnCard): Record<string, unknown> {
+  if (card.status === 'running') return loadingIcon(card.loadingImageKey)
+  const icon = {
+    completed: { token: 'done_outlined', color: 'green' },
+    failed: { token: 'close_outlined', color: 'red' },
+    blocked: { token: 'warning_outlined', color: 'orange' },
+    cancelled: { token: 'close_outlined', color: 'grey' },
+    limited: { token: 'warning_outlined', color: 'orange' },
+  }[card.status]
+  return { tag: CARD_STYLE.tagStandardIcon, ...icon }
+}
+
 function divider(): Record<string, unknown> {
   return { tag: CARD_STYLE.tagDivider }
 }
@@ -204,27 +281,74 @@ function toolElements(card: TurnCard, tools: readonly ToolCardItem[]): Record<st
   }
   for (const tool of tools) {
     const style = TOOL_STATUS[tool.status]
-    const detail = tool.detail === undefined || tool.detail === ''
-      ? ''
-      : `\n<font color='grey'>${escapeMarkdown(tool.detail)}</font>`
-    elements.push(markdownElement(
-      '',
-      `${style.icon} <font color='${style.color}'>**${escapeMarkdown(tool.name)}**</font>${detail}`,
-      CARD_STYLE.metaText,
-    ))
+    const duration = toolDuration(tool, card.updatedAt)
+    const time = duration === undefined ? '' : ` <font color='grey'>· ${duration}</font>`
+    const detailElement = tool.detail === undefined || tool.detail === ''
+      ? undefined
+      : markdownElement('', `<font color='grey'>${escapeMarkdown(tool.detail)}</font>`, CARD_STYLE.metaText)
+    if (detailElement !== undefined) {
+      detailElement.icon = tool.status === 'running'
+        ? loadingIcon(card.loadingImageKey)
+        : { tag: CARD_STYLE.tagStandardIcon, token: style.icon, color: style.color }
+    }
+    elements.push({
+      tag: CARD_STYLE.tagPanel,
+      direction: CARD_STYLE.direction,
+      vertical_spacing: CARD_STYLE.panelSpacing,
+      padding: CARD_STYLE.panelPadding,
+      background_color: CARD_STYLE.panelBackground,
+      expanded: tool.status === 'running',
+      header: {
+        title: {
+          tag: CARD_STYLE.tagMarkdown,
+          content: `<font color='${style.color}'>${style.mark}</font> ${toolEmoji(tool.name)} **${escapeMarkdown(tool.name)}**${time}`,
+        },
+        background_color: CARD_STYLE.panelBackground,
+        vertical_align: CARD_STYLE.alignCenter,
+        padding: CARD_STYLE.panelHeaderPadding,
+        icon: {
+          tag: CARD_STYLE.tagStandardIcon,
+          token: CARD_STYLE.panelChevron,
+          size: CARD_STYLE.panelChevronSize,
+        },
+        icon_position: CARD_STYLE.alignRight,
+        icon_expanded_angle: CARD_STYLE.panelExpandedAngle,
+      },
+      border: { color: CARD_STYLE.panelBorder, corner_radius: CARD_STYLE.panelRadius },
+      elements: detailElement === undefined ? [] : [detailElement],
+    })
   }
   return elements
 }
 
-function executionPanel(card: TurnCard, tools: readonly ToolCardItem[]): Record<string, unknown> | undefined {
-  if (tools.length === 0 && (card.reasoning === undefined || card.reasoning === '')) return undefined
-  const elements = toolElements(card, tools)
-  if (card.reasoning !== undefined && card.reasoning !== '') {
-    elements.unshift(markdownElement(
-      '',
-      escapePlatformMarkup(truncateRunes(card.reasoning, CARD_LIMITS.maxReasoningRunes)),
-    ))
+function reasoningElement(card: TurnCard): Record<string, unknown> | undefined {
+  const locale = card.locale ?? DEFAULT_CONFIG.locale
+  const content = card.reasoning === undefined || card.reasoning === ''
+    ? card.status === 'running' ? statusText(card.status, locale) : undefined
+    : truncateRunes(card.reasoning, CARD_LIMITS.maxReasoningRunes)
+  if (content === undefined) return undefined
+  return {
+    tag: CARD_STYLE.tagDiv,
+    text: {
+      tag: CARD_STYLE.tagPlainText,
+      content: escapePlatformMarkup(content),
+      text_size: CARD_STYLE.normalText,
+      text_color: 'grey',
+      text_align: CARD_STYLE.alignLeft,
+      lines: CARD_LIMITS.maxReasoningLines,
+    },
+    icon: turnStatusIcon(card),
+    margin: CARD_STYLE.noMargin,
   }
+}
+
+function executionPanel(card: TurnCard, tools: readonly ToolCardItem[]): Record<string, unknown> | undefined {
+  if (tools.length === 0 && (card.reasoning === undefined || card.reasoning === '') && card.status !== 'running') {
+    return undefined
+  }
+  const elements = toolElements(card, tools)
+  const reasoning = reasoningElement(card)
+  if (reasoning !== undefined) elements.unshift(reasoning)
   return {
     tag: CARD_STYLE.tagPanel,
     element_id: CARD_ELEMENT.execution,
@@ -277,14 +401,26 @@ function todoElement(
 
 function footer(card: TurnCard): Record<string, unknown> {
   const elapsedMilliseconds = Math.max(0, card.updatedAt - card.startedAt)
-  const elapsed = `${(elapsedMilliseconds / MILLISECONDS_PER_SECOND).toFixed(1)}s`
   const locale = card.locale ?? DEFAULT_CONFIG.locale
   const copy = localeCopy(locale).card
-  const parts = [statusText(card.status, locale), elapsed]
+  const elapsed = `${(elapsedMilliseconds / MILLISECONDS_PER_SECOND).toFixed(1)}${copy.seconds}`
+  const summary = [statusText(card.status, locale), elapsed]
+  if (card.contextWindow !== undefined) {
+    const context = card.usage === undefined
+      ? compactTokens(card.contextWindow)
+      : `${compactTokens(card.usage.contextTokens)}/${compactTokens(card.contextWindow)} (${compactPercent(card.usage.contextTokens, card.contextWindow)})`
+    summary.push(`${copy.context} ${context}`)
+  }
   if (card.usage !== undefined) {
-    parts.push(
-      `${copy.inputTokens} ${card.usage.inputTokens} / ${copy.outputTokens} ${card.usage.outputTokens} ${copy.tokenUnit}`,
-    )
+    const usage = [`${copy.inputTokens} ${compactTokens(card.usage.inputTokens)}`]
+    const cacheableTokens = card.usage.inputTokens + card.usage.cacheReadTokens + card.usage.cacheWriteTokens
+    if (cacheableTokens > 0) {
+      usage.push(`${copy.cacheReadTokens} ${compactTokens(card.usage.cacheReadTokens)} (${compactPercent(card.usage.cacheReadTokens, cacheableTokens)})`)
+    }
+    if (card.usage.cacheWriteTokens > 0) usage.push(`${copy.cacheWriteTokens} ${compactTokens(card.usage.cacheWriteTokens)}`)
+    usage.push(`${copy.outputTokens} ${compactTokens(card.usage.outputTokens)}`)
+    if (card.usage.reasoningTokens > 0) usage.push(`${copy.reasoningTokens} ${compactTokens(card.usage.reasoningTokens)}`)
+    summary.push(...usage)
   }
   return {
     tag: CARD_STYLE.tagColumnSet,
@@ -294,9 +430,19 @@ function footer(card: TurnCard): Record<string, unknown> {
       tag: CARD_STYLE.tagColumn,
       width: CARD_STYLE.widthWeighted,
       weight: 1,
-      elements: [markdownElement('', `<font color='grey'>${parts.join(' · ')}</font>`, CARD_STYLE.metaText)],
+      elements: [markdownElement('', `<font color='grey'>${summary.join(' · ')}</font>`, CARD_STYLE.metaText)],
     }],
   }
+}
+
+function compactTokens(tokens: number): string {
+  if (tokens < 1_000) return String(tokens)
+  const [divisor, suffix] = tokens < 1_000_000 ? [1_000, 'K'] as const : [1_000_000, 'M'] as const
+  return `${(tokens / divisor).toFixed(1).replace(/\.0$/, '')}${suffix}`
+}
+
+function compactPercent(value: number, total: number): string {
+  return `${(value / total * 100).toFixed(1).replace(/\.0$/, '')}%`
 }
 
 function cardElements(card: TurnCard, tools: readonly ToolCardItem[]): Record<string, unknown>[] {
@@ -310,11 +456,18 @@ function cardElements(card: TurnCard, tools: readonly ToolCardItem[]): Record<st
   }
   if (card.answer !== undefined && card.answer !== '') {
     if (elements.length > 0) elements.push(divider())
-    elements.push(markdownElement(CARD_ELEMENT.answer, escapePlatformMarkup(card.answer)))
+    elements.push(markdownElement(
+      CARD_ELEMENT.answer,
+      escapePlatformMarkup(compactMarkdownHeadings(card.answer)),
+    ))
   }
   if (card.error !== undefined && card.error !== '') {
     if (elements.length > 0) elements.push(divider())
     elements.push(markdownElement(CARD_ELEMENT.error, `<font color='red'>${escapeMarkdown(card.error)}</font>`))
+  }
+  if (card.status === 'running' && card.stopRequestId !== undefined) {
+    if (elements.length > 0) elements.push(divider())
+    elements.push(stopElement(card.stopRequestId, card.locale ?? DEFAULT_CONFIG.locale))
   }
   if (elements.length > 0) elements.push(divider())
   elements.push(footer(card))
@@ -382,10 +535,34 @@ function approvalButton(
       behaviors: [{
         type: CARD_STYLE.behaviorCallback,
         value: {
-          action: CARD_ACTION.toolApproval,
+          action: CARD_ACTIONS.toolApproval,
           request_id: requestId,
           decision,
         },
+      }],
+    }],
+  }
+}
+
+function stopElement(requestId: string, locale: LarkLocale): Record<string, unknown> {
+  return {
+    tag: CARD_STYLE.tagColumnSet,
+    element_id: CARD_ELEMENT.stop,
+    flex_mode: CARD_STYLE.flexNone,
+    columns: [{
+      tag: CARD_STYLE.tagColumn,
+      width: CARD_STYLE.widthWeighted,
+      weight: 1,
+      elements: [{
+        tag: CARD_STYLE.tagButton,
+        text: { tag: CARD_STYLE.tagPlainText, content: localeCopy(locale).card.stop },
+        type: 'danger',
+        width: CARD_STYLE.widthFill,
+        size: CARD_STYLE.buttonMedium,
+        behaviors: [{
+          type: CARD_STYLE.behaviorCallback,
+          value: { action: CARD_ACTIONS.turnStop, request_id: requestId },
+        }],
       }],
     }],
   }
