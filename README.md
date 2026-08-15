@@ -10,17 +10,17 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 
 ## Install
 
-Install the published package into a Harness profile:
+Clone the repository, build it, and add the checkout to a Harness profile:
 
 ```sh
-dsh plugin --profile web add dsh-plugin-lark
-```
-
-To test a local checkout, run `npm ci` and then install the checkout from its root:
-
-```sh
+git clone https://github.com/LPX-E5BD8/dsh-plugin-lark.git
+cd dsh-plugin-lark
+npm ci --ignore-scripts
+npm run build
 dsh plugin --profile web add .
 ```
+
+Keep the checkout in place while the profile uses it. An npm registry release is not required.
 
 In the Feishu/Lark developer console:
 
@@ -28,6 +28,7 @@ In the Feishu/Lark developer console:
 2. Subscribe to `im.message.receive_v1`.
 3. Register the `card.action.trigger` callback.
 4. Grant the bot `im:message` send/receive access.
+5. Optionally grant `im:resource` to enable the bundled animated loading indicator; without it, the card uses a static icon.
 
 ## Credentials
 
@@ -60,13 +61,17 @@ The bundled Cordis patch uses these defaults:
 
 `allowFrom` is fail-closed: an empty list with `allowAllUsers: false` denies everyone. Use `allowAllUsers: true` only for an intentionally public bot. Use `domain: lark` for apps hosted on `open.larksuite.com`.
 
+The `0.1.0` release is credential-smoke-tested against Feishu. The Lark domain path uses the official SDK domain switch and automated coverage; a credential-backed Lark smoke test remains on the roadmap.
+
 Leave `defaultSessionId` empty for `lark:<chatId>` isolation. Set it only when every authorized chat should share one Harness session. With a Harness session-persistence backend, the bridge resumes the latest session generation after restart. `/new` and `/clear` acknowledge only after the fresh generation reaches the durability checkpoint; storage or resume failures never fall back to an empty session.
 
-Commands: `/help`, `/new`, `/clear`.
+Bridge commands: `/help`, `/new`, `/clear`. When the DSH command runtime is mounted, `/help` also discovers the commands available to the exact Agent. A standard DSH Base profile exposes `/compact`, `/goal`, `/permission`, and `/plan`; channel-incompatible commands are omitted.
 
 ## Cards and approvals
 
 One turn owns one Card 2.0 message. Reasoning, todos, retries, compaction, hooks, nested code tools, workflows, tool calls, results, and the final answer update that card in serialized order. Streaming updates are throttled, and every payload is bounded to Lark's 28 KiB card limit.
+
+The execution panel bounds visible reasoning and recent tool calls. Running cards use an animated loading indicator when `im:resource` is available, replace it with a terminal status icon on completion, and provide a stop action bound to the originating session, chat, and user. The compact footer reports elapsed time, context-window occupancy, cache hits, input, output, and reasoning usage on one line.
 
 Ordinary replies have no attention header. Failed, blocked, cancelled, and token-limited turns use semantic headers. If Card APIs are unavailable, final assistant text still falls back to text delivery.
 
@@ -95,3 +100,7 @@ npm run test:pack
 ## License
 
 Apache-2.0
+
+## Security
+
+See [SECURITY.md](./SECURITY.md) for supported versions and private vulnerability reporting.
