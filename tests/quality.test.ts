@@ -132,6 +132,10 @@ test('quality: rendered cards stay within the Lark byte limit', () => {
 })
 
 test('quality: running cards nest tools and bound reasoning', () => {
+  const latestReasoning = Array.from(
+    { length: CARD_LIMITS.maxReasoningLines + 2 },
+    (_, index) => `line-${index}-${'思'.repeat(80)}`,
+  ).join('\n')
   const payload = renderTurnCard({
     status: 'running',
     tools: [{
@@ -142,7 +146,7 @@ test('quality: running cards nest tools and bound reasoning', () => {
       startedAt: 1_000,
       updatedAt: 1_000,
     }],
-    reasoning: '思'.repeat(CARD_LIMITS.maxReasoningRunes + 100),
+    reasoning: `hidden-start\n${latestReasoning}\nlatest-tail`,
     loadingImageKey: 'img_test',
     startedAt: 1_000,
     updatedAt: 2_000,
@@ -163,7 +167,11 @@ test('quality: running cards nest tools and bound reasoning', () => {
   const tool = execution?.elements?.find((element) => element.tag === 'collapsible_panel')
   assert.equal(reasoning?.icon?.img_key, 'img_test')
   assert.equal(reasoning?.text?.lines, CARD_LIMITS.maxReasoningLines)
-  assert.equal(reasoning?.text?.content, `${'思'.repeat(CARD_LIMITS.maxReasoningRunes)}…`)
+  assert.match(reasoning?.text?.content ?? '', /^…/)
+  assert.match(reasoning?.text?.content ?? '', /latest-tail$/)
+  assert.doesNotMatch(reasoning?.text?.content ?? '', /hidden-start|line-0/)
+  assert.ok((reasoning?.text?.content?.split('\n').length ?? 0) <= CARD_LIMITS.maxReasoningLines)
+  assert.ok([...(reasoning?.text?.content?.slice(1) ?? '')].length <= CARD_LIMITS.maxReasoningRunes)
   assert.equal(tool?.expanded, true)
   assert.equal(tool?.header?.icon?.token, 'down-small-ccm_outlined')
   assert.match(tool?.header?.title?.content ?? '', /⏳.*⌨️.*bash.*1\.0s/)

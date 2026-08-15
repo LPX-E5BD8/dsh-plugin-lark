@@ -152,6 +152,19 @@ function truncateRunes(value: string, limit: number): string {
   return runes.length <= limit ? runes.join('') : `${runes.slice(0, limit).join('')}…`
 }
 
+function truncateReasoning(value: string): string {
+  const lines = value.trim().split('\n')
+  const visible = lines.slice(-CARD_LIMITS.maxReasoningLines).join('\n')
+  const runes = [...visible]
+  const content = runes.length <= CARD_LIMITS.maxReasoningRunes
+    ? visible
+    : runes.slice(-CARD_LIMITS.maxReasoningRunes).join('')
+  return lines.length <= CARD_LIMITS.maxReasoningLines
+    && runes.length <= CARD_LIMITS.maxReasoningRunes
+    ? content
+    : `…${content}`
+}
+
 function escapePlatformMarkup(value: string): string {
   return value
     .replaceAll('&', '&amp;')
@@ -325,7 +338,7 @@ function reasoningElement(card: TurnCard): Record<string, unknown> | undefined {
   const locale = card.locale ?? DEFAULT_CONFIG.locale
   const content = card.reasoning === undefined || card.reasoning === ''
     ? card.status === 'running' ? statusText(card.status, locale) : undefined
-    : truncateRunes(card.reasoning, CARD_LIMITS.maxReasoningRunes)
+    : card.reasoning
   if (content === undefined) return undefined
   return {
     tag: CARD_STYLE.tagDiv,
@@ -685,7 +698,7 @@ export function renderTurnCard(input: TurnCard): Record<string, unknown> {
     error: input.error === undefined ? undefined : truncateRunes(input.error, CARD_LIMITS.maxErrorRunes),
     reasoning: input.reasoning === undefined
       ? undefined
-      : truncateRunes(input.reasoning, CARD_LIMITS.maxReasoningRunes),
+      : truncateReasoning(input.reasoning),
   }
   const tools = normalizedTools(card.tools)
   const payload = buildPayload(card, tools)
