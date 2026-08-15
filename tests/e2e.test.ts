@@ -1,0 +1,967 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import { LarkBridge } from '../src/bridge.ts'
+import type { LarkCardAction, LarkCardActionResult, LarkClientLike, LarkInbound } from '../src/lark.ts'
+
+interface SentText {
+  chatId: string
+  text: string
+}
+
+type TestClient = LarkClientLike & {
+  sent: SentText[]
+  cards: Array<{ chatId: string; card: unknown; messageId: string }>
+  updated: Array<{ messageId: string; card: unknown }>
+  messageHandler?: (message: LarkInbound) => Promise<void>
+  cardHandler?: (action: LarkCardAction) => Promise<LarkCardActionResult>
+}
+
+function createClient(): TestClient {
+  const client: TestClient = {
+    sent: [],
+    cards: [],
+    updated: [],
+    async start() {},
+    async stop() {},
+    async sendText(chatId, text) { client.sent.push({ chatId, text }) },
+    async sendCard(chatId, card) {
+      const messageId = `card-${client.cards.length + 1}`
+      client.cards.push({ chatId, card, messageId })
+      return messageId
+    },
+    async updateCard(messageId, card) { client.updated.push({ messageId, card }) },
+    onMessage(handler) { client.messageHandler = handler },
+    onCardAction(handler) { client.cardHandler = handler },
+  }
+  return client
+}
+
+interface TestPersistence {
+  readonly sessions: Set<string>
+  resumeError?: Error
+  flushError?: Error
+  flushWait?: Promise<void>
+  disposeErrorOnce?: Error
+}
+
+function createHost(persistence?: TestPersistence) {
+  let createCount = 0
+  let resumeCount = 0
+  let flushCount = 0
+  const createdSessionIds: string[] = []
+  const resumedSessionIds: string[] = []
+  const disposedSessionIds: string[] = []
+  const warnings: unknown[][] = []
+  const sessionListeners: Array<(session: { id: string }, event: never) => void> = []
+  const approvalListeners: Array<(
+    request: never,
+    next: () => Promise<string>,
+  ) => Promise<string>> = []
+  return {
+    logger: { error() {}, warn(...args: unknown[]) { warnings.push(args) } },
+    on(name: string, listener: (...args: never[]) => unknown) {
+      if (name === 'session/event') {
+        sessionListeners.push(listener as (session: { id: string }, event: never) => void)
+      }
+      if (name === 'approval/request') {
+        approvalListeners.push(listener as (
+          request: never,
+          next: () => Promise<string>,
+        ) => Promise<string>)
+      }
+      return () => {}
+    },
+    get(name: string) {
+      if (name === 'approval') return {}
+      if (name === 'sessionPersistence' && persistence !== undefined) {
+        return {
+          async list() {
+            return [...persistence.sessions].map((id) => ({ id }))
+          },
+        }
+      }
+      return undefined
+    },
+    agents: {
+      async create(opts: { sessionId: unknown }) {
+        createCount += 1
+        const sessionId = String(opts.sessionId)
+        createdSessionIds.push(sessionId)
+        return {
+          sessionId,
+          async dispose() {
+            disposedSessionIds.push(sessionId)
+            if (persistence?.disposeErrorOnce !== undefined) {
+              const error = persistence.disposeErrorOnce
+              persistence.disposeErrorOnce = undefined
+              throw error
+            }
+          },
+          agent: {
+            session: { id: sessionId },
+            followup() { persistence?.sessions.add(sessionId) },
+          },
+        }
+      },
+      async resume(opts: { resumeSessionId: unknown }) {
+        resumeCount += 1
+        const sessionId = String(opts.resumeSessionId)
+        resumedSessionIds.push(sessionId)
+        if (persistence?.resumeError !== undefined) throw persistence.resumeError
+        if (persistence?.sessions.has(sessionId) !== true) {
+          throw new Error(`session "${sessionId}" not found`)
+        }
+        return {
+          sessionId,
+          async dispose() { disposedSessionIds.push(sessionId) },
+          agent: {
+            session: { id: sessionId },
+            followup() { persistence.sessions.add(sessionId) },
+          },
+        }
+      },
+    },
+    sessions: {
+      async flush(session: { id: string }) {
+        flushCount += 1
+        await persistence?.flushWait
+        if (persistence?.flushError !== undefined) throw persistence.flushError
+        persistence?.sessions.add(session.id)
+        return persistence !== undefined
+      },
+    },
+    emit(sessionId: string, event: unknown) {
+      for (const listener of sessionListeners) listener({ id: sessionId }, event as never)
+    },
+    requestApproval(request: unknown): Promise<string> {
+      const listener = approvalListeners[0]
+      return listener === undefined
+        ? Promise.resolve('unavailable')
+        : listener(request as never, async () => 'unavailable')
+    },
+    createCount() { return createCount },
+    resumeCount() { return resumeCount },
+    flushCount() { return flushCount },
+    createdSessionIds() { return createdSessionIds },
+    resumedSessionIds() { return resumedSessionIds },
+    disposedSessionIds() { return disposedSessionIds },
+    warnings() { return warnings },
+  }
+}
+
+function inbound(chatId: string, openId: string, text: string): LarkInbound {
+  return {
+    chatId,
+    chatType: 'p2p',
+    openId,
+    text,
+    messageId: `${chatId}-${text}`,
+    mentioned: false,
+  }
+}
+
+function requestId(card: unknown): string {
+  const payload = card as {
+    body?: {
+      elements?: Array<{
+        element_id?: string
+        columns?: Array<{
+          elements?: Array<{
+            behaviors?: Array<{ value?: { request_id?: string } }>
+          }>
+        }>
+      }>
+    }
+  }
+  const buttons = payload.body?.elements?.find((element) => element.element_id === 'approval_buttons')
+  return buttons?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
+}
+
+function assistantMessage(turn: number, text: string): unknown {
+  return {
+    type: 'assistant/message',
+    seq: turn * 2,
+    time: Date.now(),
+    surfaceOp: 'append',
+    data: {
+      turn,
+      step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text }] },
+    },
+  }
+}
+
+function flushDeliveries(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 2))
+  }
+  assert.fail('condition was not met before timeout')
+}
+
+test('e2e: shared session routes queued turns to their originating chats', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowAllUsers: true,
+    defaultSessionId: 'shared',
+  })
+  bridge.start()
+
+  await Promise.all([
+    client.messageHandler?.(inbound('chat-a', 'user-a', 'first')),
+    client.messageHandler?.(inbound('chat-b', 'user-b', 'second')),
+  ])
+  assert.equal(host.createCount(), 1)
+  host.emit('shared', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('shared', assistantMessage(1, 'reply-a'))
+  host.emit('shared', { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  host.emit('shared', { type: 'turn/start', data: { turn: 2 } })
+  host.emit('shared', assistantMessage(2, 'reply-b'))
+  await flushDeliveries()
+
+  assert.deepEqual(client.cards.map((card) => card.chatId), ['chat-a', 'chat-b'])
+  assert.match(JSON.stringify(client.updated), /reply-a/)
+  assert.match(JSON.stringify(client.updated), /reply-b/)
+  await bridge.stop()
+})
+
+test('e2e: shared session stays shared after reset', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowAllUsers: true,
+    defaultSessionId: 'shared',
+  })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'user-a', 'first'))
+  await Promise.all([
+    client.messageHandler?.(inbound('chat-a', 'user-a', '/new')),
+    client.messageHandler?.(inbound('chat-b', 'user-b', 'second')),
+  ])
+
+  assert.equal(host.createCount(), 2)
+  await bridge.stop()
+})
+
+test('e2e: a persisted chat session resumes after bridge restart', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const firstClient = createClient()
+  const firstHost = createHost(persistence)
+  const firstBridge = new LarkBridge(firstHost as never, {
+    client: firstClient,
+    allowFrom: ['owner'],
+  })
+  firstBridge.start()
+  await firstClient.messageHandler?.(inbound('chat-a', 'owner', 'remember this'))
+  assert.deepEqual(firstHost.createdSessionIds(), ['lark:chat-a'])
+  await firstBridge.stop()
+
+  const secondClient = createClient()
+  const secondHost = createHost(persistence)
+  const secondBridge = new LarkBridge(secondHost as never, {
+    client: secondClient,
+    allowFrom: ['owner'],
+  })
+  secondBridge.start()
+  await secondClient.messageHandler?.(inbound('chat-a', 'owner', 'continue'))
+
+  assert.equal(secondHost.createCount(), 0)
+  assert.deepEqual(secondHost.resumedSessionIds(), ['lark:chat-a'])
+  await secondBridge.stop()
+})
+
+test('e2e: /new remains active across restart before the next message', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const firstClient = createClient()
+  const firstHost = createHost(persistence)
+  const firstBridge = new LarkBridge(firstHost as never, {
+    client: firstClient,
+    allowFrom: ['owner'],
+  })
+  firstBridge.start()
+  await firstClient.messageHandler?.(inbound('chat-a', 'owner', 'old context'))
+  await firstClient.messageHandler?.(inbound('chat-a', 'owner', '/new'))
+  const freshSessionId = firstHost.createdSessionIds().at(-1)
+  assert.notEqual(freshSessionId, 'lark:chat-a')
+  assert.equal(firstHost.flushCount(), 1)
+  assert.equal(persistence.sessions.has(freshSessionId ?? ''), true)
+  await firstBridge.stop()
+
+  const secondClient = createClient()
+  const secondHost = createHost(persistence)
+  const secondBridge = new LarkBridge(secondHost as never, {
+    client: secondClient,
+    allowFrom: ['owner'],
+  })
+  secondBridge.start()
+  await secondClient.messageHandler?.(inbound('chat-a', 'owner', 'new context'))
+
+  assert.deepEqual(secondHost.resumedSessionIds(), [freshSessionId])
+  await secondBridge.stop()
+})
+
+test('e2e: a persisted-session resume failure never falls back to create', async () => {
+  const persistence: TestPersistence = {
+    sessions: new Set(['lark:chat-a']),
+    resumeError: new Error('persisted session is corrupt'),
+  }
+  const client = createClient()
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await assert.rejects(
+    client.messageHandler?.(inbound('chat-a', 'owner', 'continue')),
+    /persisted session is corrupt/,
+  )
+  assert.equal(host.resumeCount(), 1)
+  assert.equal(host.createCount(), 0)
+  await bridge.stop()
+})
+
+test('e2e: /new durability failure keeps the previous session active', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const client = createClient()
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'old context'))
+  persistence.flushError = new Error('durability unavailable')
+
+  await assert.rejects(
+    client.messageHandler?.(inbound('chat-a', 'owner', '/new')),
+    /durability unavailable/,
+  )
+  const failedSessionId = host.createdSessionIds().at(-1)
+  assert.deepEqual(host.disposedSessionIds(), [failedSessionId])
+  assert.equal(persistence.sessions.has(failedSessionId ?? ''), false)
+
+  persistence.flushError = undefined
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'still old context'))
+  assert.equal(host.createdSessionIds().length, 2)
+  await bridge.stop()
+})
+
+test('e2e: failed /new retains a fresh handle when cleanup also fails', async () => {
+  const persistence: TestPersistence = {
+    sessions: new Set(),
+    flushError: new Error('durability unavailable'),
+    disposeErrorOnce: new Error('dispose unavailable'),
+  }
+  const client = createClient()
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'old context'))
+
+  await assert.rejects(
+    client.messageHandler?.(inbound('chat-a', 'owner', '/new')),
+    /durability and cleanup failed/,
+  )
+  const failedSessionId = host.createdSessionIds().at(-1) ?? ''
+  assert.equal(host.disposedSessionIds().filter((id) => id === failedSessionId).length, 1)
+
+  persistence.flushError = undefined
+  await bridge.stop()
+  assert.equal(host.disposedSessionIds().filter((id) => id === failedSessionId).length, 2)
+})
+
+test('e2e: /new retains cleanup ownership when old-session disposal fails', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const client = createClient()
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'old context'))
+  persistence.disposeErrorOnce = new Error('dispose unavailable')
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', '/new'))
+  assert.equal(client.sent.at(-1)?.text, '已开始新会话。')
+  assert.deepEqual(host.disposedSessionIds(), ['lark:chat-a'])
+
+  await bridge.stop()
+  assert.equal(host.disposedSessionIds().filter((id) => id === 'lark:chat-a').length, 2)
+})
+
+test('e2e: approval waits for reset and expires with the old session', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const client = createClient()
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run it'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec',
+    reason: 'run tests',
+  })
+  await waitFor(() => client.cards.some((card) => requestId(card.card) !== ''))
+  const approval = client.cards.find((card) => requestId(card.card) !== '')
+  const reset = Promise.withResolvers<void>()
+  persistence.flushWait = reset.promise
+  const resetting = client.messageHandler?.(inbound('chat-a', 'owner', '/new'))
+  let decided = false
+  const decision = client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: approval?.messageId ?? '',
+    value: { decision: 'allowed-once', request_id: requestId(approval?.card) },
+  }).then((result) => {
+    decided = true
+    return result
+  })
+  await flushDeliveries()
+  assert.equal(decided, false)
+
+  reset.resolve()
+  await resetting
+  assert.equal((await decision)?.toast.type, 'info')
+  assert.equal(await outcome, 'cancelled')
+  await waitFor(() => client.updated.some((entry) => (
+    entry.messageId === approval?.messageId && JSON.stringify(entry.card).includes('grey')
+  )))
+  await bridge.stop()
+})
+
+test('e2e: only the originating user and chat can decide an approval', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner', 'other'],
+  })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run it'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec',
+    reason: 'run tests',
+  })
+  await Promise.resolve()
+  const id = requestId(client.cards[0]?.card)
+
+  await client.cardHandler?.({
+    openId: 'other', chatId: 'chat-a', messageId: 'card-1',
+    value: { decision: 'allowed-once', request_id: id },
+  })
+  await client.cardHandler?.({
+    openId: 'owner', chatId: 'chat-b', messageId: 'card-1',
+    value: { decision: 'allowed-once', request_id: id },
+  })
+  assert.equal(client.updated.length, 0)
+
+  await client.cardHandler?.({
+    openId: 'owner', chatId: 'chat-a', messageId: 'card-1',
+    value: { decision: 'allowed-once', request_id: id },
+  })
+  assert.equal(await outcome, 'allowed-once')
+  assert.equal(client.updated.length, 1)
+  await bridge.stop()
+})
+
+test('e2e: a turn updates one execution card across the tool lifecycle', async () => {
+  const client = createClient()
+  let activeUpdates = 0
+  let maxActiveUpdates = 0
+  client.updateCard = async (messageId, card) => {
+    activeUpdates += 1
+    maxActiveUpdates = Math.max(maxActiveUpdates, activeUpdates)
+    await new Promise((resolve) => setTimeout(resolve, 1))
+    client.updated.push({ messageId, card })
+    activeUpdates -= 1
+  }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'inspect the repository'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', { type: 'step/start', time: 1_100, data: { turn: 1, step: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'tool/call', time: 1_200,
+    data: { turn: 1, step: 1, callId: 'call-1', name: 'exec_command', arguments: '{"cmd":"git status"}' },
+  })
+  host.emit('lark:chat-a', {
+    type: 'tool/result', time: 1_300, surfaceOp: 'append',
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-1' },
+        content: [{
+          type: 'tool-result', toolCallId: 'call-1', isError: false,
+          content: [{ type: 'text', text: 'working tree clean' }],
+        }],
+      },
+    },
+  })
+  host.emit('lark:chat-a', assistantMessage(1, 'Repository inspection complete.'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_500,
+    data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.updated.length === 4)
+
+  assert.equal(client.sent.length, 0)
+  assert.equal(client.cards.length, 1)
+  assert.equal(maxActiveUpdates, 1)
+  const payload = client.updated.at(-1)?.card as {
+    schema?: string
+    header?: unknown
+    body?: { elements?: Array<{ element_id?: string }> }
+  }
+  assert.equal(payload.schema, '2.0')
+  assert.equal(payload.header, undefined)
+  assert.ok(payload.body?.elements?.some((element) => element.element_id === 'execution_panel'))
+  const encoded = JSON.stringify(payload)
+  assert.match(encoded, /exec.*command/)
+  assert.match(encoded, /Repository inspection complete/)
+  await bridge.stop()
+})
+
+test('e2e: a failed turn finishes with an attention card', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'fail safely'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_500,
+    data: { turn: 1, reason: { kind: 'error', error: { message: 'provider unavailable', code: 'UPSTREAM' } } },
+  })
+  await flushDeliveries()
+
+  assert.equal(client.cards.length, 1)
+  const payload = client.updated.at(-1)?.card as {
+    header?: { template?: string; title?: { content?: string } }
+  }
+  assert.equal(payload.header?.template, 'red')
+  assert.equal(payload.header?.title?.content, '执行失败')
+  assert.match(JSON.stringify(payload), /provider unavailable/)
+  await bridge.stop()
+})
+
+test('e2e: an extension turn result fails soft', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run an extension'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  assert.doesNotThrow(() => host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_500,
+    data: { turn: 1, reason: { kind: 'extension-result' } },
+  }))
+  await flushDeliveries()
+
+  assert.match(JSON.stringify(client.updated.at(-1)?.card), /extension-result/)
+  await bridge.stop()
+})
+
+test('e2e: client stop failure still disposes owned agents', async () => {
+  const client = createClient()
+  client.stop = async () => { throw new Error('transport stop failed') }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'create a session'))
+  await assert.rejects(bridge.stop(), /bridge teardown failed/)
+
+  assert.deepEqual(host.disposedSessionIds(), ['lark:chat-a'])
+})
+
+test('e2e: stop closes a client that finishes starting concurrently', async () => {
+  const client = createClient()
+  const started = Promise.withResolvers<void>()
+  let stops = 0
+  client.start = () => started.promise
+  client.stop = async () => { stops += 1 }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+
+  const starting = bridge.start()
+  const stopping = bridge.stop()
+  started.resolve()
+  await starting
+  await stopping
+
+  assert.equal(stops, 2)
+})
+
+test('e2e: stop waits for fallback text delivery', async () => {
+  const client = createClient()
+  delete client.sendCard
+  delete client.updateCard
+  const delivery = Promise.withResolvers<void>()
+  let sending = false
+  client.sendText = async (chatId, text) => {
+    client.sent.push({ chatId, text })
+    sending = true
+    await delivery.promise
+  }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'answer safely'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, 'fallback answer'))
+  await waitFor(() => sending)
+  let stopped = false
+  const stopping = bridge.stop().then(() => { stopped = true })
+  await flushDeliveries()
+  assert.equal(stopped, false)
+  delivery.resolve()
+  await stopping
+})
+
+test('e2e: card creation failure falls back to final text', async () => {
+  const client = createClient()
+  client.sendCard = async () => { throw new Error('card unavailable') }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'answer safely'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, 'fallback answer'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.some((message) => message.text === 'fallback answer'))
+
+  assert.equal(client.sent.filter((message) => message.text === 'fallback answer').length, 1)
+  await bridge.stop()
+})
+
+test('e2e: card update failure falls back to final text once', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'answer safely'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  await waitFor(() => client.cards.length === 1)
+  client.updateCard = async () => { throw new Error('card unavailable') }
+  host.emit('lark:chat-a', assistantMessage(1, 'fallback answer'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.some((message) => message.text === 'fallback answer'))
+
+  assert.equal(client.sent.filter((message) => message.text === 'fallback answer').length, 1)
+  await bridge.stop()
+})
+
+test('e2e: final card failure falls back after a partial answer was delivered', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'answer safely'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, 'partial answer'))
+  await waitFor(() => JSON.stringify(client.updated).includes('partial answer'))
+  client.updateCard = async () => { throw new Error('card unavailable') }
+  host.emit('lark:chat-a', assistantMessage(1, 'final answer'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.some((message) => message.text.includes('final answer')))
+
+  assert.equal(client.sent.filter((message) => message.text.includes('final answer')).length, 1)
+  await bridge.stop()
+})
+
+test('e2e: approval cards are Card 2.0 and concurrent duplicate decisions are idempotent', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    callId: 'call-1',
+    reason: 'Run the repository test suite with <private> input.',
+  })
+  await Promise.resolve()
+  const approval = client.cards.find((card) => requestId(card.card) !== '')
+  const id = requestId(approval?.card)
+  assert.ok(id !== '')
+
+  const action = {
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: approval?.messageId ?? '',
+    value: { decision: 'allowed-once', request_id: id },
+  }
+  const results = await Promise.all([
+    client.cardHandler?.(action),
+    client.cardHandler?.(action),
+  ])
+
+  assert.equal(await outcome, 'allowed-once')
+  assert.equal(client.updated.filter((update) => update.messageId === approval?.messageId).length, 1)
+  assert.equal((approval?.card as { schema?: string }).schema, '2.0')
+  assert.match(JSON.stringify(approval?.card), /&lt;private&gt;/)
+  assert.deepEqual(results.map((result) => result?.toast?.type), ['success', 'info'])
+  const decided = client.updated.find((update) => update.messageId === approval?.messageId)?.card as {
+    schema?: string
+    header?: { template?: string }
+  }
+  assert.equal(decided.schema, '2.0')
+  assert.equal(decided.header?.template, 'green')
+  await bridge.stop()
+})
+
+test('e2e: aborting an approval cancels it and closes the card', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  const controller = new AbortController()
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+    signal: controller.signal,
+  })
+  await Promise.resolve()
+  const approval = client.cards.find((card) => requestId(card.card) !== '')
+  controller.abort()
+
+  assert.equal(await outcome, 'cancelled')
+  await flushDeliveries()
+  const decided = client.updated.find((update) => update.messageId === approval?.messageId)?.card as {
+    header?: { template?: string }
+  }
+  assert.equal(decided.header?.template, 'grey')
+  await bridge.stop()
+})
+
+test('e2e: approval card delivery failure fails closed', async () => {
+  const client = createClient()
+  client.sendCard = async () => { throw new Error('delivery unavailable') }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  const outcome = await host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+  })
+
+  assert.equal(outcome, 'unavailable')
+  await bridge.stop()
+})
+
+test('e2e: approval card without a message id fails closed', async () => {
+  const client = createClient()
+  client.sendCard = async () => undefined
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  const outcome = await host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+  })
+
+  assert.equal(outcome, 'unavailable')
+  await bridge.stop()
+})
+
+test('e2e: streamed reasoning and text are throttled into the turn card', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner'],
+    streamUpdateIntervalMs: 60_000,
+  })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'stream an answer'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'assistant/chunk', time: 1_100,
+    data: { turn: 1, step: 1, chunk: { type: 'reasoning-delta', index: 0, text: 'Checking the repository.' } },
+  })
+  host.emit('lark:chat-a', {
+    type: 'assistant/chunk', time: 1_101,
+    data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 1, text: 'partial ' } },
+  })
+  host.emit('lark:chat-a', {
+    type: 'assistant/chunk', time: 1_102,
+    data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 1, text: 'answer' } },
+  })
+  host.emit('lark:chat-a', assistantMessage(1, 'Final answer.'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_500,
+    data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await flushDeliveries()
+
+  const encoded = JSON.stringify(client.updated.at(-1)?.card)
+  assert.match(encoded, /Checking the repository/)
+  assert.match(encoded, /Final answer/)
+  assert.doesNotMatch(encoded, /partial answer/)
+  assert.ok(client.updated.length <= 3)
+  await bridge.stop()
+})
+
+test('e2e: todo and extended lifecycle events share the execution card', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run the workflow'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'todo/write', time: 1_050,
+    data: { todos: [
+      { content: 'Inspect repository', status: 'completed' },
+      { content: 'Run checks', status: 'in_progress' },
+    ] },
+  })
+  host.emit('lark:chat-a', {
+    type: 'llm/retry', seq: 10, time: 1_100,
+    data: {
+      retryId: 'retry-1', turn: 1, step: 1, provider: 'deepseek', mode: 'normal',
+      policyKey: 'default', retry: 1, maxRetries: 2, delayMs: 100,
+      failure: { message: 'temporary upstream failure', code: 'UPSTREAM' },
+    },
+  })
+  host.emit('lark:chat-a', {
+    type: 'llm/retry-started', seq: 11, time: 1_200,
+    data: { retryId: 'retry-1', turn: 1, step: 1, retry: 1 },
+  })
+  host.emit('lark:chat-a', {
+    type: 'tool/code-dispatch-start', seq: 12, time: 1_300,
+    data: {
+      rootCallId: 'root', parentCallId: 'parent', subCallId: 'sub-1',
+      name: 'read_file', arguments: { path: 'README.md' },
+    },
+  })
+  host.emit('lark:chat-a', {
+    type: 'tool/code-dispatch', seq: 13, time: 1_400,
+    data: {
+      rootCallId: 'root', parentCallId: 'parent', subCallId: 'sub-1',
+      name: 'read_file', arguments: { path: 'README.md' }, isError: false, content: [],
+    },
+  })
+  host.emit('lark:chat-a', {
+    type: 'command/run', seq: 14, time: 1_410,
+    data: { commandId: 'command-1', name: 'status', args: ' --short', source: { kind: 'user' } },
+  })
+  host.emit('lark:chat-a', {
+    type: 'command/done', seq: 15, time: 1_420,
+    data: { commandId: 'command-1', kind: 'success', text: 'clean' },
+  })
+  host.emit('lark:chat-a', {
+    type: 'compaction/start', seq: 16, time: 1_430,
+    data: { compactionId: 'compaction-1', turn: 1 },
+  })
+  host.emit('lark:chat-a', {
+    type: 'compaction/end', seq: 17, time: 1_440,
+    data: { compactionId: 'compaction-1', turn: 1 },
+  })
+  host.emit('lark:chat-a', {
+    type: 'goal/change', seq: 18, time: 1_450,
+    data: { operation: 'create', goal: { id: 'goal-1', objective: 'Ship the bridge' } },
+  })
+  host.emit('lark:chat-a', {
+    type: 'hook/invoked', seq: 19, time: 1_460,
+    data: { turn: 1, point: 'PreToolUse', dialect: 'codex', handlerId: 'hook-1' },
+  })
+  host.emit('lark:chat-a', {
+    type: 'hook/result', seq: 20, time: 1_470,
+    data: { turn: 1, point: 'PreToolUse', handlerId: 'hook-1', decision: 'pass', exitCode: 0, durationMs: 10 },
+  })
+  host.emit('lark:chat-a', {
+    type: 'tool-workflow/run-start', seq: 21, time: 1_480,
+    data: { runId: 'workflow-1', name: 'release' },
+  })
+  host.emit('lark:chat-a', {
+    type: 'tool-workflow/agent-start', seq: 22, time: 1_481,
+    data: { runId: 'workflow-1', seq: 1, label: 'Review', childId: 'child-1' },
+  })
+  host.emit('lark:chat-a', {
+    type: 'tool-workflow/agent-end', seq: 23, time: 1_482,
+    data: { runId: 'workflow-1', seq: 1, outcome: { kind: 'completed' } },
+  })
+  host.emit('lark:chat-a', {
+    type: 'tool-workflow/run-end', seq: 24, time: 1_483,
+    data: { runId: 'workflow-1', stopReason: { kind: 'completed' } },
+  })
+  host.emit('lark:chat-a', assistantMessage(1, 'Workflow complete.'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_500,
+    data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await flushDeliveries()
+
+  const encoded = JSON.stringify(client.updated.at(-1)?.card)
+  for (const expected of [
+    'Inspect repository', 'Run checks', '模型重试', 'read.*file', '命令 /status',
+    '压缩上下文', 'Ship the bridge', 'Hook PreToolUse', '工作流 release', '子任务 Review',
+    'Workflow complete',
+  ]) {
+    assert.match(encoded, new RegExp(expected))
+  }
+  await bridge.stop()
+})
+
+test('e2e: unknown extension events are logged once and ignored', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'handle extensions'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', { type: 'plugin/custom', seq: 1, time: 1_100, data: {}, ignorable: true })
+  host.emit('lark:chat-a', { type: 'plugin/custom', seq: 2, time: 1_200, data: {}, ignorable: true })
+
+  assert.equal(host.warnings().filter((args) => String(args[0]).includes('unclassified')).length, 1)
+  await bridge.stop()
+})
+
+test('e2e: unsafe streaming update intervals fail at construction', () => {
+  assert.throws(
+    () => new LarkBridge(createHost() as never, {
+      client: createClient(),
+      streamUpdateIntervalMs: 99,
+    }),
+    /streamUpdateIntervalMs/,
+  )
+})

@@ -1,0 +1,13 @@
+node_modules/
+lib/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.credentials.yaml
+.npmrc
+.dsh/
+coverage/
+*.tgz
+*.log
+.DS_Store
