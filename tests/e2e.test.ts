@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { LarkBridge } from '../src/bridge.ts'
 import { CARD_LIMITS } from '../src/cards.ts'
@@ -798,6 +799,28 @@ test('e2e: stop waits for fallback text delivery', async () => {
   assert.equal(stopped, false)
   delivery.resolve()
   await stopping
+})
+
+test('delivery task cleanup does not create an unhandled rejection', () => {
+  const bridgeModule = new URL('../src/bridge.ts', import.meta.url).href
+  const probe = `
+    import { LarkBridge } from ${JSON.stringify(bridgeModule)}
+
+    const bridge = new LarkBridge({}, { client: {} })
+    const delivery = Promise.reject(new Error('delivery exploded'))
+    bridge.trackDelivery(delivery)
+    await delivery.catch(() => undefined)
+    await new Promise((resolve) => setImmediate(resolve))
+  `
+  const checked = spawnSync(process.execPath, [
+    '--unhandled-rejections=strict',
+    '--import=tsx',
+    '--input-type=module',
+    '--eval',
+    probe,
+  ], { encoding: 'utf8', timeout: 10_000 })
+
+  assert.equal(checked.status, 0, checked.stderr || checked.stdout)
 })
 
 test('e2e: card creation failure falls back to final text', async () => {
