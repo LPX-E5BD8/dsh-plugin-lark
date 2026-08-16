@@ -23,6 +23,7 @@ interface LocaleCopy {
     readonly stopUnavailable: string
     readonly stopWrongContext: string
     readonly commandFailed: string
+    readonly longAnswer: string
     commandDescription(name: string, fallback: string): string
     unknownCommand(command: string): string
     unknownTurnEnd(kind: string): string
@@ -97,6 +98,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       stopUnavailable: '暂时无法停止。',
       stopWrongContext: '只能由发起用户在原会话中停止。',
       commandFailed: '命令执行失败，请重试。',
+      longAnswer: '回复较长，以下为完整内容：',
       commandDescription: (name, fallback) => ({
         compact: '整理较早的会话上下文',
         goal: '查看或设置长任务目标',
@@ -174,6 +176,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       stopUnavailable: 'Unable to stop this run.',
       stopWrongContext: 'Only the initiating user can stop this run in the original chat.',
       commandFailed: 'Command execution failed. Please try again.',
+      longAnswer: 'The reply is long. Here is the complete content:',
       commandDescription: (_name, fallback) => fallback,
       unknownCommand: (command) => `Unknown command ${command}. Send /help.`,
       unknownTurnEnd: (kind) => `Unknown execution result: ${kind}`,

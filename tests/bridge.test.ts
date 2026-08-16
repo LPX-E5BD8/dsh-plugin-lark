@@ -135,6 +135,22 @@ test('splitText chunks long replies', () => {
   assert.throws(() => splitText('text', 0), RangeError)
 })
 
+test('SDK sendText delivers every long reply chunk in order', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const chunks: string[] = []
+  const internals = client as unknown as {
+    sendImpl: (chatId: string, text: string) => Promise<void>
+  }
+  internals.sendImpl = async (_chatId, text) => { chunks.push(text) }
+  const answer = `start-${'答'.repeat(8_000)}-end`
+
+  await client.sendText('chat-a', answer)
+
+  assert.ok(chunks.length > 1)
+  assert.ok(chunks.every((chunk) => [...chunk].length <= 4_000))
+  assert.equal(chunks.join(''), answer)
+})
+
 test('plain-text fallback neutralizes platform mentions', () => {
   assert.equal(
     neutralizeTextMentions('before <at user_id="all">all</at> after'),
@@ -181,6 +197,7 @@ test('SDK client can reply while the optional loading image is still uploading',
   const request = prototype.request
   const start = Lark.WSClient.prototype.start
   const loading = Promise.withResolvers<void>()
+  const loadingStarted = Promise.withResolvers<void>()
   prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
   Lark.WSClient.prototype.start = async function startReady() {
     const client = this as unknown as { onReady?: () => void }
@@ -191,10 +208,13 @@ test('SDK client can reply while the optional loading image is still uploading',
     prepareLoadingImage: () => Promise<void>
     sendImpl?: unknown
   }
-  internals.prepareLoadingImage = () => loading.promise
+  internals.prepareLoadingImage = async () => {
+    loadingStarted.resolve()
+    await loading.promise
+  }
   try {
     const starting = client.start()
-    await new Promise((resolve) => setImmediate(resolve))
+    await loadingStarted.promise
     assert.equal(typeof internals.sendImpl, 'function')
     loading.resolve()
     await starting

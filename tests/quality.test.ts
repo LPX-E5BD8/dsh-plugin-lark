@@ -4,7 +4,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import ts from 'typescript'
-import { CARD_LIMITS, renderTurnCard } from '../src/cards.ts'
+import { CARD_LIMITS, renderTurnCard, renderTurnCardWithMeta } from '../src/cards.ts'
 import { DEFAULT_CONFIG } from '../src/config.ts'
 import { nonCatalogPolicyTypes, projectActivity, unclassifiedKnownEventTypes } from '../src/events.ts'
 import { apply } from '../src/index.ts'
@@ -131,6 +131,32 @@ test('quality: rendered cards stay within the Lark byte limit', () => {
   assert.match(encoded, /…/)
 })
 
+test('quality: card rendering reports byte-cap answer truncation', () => {
+  const answer = '&'.repeat(CARD_LIMITS.maxAnswerRunes)
+  const rendered = renderTurnCardWithMeta({
+    status: 'completed',
+    answer,
+    tools: [],
+    startedAt: 1_000,
+    updatedAt: 2_000,
+  })
+  const encoded = JSON.stringify(rendered.payload)
+  assert.equal(rendered.answerTruncated, true)
+  assert.ok(Buffer.byteLength(encoded, 'utf8') <= CARD_LIMITS.maxBytes)
+  assert.ok((encoded.match(/&amp;/g)?.length ?? 0) < answer.length)
+})
+
+test('quality: display trimming does not report a short answer as truncated', () => {
+  const rendered = renderTurnCardWithMeta({
+    status: 'completed',
+    answer: 'short reply\n',
+    tools: [],
+    startedAt: 1_000,
+    updatedAt: 2_000,
+  })
+  assert.equal(rendered.answerTruncated, false)
+})
+
 test('quality: running cards nest tools and bound reasoning', () => {
   const latestReasoning = Array.from(
     { length: CARD_LIMITS.maxReasoningLines + 2 },
@@ -185,6 +211,41 @@ test('quality: running cards nest tools and bound reasoning', () => {
   }) as { body?: { elements?: Array<{ elements?: Array<{ tag?: string; icon?: { token?: string } }> }> } }
   const completedReasoning = completed.body?.elements?.[0]?.elements?.find((element) => element.tag === 'div')
   assert.equal(completedReasoning?.icon?.token, 'done_outlined')
+})
+
+test('quality: execution cards favor reasoning over recent tools', () => {
+  assert.equal(CARD_LIMITS.maxVisibleTools, 3)
+  assert.equal(CARD_LIMITS.maxReasoningLines, 12)
+  const payload = renderTurnCard({
+    status: 'running',
+    tools: Array.from({ length: 7 }, (_, index) => ({
+      id: `tool-${index}`,
+      name: `read-${index}`,
+      status: 'completed' as const,
+    })),
+    reasoning: Array.from({ length: 20 }, (_, index) => `reasoning-${index}`).join('\n'),
+    startedAt: 1,
+    updatedAt: 2,
+  }) as {
+    body?: { elements?: Array<{
+      element_id?: string
+      elements?: Array<{
+        tag?: string
+        content?: string
+        header?: { title?: { content?: string } }
+        text?: { lines?: number }
+      }>
+    }> }
+  }
+  const execution = payload.body?.elements?.find((element) => element.element_id === 'execution_panel')
+  const tools = execution?.elements?.filter((element) => element.tag === 'collapsible_panel') ?? []
+  assert.equal(execution?.elements?.find((element) => element.tag === 'div')?.text?.lines, 12)
+  assert.equal(tools.length, 3)
+  assert.deepEqual(
+    tools.map((tool) => tool.header?.title?.content?.match(/read-\d/)?.[0]),
+    ['read-4', 'read-5', 'read-6'],
+  )
+  assert.match(execution?.elements?.find((element) => element.tag === 'markdown')?.content ?? '', />4 /)
 })
 
 test('quality: model output cannot inject Lark platform tags', () => {

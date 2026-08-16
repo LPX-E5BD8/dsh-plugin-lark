@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { LarkBridge } from '../src/bridge.ts'
+import { CARD_LIMITS } from '../src/cards.ts'
 import type { LarkCardAction, LarkCardActionResult, LarkClientLike, LarkInbound } from '../src/lark.ts'
 
 interface SentText {
@@ -963,6 +964,192 @@ test('e2e: streamed reasoning and text are throttled into the turn card', async 
   await bridge.stop()
 })
 
+test('e2e: long card replies keep a preview and deliver the complete answer', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+  const answer = `answer-start\n${'内容'.repeat(CARD_LIMITS.maxAnswerRunes)}\nanswer-end`
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'write a long answer'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, answer))
+  await flushDeliveries()
+  assert.equal(client.sent.length, 0)
+
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_500,
+    data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.length === 1)
+
+  const card = JSON.stringify(client.updated.at(-1)?.card)
+  assert.match(card, /answer-start/)
+  assert.doesNotMatch(card, /answer-end/)
+  assert.equal(client.sent[0]?.text, `回复较长，以下为完整内容：\n\n${answer}`)
+  await bridge.stop()
+})
+
+test('e2e: a short answer with trailing whitespace stays on the card only', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'write a short answer'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, 'short reply\n'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.updated.length > 0)
+  await flushDeliveries()
+
+  assert.equal(client.sent.length, 0)
+  assert.match(JSON.stringify(client.updated.at(-1)?.card), /short reply/)
+  await bridge.stop()
+})
+
+test('e2e: byte-heavy card replies continue even below the rune preview limit', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+  const answer = `byte-start-${'&'.repeat(CARD_LIMITS.maxAnswerRunes - 24)}-byte-end`
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'write escaped text'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, answer))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.length === 1)
+
+  assert.ok([...answer].length <= CARD_LIMITS.maxAnswerRunes)
+  assert.equal(client.sent[0]?.text, `回复较长，以下为完整内容：\n\n${answer}`)
+  assert.doesNotMatch(JSON.stringify(client.updated.at(-1)?.card), /byte-end/)
+  await bridge.stop()
+})
+
+test('e2e: a failed long-answer card falls back to the untruncated answer', async () => {
+  const client = createClient()
+  client.sendCard = async () => { throw new Error('card unavailable') }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+  const answer = `fallback-start-${'长'.repeat(CARD_LIMITS.maxAnswerRunes)}-fallback-end`
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'answer without a card'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, answer))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.length === 1)
+
+  assert.equal(client.sent[0]?.text, answer)
+  await bridge.stop()
+})
+
+test('e2e: a failed terminal card update falls back to the untruncated answer', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+  const answer = `update-start-${'更'.repeat(CARD_LIMITS.maxAnswerRunes)}-update-end`
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'finish after an update'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, answer))
+  await waitFor(() => client.updated.some((entry) => JSON.stringify(entry.card).includes('update-start')))
+  client.updateCard = async () => { throw new Error('terminal update unavailable') }
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.length === 1)
+
+  assert.equal(client.sent[0]?.text, answer)
+  await bridge.stop()
+})
+
+test('e2e: a failed long-answer continuation retries through text fallback', async () => {
+  const client = createClient()
+  let attempts = 0
+  client.sendText = async (chatId, text) => {
+    attempts += 1
+    if (attempts === 1) throw new Error('continuation unavailable')
+    client.sent.push({ chatId, text })
+  }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+  const answer = `retry-start-${'重'.repeat(CARD_LIMITS.maxAnswerRunes)}-retry-end`
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'retry the continuation'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, answer))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.length === 1)
+
+  assert.equal(attempts, 2)
+  assert.deepEqual(client.sent, [{ chatId: 'chat-a', text: answer }])
+  await bridge.stop()
+})
+
+test('e2e: plain-text mode sends one complete long answer without terminal duplication', async () => {
+  const client = createClient()
+  delete client.sendCard
+  delete client.updateCard
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  bridge.start()
+  const answer = `plain-start-${'文'.repeat(CARD_LIMITS.maxAnswerRunes)}-plain-end`
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'use plain text'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, answer))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await flushDeliveries()
+
+  assert.deepEqual(client.sent, [{ chatId: 'chat-a', text: answer }])
+  await bridge.stop()
+})
+
+test('e2e: stop drains a long-answer continuation already being delivered', async () => {
+  const client = createClient()
+  const delivery = Promise.withResolvers<void>()
+  let sending = false
+  client.sendText = async (chatId, text) => {
+    client.sent.push({ chatId, text })
+    sending = true
+    await delivery.promise
+  }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+  const answer = `drain-start-${'答'.repeat(CARD_LIMITS.maxAnswerRunes)}-drain-end`
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'deliver before stopping'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, answer))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => sending)
+
+  let stopped = false
+  const stopping = bridge.stop().then(() => { stopped = true })
+  await flushDeliveries()
+  assert.equal(stopped, false)
+  assert.match(client.sent[0]?.text ?? '', /drain-end$/)
+  delivery.resolve()
+  await stopping
+})
+
 test('e2e: streaming and tool-step text stay in execution until a final message arrives', async () => {
   const client = createClient()
   const host = createHost()
@@ -1188,13 +1375,13 @@ test('e2e: todo and extended lifecycle events share the execution card', async (
 
   const encoded = JSON.stringify(client.updated.at(-1)?.card)
   for (const expected of [
-    'Inspect repository', 'Run checks', '2 个更早的工具调用已折叠', '命令 /status',
-    '压缩上下文', 'Ship the bridge', 'Hook PreToolUse', '工作流 release', '子任务 Review',
+    'Inspect repository', 'Run checks', '5 个更早的工具调用已折叠',
+    'Hook PreToolUse', '工作流 release', '子任务 Review',
     'Workflow complete',
   ]) {
     assert.match(encoded, new RegExp(expected))
   }
-  assert.doesNotMatch(encoded, /模型重试|read.*file/)
+  assert.doesNotMatch(encoded, /模型重试|read.*file|命令 \/status|压缩上下文|Ship the bridge/)
   await bridge.stop()
 })
 

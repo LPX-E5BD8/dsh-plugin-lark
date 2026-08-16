@@ -6,13 +6,13 @@ export const CARD_LIMITS = {
   maxBytes: 28 * 1024,
   maxSummaryRunes: 100,
   maxAnswerRunes: 6_000,
-  maxVisibleTools: 6,
+  maxVisibleTools: 3,
   maxToolNameRunes: 80,
   maxToolDetailRunes: 240,
   maxErrorRunes: 600,
   maxApprovalReasonRunes: 1_000,
-  maxReasoningRunes: 360,
-  maxReasoningLines: 6,
+  maxReasoningRunes: 1_000,
+  maxReasoningLines: 12,
   maxVisibleTodos: 20,
   maxTodoRunes: 240,
 } as const
@@ -669,10 +669,16 @@ function payloadBytes(payload: Record<string, unknown>): number {
   return Buffer.byteLength(JSON.stringify(payload), 'utf8')
 }
 
-function fitAnswer(card: TurnCard, tools: readonly ToolCardItem[]): Record<string, unknown> {
+export interface RenderedTurnCard {
+  readonly payload: Record<string, unknown>
+  readonly answerTruncated: boolean
+}
+
+function fitAnswer(card: TurnCard, tools: readonly ToolCardItem[]): RenderedTurnCard {
   const answer = [...(card.answer ?? '')]
   let low = 0
   let high = answer.length
+  let fittedRunes = 0
   let fitted = buildPayload({ ...card, answer: '' }, tools)
   if (payloadBytes(fitted) > CARD_LIMITS.maxBytes) {
     throw new RangeError('lark: card chrome exceeds the platform byte limit')
@@ -683,18 +689,26 @@ function fitAnswer(card: TurnCard, tools: readonly ToolCardItem[]): Record<strin
     const candidate = buildPayload({ ...card, answer: `${answer.slice(0, middle).join('')}${suffix}` }, tools)
     if (payloadBytes(candidate) <= CARD_LIMITS.maxBytes) {
       fitted = candidate
+      fittedRunes = middle
       low = middle + 1
     } else {
       high = middle - 1
     }
   }
-  return fitted
+  return {
+    payload: fitted,
+    answerTruncated: fittedRunes < answer.length,
+  }
 }
 
-export function renderTurnCard(input: TurnCard): Record<string, unknown> {
+export function renderTurnCardWithMeta(input: TurnCard): RenderedTurnCard {
+  const answerRunes = input.answer === undefined ? undefined : [...input.answer.trim()]
+  const normalizedAnswer = input.answer === undefined
+    ? undefined
+    : truncateRunes(input.answer, CARD_LIMITS.maxAnswerRunes)
   const card: TurnCard = {
     ...input,
-    answer: input.answer === undefined ? undefined : truncateRunes(input.answer, CARD_LIMITS.maxAnswerRunes),
+    answer: normalizedAnswer,
     error: input.error === undefined ? undefined : truncateRunes(input.error, CARD_LIMITS.maxErrorRunes),
     reasoning: input.reasoning === undefined
       ? undefined
@@ -702,5 +716,15 @@ export function renderTurnCard(input: TurnCard): Record<string, unknown> {
   }
   const tools = normalizedTools(card.tools)
   const payload = buildPayload(card, tools)
-  return payloadBytes(payload) <= CARD_LIMITS.maxBytes ? payload : fitAnswer(card, tools)
+  const answerTruncated = answerRunes !== undefined && answerRunes.length > CARD_LIMITS.maxAnswerRunes
+  if (payloadBytes(payload) <= CARD_LIMITS.maxBytes) return { payload, answerTruncated }
+  const fitted = fitAnswer(card, tools)
+  return {
+    payload: fitted.payload,
+    answerTruncated: answerTruncated || fitted.answerTruncated,
+  }
+}
+
+export function renderTurnCard(input: TurnCard): Record<string, unknown> {
+  return renderTurnCardWithMeta(input).payload
 }

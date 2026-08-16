@@ -76,6 +76,8 @@ function toolResponse(): StreamChunk[] {
 }
 
 class ScriptedAdapter extends LlmAdapter {
+  readonly requests: GenerateOptions[] = []
+
   constructor(private readonly responses: StreamChunk[][]) {
     super()
   }
@@ -84,11 +86,25 @@ class ScriptedAdapter extends LlmAdapter {
     return Promise.resolve({ provider, id: model, name: model })
   }
 
-  async * stream(_options: GenerateOptions): AsyncIterable<StreamChunk> {
+  async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options)
     const response = this.responses.shift()
     if (response === undefined) throw new Error('script exhausted')
     yield* response
   }
+}
+
+function echoTool() {
+  return defineTool({
+    name: 'echo',
+    description: 'echo text',
+    parameters: { text: { type: 'string', required: true } },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text' as const, text: String(value) }],
+    },
+    async execute(args) { return args.text },
+  })
 }
 
 function command(text: string): LarkInbound {
@@ -115,6 +131,12 @@ function approvalRequestId(card: unknown): string {
   return buttons?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
 }
 
+interface HarnessPreset {
+  readonly defaultId: string
+  readonly mounted: string[]
+  readonly withEchoTool?: boolean
+}
+
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return
@@ -123,7 +145,12 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   assert.fail('condition was not met before timeout')
 }
 
-async function mount(root: string, adapter?: LlmAdapter, locale?: LarkLocale): Promise<{
+async function mount(
+  root: string,
+  adapter?: LlmAdapter,
+  locale?: LarkLocale,
+  preset?: HarnessPreset,
+): Promise<{
   ctx: Context
   bridge: LarkBridge
   client: HarnessClient
@@ -138,6 +165,19 @@ async function mount(root: string, adapter?: LlmAdapter, locale?: LarkLocale): P
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
   await ctx.plugin(ApprovalService)
+  if (preset !== undefined) {
+    ctx.provide('agentPresets', {
+      resolve(id?: string) {
+        return Promise.resolve({ id: id ?? preset.defaultId })
+      },
+      async mount(agentCtx: Context, id?: string) {
+        const resolved = id ?? preset.defaultId
+        preset.mounted.push(resolved)
+        if (preset.withEchoTool === true) agentCtx.tools.register(echoTool())
+        return { id: resolved }
+      },
+    })
+  }
   if (adapter !== undefined) ctx.llm.registerAdapter(['mock'], adapter)
   const client = createClient()
   const bridge = new LarkBridge(ctx, {
@@ -188,16 +228,7 @@ test('harness e2e: message, tool approval, cards, and teardown stay assembled', 
   const root = await mkdtemp(join(tmpdir(), 'dsh-lark-assembled-'))
   t.after(() => rm(root, { recursive: true, force: true }))
   const harness = await mount(root, new ScriptedAdapter([toolResponse(), textResponse('done')]), 'en-US')
-  harness.ctx.tools.register(defineTool({
-    name: 'echo',
-    description: 'echo text',
-    parameters: { text: { type: 'string', required: true } },
-    output: {
-      schema: { type: 'string' },
-      render: (_args, value) => [{ type: 'text', text: String(value) }],
-    },
-    async execute(args) { return args.text },
-  }))
+  harness.ctx.tools.register(echoTool())
   harness.ctx.on('tools/pre-execute', async (_execution, _next): Promise<PreToolDecision> => ({
     kind: 'ask',
     reason: 'confirm echo',
@@ -237,4 +268,53 @@ test('harness e2e: message, tool approval, cards, and teardown stay assembled', 
   assert.equal(harness.client.stopped, true)
   assert.equal(harness.ctx.agents.list().length, 0)
   await harness.ctx.fiber.dispose()
+})
+
+test('harness e2e: Lark agents mount and resume their persisted agent preset', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-preset-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const firstMounts: string[] = []
+  const firstAdapter = new ScriptedAdapter([textResponse('ready')])
+  const first = await mount(root, firstAdapter, undefined, {
+    defaultId: 'standard',
+    mounted: firstMounts,
+    withEchoTool: true,
+  })
+  await first.client.messageHandler?.(command('inspect the repository'))
+  const firstAgent = first.ctx.agents.list()[0]
+  assert.ok(firstAgent !== undefined)
+  await firstAgent.whenIdle()
+  await first.ctx.sessions.flush(firstAgent.session)
+  assert.equal(firstAgent.session.header.agentPreset, 'standard')
+  assert.equal(
+    (await first.ctx.sessionPersistence.inspect(firstAgent.id)).meta.agentPreset,
+    'standard',
+  )
+  assert.deepEqual(firstMounts, ['standard'])
+  assert.ok(
+    firstAdapter.requests[0]?.tools?.some((tool) => tool.name === 'echo'),
+    'preset-scoped tools must reach the model request',
+  )
+  await first.dispose()
+
+  const resumedMounts: string[] = []
+  const resumedAdapter = new ScriptedAdapter([textResponse('resumed')])
+  const second = await mount(root, resumedAdapter, undefined, {
+    defaultId: 'replacement-default',
+    mounted: resumedMounts,
+    withEchoTool: true,
+  })
+  await second.client.messageHandler?.(command('/help'))
+  const resumedAgent = second.ctx.agents.list()[0]
+  assert.ok(resumedAgent !== undefined)
+  assert.equal(resumedAgent.session.header.agentPreset, 'standard')
+  assert.deepEqual(resumedMounts, ['standard'])
+  await second.client.messageHandler?.(command('continue'))
+  await resumedAgent.whenIdle()
+  assert.ok(
+    resumedAdapter.requests[0]?.tools?.some((tool) => tool.name === 'echo'),
+    'resumed preset-scoped tools must reach the model request',
+  )
+  await second.dispose()
 })
