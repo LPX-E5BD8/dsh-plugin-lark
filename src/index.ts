@@ -117,6 +117,12 @@ export {
   renderApprovalDecisionCard as decidedCard,
 } from './cards.ts'
 export { LarkSdkClient, splitText, unwrapCardAction } from './lark.ts'
-export type { LarkCardAction, LarkCardActionResult, LarkClientLike, LarkInbound } from './lark.ts'
+export type {
+  LarkCardAction,
+  LarkCardActionResult,
+  LarkClientLike,
+  LarkDeliveryOptions,
+  LarkInbound,
+} from './lark.ts'
 export { LARK_LOCALES } from './locale.ts'
 export type { LarkLocale } from './locale.ts'

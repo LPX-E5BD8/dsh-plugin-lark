@@ -30,14 +30,18 @@ export interface LarkCardActionResult {
   }
 }
 
+export interface LarkDeliveryOptions {
+  replyToMessageId?: string
+}
+
 export interface LarkClientLike {
   readonly loadingImageKey?: string
   start(): Promise<void>
   stopReceiving?(): Promise<void>
   stop(): Promise<void>
-  sendText(chatId: string, text: string): Promise<void>
+  sendText(chatId: string, text: string, options?: LarkDeliveryOptions): Promise<void>
   onMessage(handler: (msg: LarkInbound) => Promise<void>): void
-  sendCard?(chatId: string, card: unknown): Promise<string | void>
+  sendCard?(chatId: string, card: unknown, options?: LarkDeliveryOptions): Promise<string | void>
   updateCard?(messageId: string, card: unknown): Promise<void>
   onCardAction?(handler: (action: LarkCardAction) => Promise<LarkCardActionResult>): void
 }
@@ -148,7 +152,8 @@ type LarkRest = {
   im: {
     v1: {
       message: {
-        create: (opts: unknown) => Promise<{ data?: { message_id?: string } }>
+        create: (opts: unknown) => Promise<LarkMessageResponse>
+        reply: (opts: unknown) => Promise<LarkMessageResponse>
         patch?: (opts: unknown) => Promise<unknown>
         update?: (opts: unknown) => Promise<unknown>
       }
@@ -159,6 +164,12 @@ type LarkRest = {
   }
 }
 
+interface LarkMessageResponse {
+  code?: number
+  msg?: string
+  data?: { message_id?: string }
+}
+
 /** Real WS long-connection client via official Node SDK. */
 export class LarkSdkClient implements LarkClientLike {
   loadingImageKey: string | undefined
@@ -166,7 +177,6 @@ export class LarkSdkClient implements LarkClientLike {
   private cardHandler: ((action: LarkCardAction) => Promise<LarkCardActionResult>) | undefined
   private ws: { close?: (params?: { force?: boolean }) => void } | undefined
   private rest: LarkRest | undefined
-  private sendImpl: ((chatId: string, text: string) => Promise<void>) | undefined
   private cancelStart: ((error: Error) => void) | undefined
   private receivingStopped = false
 
@@ -261,31 +271,22 @@ export class LarkSdkClient implements LarkClientLike {
       )
       if (this.receivingStopped) throw new Error('lark: client stopped during startup')
       this.rest = rest
-      this.sendImpl = async (chatId, text) => {
-        await client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'text',
-            content: JSON.stringify({ text }),
-          },
-        })
-      }
       await this.prepareLoadingImage(rest)
+      if (this.receivingStopped) throw new Error('lark: client stopped during startup')
     } catch (error) {
       this.ws?.close?.({ force: true })
       this.ws = undefined
       this.rest = undefined
-      this.sendImpl = undefined
       throw error
     } finally {
       this.cancelStart = undefined
     }
   }
 
-  async sendText(chatId: string, text: string): Promise<void> {
-    if (this.sendImpl === undefined) throw new Error('lark client not started')
-    for (const chunk of splitText(neutralizeTextMentions(text))) await this.sendImpl(chatId, chunk)
+  async sendText(chatId: string, text: string, options?: LarkDeliveryOptions): Promise<void> {
+    for (const chunk of splitText(neutralizeTextMentions(text))) {
+      await this.deliver(chatId, 'text', JSON.stringify({ text: chunk }), options)
+    }
   }
 
   private async prepareLoadingImage(rest: LarkRest): Promise<void> {
@@ -304,18 +305,39 @@ export class LarkSdkClient implements LarkClientLike {
     }
   }
 
-  async sendCard(chatId: string, card: unknown): Promise<string | undefined> {
+  async sendCard(
+    chatId: string,
+    card: unknown,
+    options?: LarkDeliveryOptions,
+  ): Promise<string | undefined> {
+    return this.deliver(chatId, 'interactive', JSON.stringify(card), options)
+  }
+
+  private async deliver(
+    chatId: string,
+    msgType: string,
+    content: string,
+    options?: LarkDeliveryOptions,
+  ): Promise<string> {
     if (this.rest === undefined) throw new Error('lark client not started')
-    const res = await this.rest.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: {
-        receive_id: chatId,
-        msg_type: 'interactive',
-        content: JSON.stringify(card),
-      },
-    })
-    const id = res?.data?.message_id
-    return typeof id === 'string' ? id : undefined
+    const replyToMessageId = options?.replyToMessageId
+    const res = replyToMessageId !== undefined && replyToMessageId !== ''
+      ? await this.rest.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: { msg_type: msgType, content },
+      })
+      : await this.rest.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: msgType, content },
+      })
+    if (res.code !== undefined && res.code !== 0) {
+      throw new Error(`lark: message delivery failed (${res.code}): ${res.msg ?? 'unknown error'}`)
+    }
+    const id = res.data?.message_id
+    if (typeof id !== 'string' || id === '') {
+      throw new Error('lark: message delivery response is missing message_id')
+    }
+    return id
   }
 
   async updateCard(messageId: string, card: unknown): Promise<void> {
@@ -352,7 +374,6 @@ export class LarkSdkClient implements LarkClientLike {
       await this.stopReceiving()
     } finally {
       this.rest = undefined
-      this.sendImpl = undefined
     }
   }
 }
