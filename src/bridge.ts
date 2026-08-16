@@ -30,6 +30,7 @@ export interface LarkBridgeOptions {
   provider?: string
   model?: string
   streamUpdateIntervalMs?: number
+  maxConversationHandles?: number
   cwd?: string
   client: LarkClientLike
   inboundDeduplicator?: InboundDeduplicator
@@ -39,7 +40,11 @@ interface ConversationSession {
   readonly baseId: string
   handle: AgentHandle
   sessionId: string
+  lastAccess: number
 }
+
+type ConversationEvictionResult = 'evicted' | 'retained' | 'busy' | 'not-durable'
+type ConversationCheckpointResult = 'ready' | 'stale' | 'pending' | 'not-durable'
 
 interface SessionBinding {
   readonly sessionId: ReturnType<typeof SessionId>
@@ -389,9 +394,14 @@ export class LarkBridge {
   private readonly provider: string
   private readonly model: string
   private readonly streamUpdateIntervalMs: number
+  private readonly maxConversationHandles: number
   private readonly cwd: string
   private readonly conversations = new Map<string, ConversationSession>()
   private readonly conversationOpenings = new Map<string, Promise<ConversationSession>>()
+  private readonly conversationLeases = new Map<string, number>()
+  private readonly conversationLru = new Map<string, ConversationSession>()
+  private readonly conversationEvictions = new Map<string, Promise<void>>()
+  private readonly conversationIdleWatchers = new Map<string, Promise<void>>()
   private readonly handles = new Map<string, Promise<AgentHandle>>()
   private readonly queuedRoutes = new Map<string, RouteQueue>()
   private readonly turns = new Map<string, Map<number, TurnState>>()
@@ -412,8 +422,11 @@ export class LarkBridge {
   private approvalWaterfallBound = false
   private startPromise: Promise<void> | undefined
   private stopPromise: Promise<void> | undefined
+  private conversationEvictionWorker: Promise<void> | undefined
   private clientStarted = false
   private stopping = false
+  private conversationEvictionRequested = false
+  private conversationAccessSequence = 0
   private commandAbort = new AbortController()
   // Resets are rare; use per-session barriers only if contention is measured.
   private resetBarrier: Promise<void> = Promise.resolve()
@@ -434,6 +447,10 @@ export class LarkBridge {
     if (!Number.isSafeInteger(this.streamUpdateIntervalMs)
       || this.streamUpdateIntervalMs < MIN_STREAM_UPDATE_INTERVAL_MS) {
       throw new RangeError(`lark: streamUpdateIntervalMs must be an integer >= ${MIN_STREAM_UPDATE_INTERVAL_MS}`)
+    }
+    this.maxConversationHandles = options.maxConversationHandles ?? DEFAULT_CONFIG.maxConversationHandles
+    if (!Number.isSafeInteger(this.maxConversationHandles) || this.maxConversationHandles < 0) {
+      throw new RangeError('lark: maxConversationHandles must be a non-negative safe integer')
     }
     this.cwd = options.cwd ?? process.cwd()
   }
@@ -497,18 +514,29 @@ export class LarkBridge {
     }
     if (start !== undefined) await Promise.allSettled([start])
     await collectSettled([...this.activeInboundTasks], failures)
+    const evictionWorker = this.conversationEvictionWorker
+    if (evictionWorker !== undefined) await collectSettled([evictionWorker], failures)
+    if (this.conversationEvictionWorker === evictionWorker) {
+      this.conversationEvictionWorker = undefined
+    }
+    this.conversationEvictionRequested = false
     this.clearAllStreamTimers()
     await this.drainDeliveries(failures)
     await collectSettled([Promise.resolve().then(() => this.client.stop())], failures)
     const agents = await collectSettled(this.handles.values(), failures)
     this.conversations.clear()
     this.conversationOpenings.clear()
+    this.conversationLeases.clear()
+    this.conversationLru.clear()
+    this.conversationEvictions.clear()
+    this.conversationIdleWatchers.clear()
     this.handles.clear()
     this.inboundTasks.clear()
     this.activeInboundTasks.clear()
     this.completedInboundKeys.length = 0
     this.clearRoutes()
     await collectSettled([...new Set(agents)].map((handle) => handle.dispose()), failures)
+    this.conversationAccessSequence = 0
     this.clientStarted = false
     if (failures.length > 0) throw new AggregateError(failures, 'lark: bridge teardown failed')
   }
@@ -580,19 +608,20 @@ export class LarkBridge {
       return
     }
     await this.resetBarrier
-    const conversation = await this.ensureConversation(route.sessionBaseId)
-    this.enqueueRoute(conversation.sessionId, route)
-    try {
-      conversation.handle.agent.followup(createUserMessage({
-        content: [{ type: 'text', text: msg.text.trim() }],
-        source: { kind: 'user' },
-      }))
-    } catch (error) {
-      this.removeQueuedRoute(conversation.sessionId, route)
-      this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
-      await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
-      throw error
-    }
+    await this.withConversation(route.sessionBaseId, async (conversation) => {
+      this.enqueueRoute(conversation.sessionId, route)
+      try {
+        conversation.handle.agent.followup(createUserMessage({
+          content: [{ type: 'text', text: msg.text.trim() }],
+          source: { kind: 'user' },
+        }))
+      } catch (error) {
+        this.removeQueuedRoute(conversation.sessionId, route)
+        this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
+        await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
+        throw error
+      }
+    })
   }
 
   async handleCardAction(action: LarkCardAction): Promise<LarkCardActionResult> {
@@ -796,11 +825,13 @@ export class LarkBridge {
       case '/start':
       case '/help':
         await this.resetBarrier
-        await this.safeSend(
-          route.chatId,
-          this.commandHelp((await this.ensureConversation(route.sessionBaseId)).handle.agent),
-          routeDeliveryOptions(route),
-        )
+        await this.withConversation(route.sessionBaseId, async (conversation) => {
+          await this.safeSend(
+            route.chatId,
+            this.commandHelp(conversation.handle.agent),
+            routeDeliveryOptions(route),
+          )
+        })
         break
       case '/new':
       case '/clear':
@@ -836,11 +867,13 @@ export class LarkBridge {
 
   private executeRuntimeCommand(route: MessageRoute, text: string, command: string): Promise<void> {
     let operation: Promise<void> = Promise.resolve()
-    const admission = this.resetBarrier.then(async () => {
-      const conversation = await this.ensureConversation(route.sessionBaseId)
+    const admission = this.resetBarrier.then(() => {
       operation = this.enqueueSessionOperation(
-        conversation.baseId,
-        () => this.executeRuntimeCommandNow(conversation, route, text, command),
+        route.sessionBaseId,
+        () => this.withConversation(
+          route.sessionBaseId,
+          (conversation) => this.executeRuntimeCommandNow(conversation, route, text, command),
+        ),
       )
     })
     this.resetBarrier = admission.catch(() => {})
@@ -879,7 +912,14 @@ export class LarkBridge {
   }
 
   private enqueueSessionOperation<T>(baseId: string, task: () => Promise<T>): Promise<T> {
-    const operation = (this.sessionOperations.get(baseId) ?? Promise.resolve()).then(task)
+    this.acquireConversationLease(baseId)
+    const operation = (this.sessionOperations.get(baseId) ?? Promise.resolve()).then(async () => {
+      try {
+        return await task()
+      } finally {
+        this.releaseConversationLease(baseId)
+      }
+    })
     const tail = operation.then(() => {}, () => {})
     this.sessionOperations.set(baseId, tail)
     void tail.then(() => {
@@ -890,17 +930,20 @@ export class LarkBridge {
 
   private scheduleReset(route: MessageRoute): Promise<void> {
     const reset = this.resetBarrier.then(async () => {
-      const conversation = await this.ensureConversation(route.sessionBaseId)
-      await this.sessionOperations.get(conversation.baseId)
-      await this.resetConversation(route)
+      await this.withConversation(route.sessionBaseId, async (conversation) => {
+        await this.sessionOperations.get(conversation.baseId)
+        await this.resetConversation(route, conversation)
+      })
     })
     this.resetBarrier = reset.catch(() => {})
     return reset
   }
 
-  private async resetConversation(route: MessageRoute): Promise<void> {
+  private async resetConversation(
+    route: MessageRoute,
+    conversation: ConversationSession,
+  ): Promise<void> {
     const chatId = route.chatId
-    const conversation = await this.ensureConversation(route.sessionBaseId)
     const previousSessionId = conversation.sessionId
     const previousHandle = conversation.handle
     const baseId = conversation.baseId
@@ -934,6 +977,239 @@ export class LarkBridge {
     await this.safeSend(chatId, this.text.freshSession, routeDeliveryOptions(route))
   }
 
+  private async withConversation<T>(
+    baseId: string,
+    task: (conversation: ConversationSession) => Promise<T> | T,
+  ): Promise<T> {
+    this.acquireConversationLease(baseId)
+    try {
+      while (true) {
+        const eviction = this.conversationEvictions.get(baseId)
+        if (eviction !== undefined) {
+          await eviction
+          continue
+        }
+        const conversation = await this.ensureConversation(baseId)
+        const laterEviction = this.conversationEvictions.get(baseId)
+        if (laterEviction !== undefined) {
+          await laterEviction
+          continue
+        }
+        if (this.conversations.get(baseId) !== conversation) continue
+        this.touchConversation(conversation)
+        return await task(conversation)
+      }
+    } finally {
+      this.releaseConversationLease(baseId)
+    }
+  }
+
+  private acquireConversationLease(baseId: string): void {
+    this.conversationLeases.set(baseId, (this.conversationLeases.get(baseId) ?? 0) + 1)
+  }
+
+  private releaseConversationLease(baseId: string): void {
+    const leases = this.conversationLeases.get(baseId) ?? 0
+    if (leases <= 1) this.conversationLeases.delete(baseId)
+    else this.conversationLeases.set(baseId, leases - 1)
+    this.requestConversationEviction()
+  }
+
+  private touchConversation(conversation: ConversationSession): void {
+    if (this.conversations.get(conversation.baseId) !== conversation) return
+    conversation.lastAccess = ++this.conversationAccessSequence
+    this.conversationLru.delete(conversation.baseId)
+    this.conversationLru.set(conversation.baseId, conversation)
+  }
+
+  private requestConversationEviction(): void {
+    if (this.stopping || this.conversations.size <= this.maxConversationHandles) return
+    this.conversationEvictionRequested = true
+    if (this.conversationEvictionWorker !== undefined) return
+    const work = Promise.resolve().then(() => this.runConversationEvictionWorker())
+    const worker = work.catch((error: unknown) => {
+      this.ctx.logger.error('[lark] conversation eviction worker failed: %s', messageOf(error))
+    })
+    this.conversationEvictionWorker = worker
+    const cleanup = (): void => {
+      if (this.conversationEvictionWorker !== worker) return
+      this.conversationEvictionWorker = undefined
+      if (this.conversationEvictionRequested
+        && !this.stopping
+        && this.conversations.size > this.maxConversationHandles) {
+        this.requestConversationEviction()
+      }
+    }
+    void worker.then(cleanup, cleanup)
+  }
+
+  private async runConversationEvictionWorker(): Promise<void> {
+    while (this.conversationEvictionRequested
+      && !this.stopping
+      && this.conversations.size > this.maxConversationHandles) {
+      this.conversationEvictionRequested = false
+      await this.evictConversationOverflow()
+    }
+    if (this.stopping || this.conversations.size <= this.maxConversationHandles) {
+      this.conversationEvictionRequested = false
+    }
+  }
+
+  private async evictConversationOverflow(): Promise<void> {
+    const candidates = [...this.conversationLru].map(([baseId, conversation]) => ({
+      baseId,
+      conversation,
+      lastAccess: conversation.lastAccess,
+    }))
+    for (const candidate of candidates) {
+      if (this.stopping || this.conversations.size <= this.maxConversationHandles) return
+      const result = await this.tryEvictConversation(
+        candidate.baseId,
+        candidate.conversation,
+        candidate.lastAccess,
+      )
+      if (result === 'not-durable') return
+    }
+  }
+
+  private async tryEvictConversation(
+    baseId: string,
+    conversation: ConversationSession,
+    lastAccess: number,
+  ): Promise<ConversationEvictionResult> {
+    if (!this.isConversationEvictionCandidate(baseId, conversation, lastAccess)) return 'retained'
+    const gate = Promise.withResolvers<void>()
+    this.conversationEvictions.set(baseId, gate.promise)
+    try {
+      if (!this.isConversationEvictionCandidate(baseId, conversation, lastAccess)) return 'retained'
+      return await this.evictConversation(baseId, conversation, lastAccess)
+    } finally {
+      if (this.conversationEvictions.get(baseId) === gate.promise) {
+        this.conversationEvictions.delete(baseId)
+      }
+      gate.resolve()
+    }
+  }
+
+  private isConversationEvictionCandidate(
+    baseId: string,
+    conversation: ConversationSession,
+    lastAccess: number,
+  ): boolean {
+    return !this.stopping
+      && this.conversations.get(baseId) === conversation
+      && this.conversationLru.get(baseId) === conversation
+      && conversation.lastAccess === lastAccess
+      && (this.conversationLeases.get(baseId) ?? 0) === 0
+      && this.handles.has(conversation.sessionId)
+  }
+
+  private async evictConversation(
+    baseId: string,
+    conversation: ConversationSession,
+    lastAccess: number,
+  ): Promise<ConversationEvictionResult> {
+    let maintenance: Promise<ConversationCheckpointResult>
+    try {
+      maintenance = conversation.handle.agent.runMaintenance(async (signal) => {
+        if (!this.isConversationEvictionCandidate(baseId, conversation, lastAccess)
+          || signal.aborted) return 'stale'
+        if (conversation.handle.agent.inbox.hasPending) return 'pending'
+        if (this.ctx.get('sessionPersistence') === undefined) return 'not-durable'
+        const durable = await this.ctx.sessions.flush(conversation.handle.agent.session)
+        if (durable !== true) return 'not-durable'
+        if (!this.isConversationEvictionCandidate(baseId, conversation, lastAccess)
+          || signal.aborted) return 'stale'
+        return conversation.handle.agent.inbox.hasPending ? 'pending' : 'ready'
+      })
+    } catch {
+      this.watchConversationIdle(conversation)
+      return 'busy'
+    }
+
+    let checkpoint: ConversationCheckpointResult
+    try {
+      checkpoint = await maintenance
+    } catch (error) {
+      this.ctx.logger.warn(
+        '[lark] conversation eviction checkpoint failed; retaining handle: %s',
+        messageOf(error),
+      )
+      return 'not-durable'
+    }
+    if (checkpoint === 'not-durable') return 'not-durable'
+    if (checkpoint !== 'ready') {
+      if (checkpoint === 'pending' && conversation.handle.agent.status === 'running') {
+        this.watchConversationIdle(conversation)
+      }
+      return 'retained'
+    }
+    if (!this.isConversationEvictionCandidate(baseId, conversation, lastAccess)) return 'retained'
+    if (conversation.handle.agent.inbox.hasPending) {
+      if (conversation.handle.agent.status === 'running') this.watchConversationIdle(conversation)
+      return 'retained'
+    }
+    if (conversation.handle.agent.status !== 'idle') {
+      this.watchConversationIdle(conversation)
+      return 'busy'
+    }
+
+    let disposeError: unknown
+    try {
+      await conversation.handle.dispose()
+    } catch (error) {
+      disposeError = error
+    }
+    this.finalizeConversationEviction(conversation)
+    if (disposeError !== undefined) {
+      this.ctx.logger.error('[lark] evicted conversation disposal failed: %s', messageOf(disposeError))
+    }
+    return 'evicted'
+  }
+
+  private watchConversationIdle(conversation: ConversationSession): void {
+    const baseId = conversation.baseId
+    if (this.stopping
+      || this.conversations.get(baseId) !== conversation
+      || this.conversationIdleWatchers.has(baseId)) return
+    let idle: Promise<void>
+    try {
+      idle = conversation.handle.agent.whenIdle()
+    } catch (error) {
+      this.ctx.logger.warn('[lark] conversation idle wait failed: %s', messageOf(error))
+      return
+    }
+    this.conversationIdleWatchers.set(baseId, idle)
+    const clear = (): boolean => {
+      if (this.conversationIdleWatchers.get(baseId) !== idle) return false
+      this.conversationIdleWatchers.delete(baseId)
+      return true
+    }
+    void idle.then(
+      () => {
+        if (clear() && this.conversations.get(baseId) === conversation) {
+          this.requestConversationEviction()
+        }
+      },
+      (error: unknown) => {
+        if (!clear()) return
+        this.ctx.logger.warn('[lark] conversation idle wait failed: %s', messageOf(error))
+      },
+    )
+  }
+
+  private finalizeConversationEviction(conversation: ConversationSession): void {
+    const { baseId, sessionId } = conversation
+    if (this.conversations.get(baseId) !== conversation) return
+    this.conversations.delete(baseId)
+    this.conversationOpenings.delete(baseId)
+    if (this.conversationLru.get(baseId) === conversation) this.conversationLru.delete(baseId)
+    this.conversationIdleWatchers.delete(baseId)
+    this.handles.delete(sessionId)
+    this.lastSessionGenerations.delete(baseId)
+    this.clearSessionState(sessionId)
+  }
+
   private async ensureConversation(baseId: string): Promise<ConversationSession> {
     const existing = this.conversations.get(baseId)
     if (existing !== undefined) return existing
@@ -963,8 +1239,9 @@ export class LarkBridge {
       baseId,
       Math.max(this.lastSessionGenerations.get(baseId) ?? 0, binding.generation),
     )
-    const entry: ConversationSession = { baseId, handle, sessionId: String(sessionId) }
+    const entry: ConversationSession = { baseId, handle, sessionId: String(sessionId), lastAccess: 0 }
     this.conversations.set(baseId, entry)
+    this.touchConversation(entry)
     return entry
   }
 

@@ -60,6 +60,7 @@ The bundled Cordis patch uses these defaults:
     provider: deepseek-official
     model: deepseek-v4-flash
     streamUpdateIntervalMs: 1000
+    maxConversationHandles: 32  # steady-state live conversation-handle target
 ```
 
 `allowFrom` is fail-closed: an empty list with `allowAllUsers: false` denies everyone. Use `allowAllUsers: true` only for an intentionally public bot. Use `domain: lark` for apps hosted on `open.larksuite.com`.
@@ -69,6 +70,10 @@ The `0.1.0` release was credential-smoke-tested against Feishu. The Lark domain 
 Leave `defaultSessionId` empty for conversation isolation. Direct chats retain the compatible `lark:<chatId>` session. In group chats, each ordinary reply tree uses its root message as a resumable scope, while each native Lark thread uses its chat and thread IDs. `parent_id` never selects a session. Set `defaultSessionId` only when every authorized direct chat, reply tree, and thread should share one Harness session.
 
 With a Harness session-persistence backend, the bridge resumes the latest generation for the exact conversation scope after restart. `/new` and `/clear` reset only that direct chat, reply tree, or thread; with `defaultSessionId`, they intentionally reset the global shared session. An acknowledgement arrives only after the fresh generation reaches the durability checkpoint, and storage or resume failures never fall back to an empty session.
+
+`maxConversationHandles` is the per-plugin steady-state target for live conversation handles, not a hard concurrency limit. When the total rises above the target, the bridge releases least-recently-used handles only after the conversation has no active turn, pending inbox work, or bridge-owned operation, and `sessions.flush()` confirms that a durability listener participated. The bridge never cancels or refuses those workloads merely to make room. Missing durability or a failed checkpoint keeps the handle resident and can leave the live total temporarily above the target. Once terminal cleanup starts, that retired handle is never reused; cleanup failures are logged, and later access cold-resumes the durable session.
+
+Set `maxConversationHandles: 0` to keep no durably checkpointed idle handle warm. A later message cold-resumes the exact persisted session generation with its Agent preset and scoped tools. Eviction removes only the process-local Agent and Session; it never deletes the durable transcript. Cold resume can add latency, and custom profiles without session persistence retain their handles rather than discard conversation history.
 
 Group sessions created before `0.3.0` were chat-wide and cannot be assigned safely to one reply root. They remain in storage for rollback or export, but `0.3.0` does not auto-attach them to a new reply-tree or thread session. Direct-chat and explicit `defaultSessionId` sessions keep their existing identities.
 

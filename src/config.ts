@@ -6,6 +6,7 @@ export const DEFAULT_CONFIG = {
   model: 'deepseek-v4-flash',
   sessionPrefix: 'lark',
   streamUpdateIntervalMs: 1_000,
+  maxConversationHandles: 32,
 } as const
 
 export const LARK_APP_ID_PATTERN = /^cli_[0-9a-f]{16}$/i

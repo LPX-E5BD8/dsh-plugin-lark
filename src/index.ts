@@ -20,6 +20,7 @@ export interface LarkConfig {
   provider?: string
   model?: string
   streamUpdateIntervalMs?: number
+  maxConversationHandles?: number
 }
 
 export const Config: Schema = Schema.object({
@@ -31,6 +32,9 @@ export const Config: Schema = Schema.object({
   provider: Schema.string().default(DEFAULT_CONFIG.provider),
   model: Schema.string().default(DEFAULT_CONFIG.model),
   streamUpdateIntervalMs: Schema.number().default(DEFAULT_CONFIG.streamUpdateIntervalMs),
+  maxConversationHandles: Schema.natural()
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(DEFAULT_CONFIG.maxConversationHandles),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -93,6 +97,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
         provider: config.provider,
         model: config.model,
         streamUpdateIntervalMs: config.streamUpdateIntervalMs,
+        maxConversationHandles: config.maxConversationHandles,
       })
       await bridge.start()
     } catch (error) {

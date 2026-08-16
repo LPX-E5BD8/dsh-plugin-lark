@@ -44,9 +44,16 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Expose the official SDK WebSocket connection state through an optional Web-profile readiness endpoint.
 - Return only sanitized reconnect metadata, with non-connected states failing readiness.
 
-## Later 0.x — Operations
+## 0.6.0 — Bounded conversation residency
 
-- Bound idle in-memory conversation handles after their durable checkpoint.
+- Keep live conversation handles within a configurable steady-state target by releasing least-recently-used idle entries after a confirmed durability checkpoint.
+- Preserve active turns, pending inbox work, and bridge operations, then cold-resume the exact persisted conversation scope when an evicted conversation is used again.
+
+## Later 0.x — Usability
+
+- Publish a Chinese README alongside the English documentation and add a complete feature overview.
+- Let each authorized conversation select a validated project/workspace without affecting other conversations.
+- Let each conversation select and persist an available provider/model without cross-session leakage.
 
 ## 1.0 — Stable release
 
