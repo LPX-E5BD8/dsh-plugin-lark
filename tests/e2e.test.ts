@@ -936,6 +936,153 @@ test('e2e: aborting an approval cancels it and closes the card', async () => {
   await bridge.stop()
 })
 
+test('e2e: abort while approval card send is pending closes the late card', async () => {
+  const client = createClient()
+  const sendEntered = Promise.withResolvers<void>()
+  const sendRelease = Promise.withResolvers<void>()
+  const originalSendCard = client.sendCard!.bind(client)
+  client.sendCard = async (chatId, card, options) => {
+    if (requestId(card) !== '') {
+      sendEntered.resolve()
+      await sendRelease.promise
+    }
+    return originalSendCard(chatId, card, options)
+  }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  const controller = new AbortController()
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+    signal: controller.signal,
+  })
+  await sendEntered.promise
+  assert.equal(client.cards.some((entry) => requestId(entry.card) !== ''), false)
+
+  controller.abort()
+  assert.equal(await outcome, 'cancelled')
+  sendRelease.resolve()
+  await waitFor(() => client.cards.some((entry) => requestId(entry.card) !== ''))
+  const approval = client.cards.find((entry) => requestId(entry.card) !== '')
+  await waitFor(() => client.updated.some((entry) => entry.messageId === approval?.messageId))
+
+  const updates = client.updated.filter((entry) => entry.messageId === approval?.messageId)
+  assert.equal(updates.length, 1)
+  assert.equal((updates[0]?.card as { header?: { template?: string } }).header?.template, 'grey')
+  await bridge.stop()
+})
+
+test('e2e: reset while approval card send is pending closes the old-session card', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const client = createClient()
+  const sendEntered = Promise.withResolvers<void>()
+  const sendRelease = Promise.withResolvers<void>()
+  const originalSendCard = client.sendCard!.bind(client)
+  client.sendCard = async (chatId, card, options) => {
+    if (requestId(card) !== '') {
+      sendEntered.resolve()
+      await sendRelease.promise
+    }
+    return originalSendCard(chatId, card, options)
+  }
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+  })
+  await sendEntered.promise
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', '/new'))
+  assert.equal(await outcome, 'cancelled')
+  assert.equal(client.cards.some((entry) => requestId(entry.card) !== ''), false)
+
+  sendRelease.resolve()
+  await waitFor(() => client.cards.some((entry) => requestId(entry.card) !== ''))
+  const approval = client.cards.find((entry) => requestId(entry.card) !== '')
+  await waitFor(() => client.updated.some((entry) => entry.messageId === approval?.messageId))
+  const updates = client.updated.filter((entry) => entry.messageId === approval?.messageId)
+  assert.equal(updates.length, 1)
+  assert.equal((updates[0]?.card as { header?: { template?: string } }).header?.template, 'grey')
+
+  const action = await client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: approval?.messageId ?? '',
+    value: { decision: 'allowed-once', request_id: requestId(approval?.card) },
+  })
+  assert.equal(action?.toast.type, 'info')
+  await bridge.stop()
+})
+
+test('e2e: bridge stop drains closure of an approval card whose send is pending', async () => {
+  const client = createClient()
+  const sendEntered = Promise.withResolvers<void>()
+  const sendRelease = Promise.withResolvers<void>()
+  const updateEntered = Promise.withResolvers<void>()
+  const updateRelease = Promise.withResolvers<void>()
+  const originalSendCard = client.sendCard!.bind(client)
+  const originalUpdateCard = client.updateCard!.bind(client)
+  client.sendCard = async (chatId, card, options) => {
+    if (requestId(card) !== '') {
+      sendEntered.resolve()
+      await sendRelease.promise
+    }
+    return originalSendCard(chatId, card, options)
+  }
+  client.updateCard = async (messageId, card) => {
+    if ((card as { header?: { template?: string } }).header?.template === 'grey') {
+      updateEntered.resolve()
+      await updateRelease.promise
+    }
+    await originalUpdateCard(messageId, card)
+  }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+  })
+  await sendEntered.promise
+
+  let stopped = false
+  const stopping = bridge.stop().then(() => { stopped = true })
+  assert.equal(await outcome, 'cancelled')
+  await flushDeliveries()
+  assert.equal(stopped, false)
+
+  sendRelease.resolve()
+  const phase = await Promise.race([
+    updateEntered.promise.then(() => 'updating' as const),
+    stopping.then(() => 'stopped' as const),
+  ])
+  const stoppedBeforeUpdateRelease = stopped
+  updateRelease.resolve()
+  await stopping
+
+  assert.equal(phase, 'updating')
+  assert.equal(stoppedBeforeUpdateRelease, false)
+  const approval = client.cards.find((entry) => requestId(entry.card) !== '')
+  const updates = client.updated.filter((entry) => entry.messageId === approval?.messageId)
+  assert.equal(updates.length, 1)
+  assert.equal((updates[0]?.card as { header?: { template?: string } }).header?.template, 'grey')
+})
+
 test('e2e: approval card delivery failure fails closed', async () => {
   const client = createClient()
   client.sendCard = async () => { throw new Error('delivery unavailable') }
@@ -952,6 +1099,77 @@ test('e2e: approval card delivery failure fails closed', async () => {
 
   assert.equal(outcome, 'unavailable')
   await bridge.stop()
+})
+
+test('e2e: synchronous approval card delivery failure fails closed', async () => {
+  const client = createClient()
+  client.sendCard = () => { throw new Error('delivery unavailable') }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  const outcome = await host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+  })
+
+  assert.equal(outcome, 'unavailable')
+  await bridge.stop()
+})
+
+test('e2e: approval cards are skipped when they cannot be closed', async () => {
+  const client = createClient()
+  delete client.updateCard
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+  const outcome = await host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+  })
+
+  assert.equal(outcome, 'unavailable')
+  assert.equal(client.cards.length, 0)
+  await bridge.stop()
+})
+
+test('e2e: approval requests captured before teardown fail closed once stop starts', async () => {
+  const client = createClient()
+  const stopReceivingEntered = Promise.withResolvers<void>()
+  const stopReceivingRelease = Promise.withResolvers<void>()
+  client.stopReceiving = async () => {
+    stopReceivingEntered.resolve()
+    await stopReceivingRelease.promise
+  }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run a protected tool'))
+
+  const stopping = bridge.stop()
+  await stopReceivingEntered.promise
+  const controller = new AbortController()
+  const approval = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+    signal: controller.signal,
+  })
+  const outcome = await Promise.race([
+    approval,
+    flushDeliveries().then(() => 'still-pending'),
+  ])
+  controller.abort()
+  stopReceivingRelease.resolve()
+  await stopping
+
+  assert.equal(outcome, 'unavailable')
+  assert.equal(client.cards.length, 0)
 })
 
 test('e2e: approval card without a message id fails closed', async () => {
