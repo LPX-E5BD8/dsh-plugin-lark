@@ -5,6 +5,7 @@ interface LocaleCopy {
   readonly bridge: {
     readonly help: string
     readonly denied: string
+    readonly unsupportedInput: string
     readonly followupFailure: string
     readonly cardUnavailable: string
     readonly approvalUnauthorized: string
@@ -80,6 +81,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
         '/help — 显示帮助',
       ].join('\n'),
       denied: '没有权限。',
+      unsupportedInput: '暂不支持图片、文件或其他非文本消息，请改用文字发送。',
       followupFailure: '消息提交失败，请重试。',
       cardUnavailable: '卡片操作暂不可用。',
       approvalUnauthorized: '无权执行此操作。',
@@ -158,6 +160,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
         '/help — show this help',
       ].join('\n'),
       denied: "You don't have permission.",
+      unsupportedInput: 'Images, files, and other non-text messages are not supported yet. Please send text.',
       followupFailure: 'Message submission failed. Please try again.',
       cardUnavailable: 'Card actions are temporarily unavailable.',
       approvalUnauthorized: 'You cannot perform this action.',

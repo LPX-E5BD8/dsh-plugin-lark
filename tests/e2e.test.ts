@@ -362,6 +362,129 @@ test('e2e: help replies to the command message', async () => {
   await bridge.stop()
 })
 
+test('e2e: unsupported p2p input replies once without creating an agent', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+  const message: LarkInbound = {
+    ...inbound('chat-a', 'owner', ''),
+    messageId: 'image-message',
+    messageType: 'image',
+  }
+
+  await Promise.all([
+    client.messageHandler?.(message),
+    client.messageHandler?.(message),
+  ])
+
+  assert.deepEqual(client.sent, [{
+    chatId: 'chat-a',
+    text: '暂不支持图片、文件或其他非文本消息，请改用文字发送。',
+  }])
+  assert.deepEqual(client.textDeliveryOptions, [{ replyToMessageId: 'image-message' }])
+  assert.equal(host.createCount(), 0)
+  assert.deepEqual(host.followupSessionIds(), [])
+  await bridge.stop()
+})
+
+test('e2e: unsupported input honors authorization before replying', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'stranger', ''),
+    messageId: 'private-file',
+    messageType: 'file',
+  })
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-b', openId: 'stranger', text: '', messageId: 'private-thread-file',
+    messageType: 'file', threadId: 'thread-b',
+  }))
+
+  assert.deepEqual(client.sent, [
+    { chatId: 'chat-a', text: '没有权限。' },
+    { chatId: 'chat-b', text: '没有权限。' },
+  ])
+  assert.deepEqual(client.textDeliveryOptions, [
+    { replyToMessageId: 'private-file' },
+    { replyToMessageId: 'private-thread-file', replyInThread: true },
+  ])
+  assert.equal(host.createCount(), 0)
+  assert.deepEqual(host.followupSessionIds(), [])
+  await bridge.stop()
+})
+
+test('e2e: a durable receipt suppresses unsupported input after restart', async () => {
+  const completed = new Set<string>()
+  const deduplicator = {
+    has: (key: string) => completed.has(key),
+    async complete(key: string) { completed.add(key) },
+  }
+  const message: LarkInbound = {
+    ...inbound('chat-a', 'owner', ''),
+    messageId: 'file-message',
+    messageType: 'file',
+  }
+  const firstClient = createClient()
+  const firstHost = createHost()
+  const firstBridge = new LarkBridge(firstHost as never, {
+    client: firstClient,
+    allowFrom: ['owner'],
+    inboundDeduplicator: deduplicator,
+  })
+  await firstBridge.start()
+  await firstClient.messageHandler?.(message)
+  assert.equal(firstClient.sent.length, 1)
+  await firstBridge.stop()
+
+  const secondClient = createClient()
+  const secondHost = createHost()
+  const secondBridge = new LarkBridge(secondHost as never, {
+    client: secondClient,
+    allowFrom: ['owner'],
+    inboundDeduplicator: deduplicator,
+  })
+  await secondBridge.start()
+  await secondClient.messageHandler?.(message)
+
+  assert.equal(secondClient.sent.length, 0)
+  assert.equal(secondHost.createCount(), 0)
+  assert.deepEqual(secondHost.followupSessionIds(), [])
+  await secondBridge.stop()
+})
+
+test('e2e: group attachments require a mention and preserve thread delivery', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: '', messageId: 'unmentioned-file',
+    messageType: 'file', mentioned: false,
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: '', messageId: 'thread-file',
+    messageType: 'file', rootId: 'root-a', threadId: 'thread-a',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: '', messageId: 'reply-audio',
+    messageType: 'audio', rootId: 'root-a',
+  }))
+
+  assert.equal(client.sent.length, 2)
+  assert.deepEqual(client.textDeliveryOptions, [
+    { replyToMessageId: 'thread-file', replyInThread: true },
+    { replyToMessageId: 'reply-audio' },
+  ])
+  assert.equal(host.createCount(), 0)
+  assert.deepEqual(host.followupSessionIds(), [])
+  await bridge.stop()
+})
+
 test('e2e: shared session stays shared after reset', async () => {
   const client = createClient()
   const host = createHost()

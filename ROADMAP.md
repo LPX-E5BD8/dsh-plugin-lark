@@ -34,9 +34,13 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Keep direct-chat session identities compatible and preserve explicit global session binding.
 - Deliver native-thread replies inside the originating thread without changing ordinary reply-tree delivery.
 
+## 0.4.0 — Input safety
+
+- Classify unsupported non-text input without parsing or retaining its platform content or resource metadata.
+- Reply with a generic text-only notice only after the existing authorization and group-mention gates.
+
 ## Later 0.x — Input and operations
 
-- Define safe handling for image and file input before enabling it.
 - Add connection-health diagnostics for operators.
 - Bound idle in-memory conversation handles after their durable checkpoint.
 
