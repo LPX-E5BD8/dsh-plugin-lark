@@ -6,7 +6,7 @@ import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
-import { CARD_ACTIONS, CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCard } from './cards.ts'
+import { CARD_ACTIONS, CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCardWithMeta } from './cards.ts'
 import type { ToolCardItem, TurnCard, TurnCardStatus, TurnCardTodo, TurnCardUsage } from './cards.ts'
 import { DEFAULT_CONFIG, MIN_STREAM_UPDATE_INTERVAL_MS } from './config.ts'
 import { projectActivity, sessionEventPolicy } from './events.ts'
@@ -37,10 +37,28 @@ interface SessionBinding {
   readonly sessionId: ReturnType<typeof SessionId>
   readonly persisted: boolean
   readonly generation: number
+  readonly agentPreset?: string
 }
 
 interface SessionPersistenceLike {
-  list(): Promise<ReadonlyArray<{ id: ReturnType<typeof SessionId> }>>
+  list(): Promise<ReadonlyArray<{
+    id: ReturnType<typeof SessionId>
+    agentPreset?: string
+  }>>
+  inspect?(id: ReturnType<typeof SessionId>): Promise<{
+    readonly meta: { readonly agentPreset?: string }
+    readonly events: ReadonlyArray<{ readonly type: string; readonly data: unknown }>
+  }>
+}
+
+interface AgentPresetsLike {
+  resolve(id?: string): Promise<{ readonly id: string }>
+  mount(agentCtx: Context, id?: string): Promise<{ readonly id: string }>
+}
+
+interface AgentComposition {
+  readonly agentPreset?: string
+  readonly setup?: (agentCtx: Context) => Promise<void>
 }
 
 interface CommandRuntimeLike {
@@ -73,6 +91,7 @@ interface TurnState {
   readonly startedAt: number
   status: TurnCardStatus
   answer?: string
+  fullAnswer?: string
   error?: string
   updatedAt: number
   usage?: TurnCardUsage
@@ -85,6 +104,7 @@ interface TurnState {
   delivery: Promise<void>
   deliveryDisabled?: boolean
   deliveredAnswer?: string
+  longAnswerSent?: boolean
   textFallbackSent?: boolean
   streamTimer?: ReturnType<typeof setTimeout>
   lastStreamUpdateAt?: number
@@ -150,8 +170,13 @@ function tailBoundedText(value: string, limit: number): string {
 }
 
 function appendAnswer(current: string | undefined, next: string): string {
-  const combined = current === undefined || current === '' ? next : `${current}\n\n${next}`
-  return boundedText(combined, CARD_LIMITS.maxAnswerRunes)
+  return current === undefined || current === '' ? next : `${current}\n\n${next}`
+}
+
+function answerPreview(answer: string): string {
+  const runes = [...answer]
+  if (runes.length <= CARD_LIMITS.maxAnswerRunes) return answer
+  return `${runes.slice(0, CARD_LIMITS.maxAnswerRunes - 1).join('')}…`
 }
 
 function appendDelta(current: string | undefined, delta: string, limit: number): string {
@@ -274,16 +299,60 @@ function sessionGeneration(baseId: string, sessionId: string): number | undefine
   return Number.isSafeInteger(generation) && generation > 0 ? generation : undefined
 }
 
+function optionalAgentPreset(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+function selectedAgentPreset(
+  headerPreset: string | undefined,
+  events: ReadonlyArray<{ readonly type: string; readonly data: unknown }>,
+): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type !== 'agent-preset/selected') continue
+    const data = event.data
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+      throw new TypeError('lark: persisted agent preset selection is invalid')
+    }
+    const preset = optionalAgentPreset((data as { agentPreset?: unknown }).agentPreset)
+    if (preset === undefined) throw new TypeError('lark: persisted agent preset selection is invalid')
+    return preset
+  }
+  return optionalAgentPreset(headerPreset)
+}
+
+function agentPresetsOf(ctx: Context): AgentPresetsLike | undefined {
+  const service = ctx.get('agentPresets') as unknown
+  if (service === undefined) return undefined
+  if (service === null || typeof service !== 'object') {
+    throw new TypeError('lark: agentPresets service is invalid')
+  }
+  const candidate = service as Partial<AgentPresetsLike>
+  if (typeof candidate.resolve !== 'function' || typeof candidate.mount !== 'function') {
+    throw new TypeError('lark: agentPresets service is invalid')
+  }
+  return candidate as AgentPresetsLike
+}
+
 function latestSessionBinding(
   baseId: string,
-  headers: ReadonlyArray<{ id: ReturnType<typeof SessionId> }>,
+  headers: ReadonlyArray<{
+    id: ReturnType<typeof SessionId>
+    agentPreset?: string
+  }>,
 ): SessionBinding | undefined {
   let latest: SessionBinding | undefined
   for (const header of headers) {
     const sessionId = String(header.id)
     const generation = sessionGeneration(baseId, sessionId)
     if (generation === undefined || generation <= (latest?.generation ?? -1)) continue
-    latest = { sessionId: SessionId(sessionId), persisted: true, generation }
+    const agentPreset = optionalAgentPreset(header.agentPreset)
+    latest = {
+      sessionId: SessionId(sessionId),
+      persisted: true,
+      generation,
+      ...(agentPreset === undefined ? {} : { agentPreset }),
+    }
   }
   return latest
 }
@@ -769,7 +838,12 @@ export class LarkBridge {
     const binding = this.sharedSessionId === undefined
       ? await this.resolveSessionBinding(this.sessionBaseId(chatId))
       : { sessionId: SessionId(this.sharedSessionId), persisted: false, generation: this.lastSessionGeneration }
-    const handle = await this.ensureHandle(binding.sessionId, binding.persisted)
+    const handle = await this.ensureHandle(
+      binding.sessionId,
+      binding.persisted,
+      false,
+      binding.agentPreset,
+    )
     const sessionId = binding.sessionId
     this.lastSessionGeneration = Math.max(this.lastSessionGeneration, binding.generation)
     if (this.sharedSessionBaseId !== undefined) this.sharedSessionId = String(sessionId)
@@ -799,19 +873,12 @@ export class LarkBridge {
     sessionId: ReturnType<typeof SessionId>,
     persisted = false,
     materialize = false,
+    persistedAgentPreset?: string,
   ): Promise<AgentHandle> {
     const key = String(sessionId)
     const existing = this.handles.get(key)
     if (existing !== undefined) return existing
-    const agentOptions = { provider: this.provider, model: this.model }
-    const opened = persisted
-      ? this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions })
-      : this.ctx.agents.create({
-          sessionId,
-          meta: { cwd: this.cwd },
-          agentOptions,
-          ...(materialize ? { seed: [] } : {}),
-        })
+    const opened = this.openHandle(sessionId, persisted, materialize, persistedAgentPreset)
     this.handles.set(key, opened)
     try {
       const handle = await opened
@@ -822,6 +889,66 @@ export class LarkBridge {
     } catch (error) {
       if (this.handles.get(key) === opened) this.handles.delete(key)
       throw error
+    }
+  }
+
+  private async openHandle(
+    sessionId: ReturnType<typeof SessionId>,
+    persisted: boolean,
+    materialize: boolean,
+    persistedAgentPreset?: string,
+  ): Promise<AgentHandle> {
+    const agentOptions = { provider: this.provider, model: this.model }
+    const presets = agentPresetsOf(this.ctx)
+    const requestedPreset = presets !== undefined && persisted
+      ? await this.persistedAgentPreset(sessionId, persistedAgentPreset)
+      : undefined
+    const composition = await this.agentComposition(presets, requestedPreset)
+    if (persisted) {
+      return this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        ...(composition.setup === undefined ? {} : { setup: composition.setup }),
+      })
+    }
+    return this.ctx.agents.create({
+      sessionId,
+      meta: {
+        cwd: this.cwd,
+        ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
+      },
+      agentOptions,
+      ...(composition.setup === undefined ? {} : { setup: composition.setup }),
+      ...(materialize ? { seed: [] } : {}),
+    })
+  }
+
+  private async persistedAgentPreset(
+    sessionId: ReturnType<typeof SessionId>,
+    headerPreset?: string,
+  ): Promise<string | undefined> {
+    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    if (persistence?.inspect === undefined) return optionalAgentPreset(headerPreset)
+    const inspected = await persistence.inspect(sessionId)
+    return selectedAgentPreset(inspected.meta.agentPreset ?? headerPreset, inspected.events)
+  }
+
+  private async agentComposition(
+    presets: AgentPresetsLike | undefined,
+    requestedPreset?: string,
+  ): Promise<AgentComposition> {
+    if (presets === undefined) return {}
+    const resolved = await presets.resolve(requestedPreset)
+    const agentPreset = optionalAgentPreset(resolved.id)
+    if (agentPreset === undefined) throw new TypeError('lark: resolved agent preset id is invalid')
+    return {
+      agentPreset,
+      setup: async (agentCtx) => {
+        const mounted = await presets.mount(agentCtx, agentPreset)
+        if (mounted.id !== agentPreset) {
+          throw new Error(`lark: mounted agent preset "${mounted.id}" does not match "${agentPreset}"`)
+        }
+      },
     }
   }
 
@@ -997,7 +1124,10 @@ export class LarkBridge {
     const callsTool = event.data.message.content.some((block) => block.type === 'tool-call')
     if (text !== undefined) {
       if (callsTool) state.reasoning = appendProcessText(state.reasoning, text)
-      else state.answer = appendAnswer(state.answer, text)
+      else {
+        state.fullAnswer = appendAnswer(state.fullAnswer, text)
+        state.answer = answerPreview(state.fullAnswer)
+      }
     }
     state.streamingAnswer = undefined
     if (this.canRenderTurnCards()) {
@@ -1163,17 +1293,20 @@ export class LarkBridge {
     if (!this.canRenderTurnCards() || state.deliveryDisabled === true) return
     this.clearStreamTimer(state)
     state.lastStreamUpdateAt = Date.now()
-    let card: Record<string, unknown>
+    let rendered: ReturnType<typeof renderTurnCardWithMeta>
     const turnCard = this.turnCard(state)
     try {
-      card = renderTurnCard(turnCard)
+      rendered = renderTurnCardWithMeta(turnCard)
     } catch (error) {
       this.ctx.logger.error('[lark] card render failed: %s', messageOf(error))
       return
     }
-    const answer = turnCard.answer === undefined || turnCard.answer === '' ? undefined : turnCard.answer
+    const completeAnswer = state.fullAnswer ?? turnCard.answer
+    const answerTruncated = rendered.answerTruncated || completeAnswer !== turnCard.answer
+    const deliveredAnswer = answerTruncated ? undefined : completeAnswer
+    const longAnswer = turnCard.status === 'running' || !answerTruncated ? undefined : completeAnswer
     const delivery = state.delivery
-      .then(() => this.deliverTurnCard(state, card, answer))
+      .then(() => this.deliverTurnCard(state, rendered.payload, deliveredAnswer, longAnswer))
       .catch((error: unknown) => {
         state.deliveryDisabled = true
         this.ctx.logger.error('[lark] turn card delivery failed: %s', messageOf(error))
@@ -1187,17 +1320,20 @@ export class LarkBridge {
     state: TurnState,
     card: Record<string, unknown>,
     answer: string | undefined,
+    longAnswer: string | undefined,
   ): Promise<void> {
     if (state.deliveryDisabled === true) return
     if (state.messageId !== undefined) {
       await this.client.updateCard!(state.messageId, card)
       if (answer !== undefined) state.deliveredAnswer = answer
+      await this.deliverLongAnswer(state, longAnswer)
       return
     }
     const messageId = await this.client.sendCard!(state.route.chatId, card)
     if (typeof messageId === 'string' && messageId !== '') {
       state.messageId = messageId
       if (answer !== undefined) state.deliveredAnswer = answer
+      await this.deliverLongAnswer(state, longAnswer)
       return
     }
     state.deliveryDisabled = true
@@ -1207,10 +1343,18 @@ export class LarkBridge {
 
   private fallbackFailedCard(state: TurnState): void {
     if (state.deliveryDisabled !== true || state.status === 'running') return
-    if (state.deliveredAnswer === state.answer || state.textFallbackSent === true) return
-    if (state.answer === undefined || state.answer === '') return
+    const answer = state.fullAnswer ?? state.answer
+    if (state.deliveredAnswer === answer || state.textFallbackSent === true) return
+    if (answer === undefined || answer === '') return
     state.textFallbackSent = true
-    this.trackDelivery(this.safeSend(state.route.chatId, state.answer))
+    this.trackDelivery(this.safeSend(state.route.chatId, answer))
+  }
+
+  private async deliverLongAnswer(state: TurnState, answer: string | undefined): Promise<void> {
+    if (answer === undefined || state.longAnswerSent === true) return
+    state.longAnswerSent = true
+    await this.client.sendText(state.route.chatId, `${this.text.longAnswer}\n\n${answer}`)
+    state.deliveredAnswer = answer
   }
 
   private trackDelivery(delivery: Promise<void>): void {

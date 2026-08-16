@@ -41,6 +41,8 @@ export DSH_LARK_APP_SECRET='<app-secret>'
 
 `FEISHU_APP_SECRET` remains an environment-only fallback for existing deployments. Local `.env*`, `.credentials.yaml`, and `.dsh/` state are ignored by Git.
 
+See [SMOKE_TESTS.md](./SMOKE_TESTS.md) for the repeatable credential-backed Feishu and Lark release checks.
+
 ## Config
 
 The bundled Cordis patch uses these defaults:
@@ -61,7 +63,7 @@ The bundled Cordis patch uses these defaults:
 
 `allowFrom` is fail-closed: an empty list with `allowAllUsers: false` denies everyone. Use `allowAllUsers: true` only for an intentionally public bot. Use `domain: lark` for apps hosted on `open.larksuite.com`.
 
-The `0.1.0` release is credential-smoke-tested against Feishu. The Lark domain path uses the official SDK domain switch and automated coverage; a credential-backed Lark smoke test remains on the roadmap.
+The `0.1.0` release was credential-smoke-tested against Feishu. The Lark domain path uses the official SDK domain switch and automated coverage. The release runbook covers credential-backed checks for both domains; a recorded Lark run is still required before claiming that domain as credential-smoke-tested.
 
 Leave `defaultSessionId` empty for `lark:<chatId>` isolation. Set it only when every authorized chat should share one Harness session. With a Harness session-persistence backend, the bridge resumes the latest session generation after restart. `/new` and `/clear` acknowledge only after the fresh generation reaches the durability checkpoint; storage or resume failures never fall back to an empty session.
 
@@ -69,7 +71,7 @@ Bridge commands: `/help`, `/new`, `/clear`. When the DSH command runtime is moun
 
 ## Cards and approvals
 
-One turn owns one Card 2.0 message. Reasoning, todos, retries, compaction, hooks, nested code tools, workflows, tool calls, results, and the final answer update that card in serialized order. Streaming updates are throttled, and every payload is bounded to Lark's 28 KiB card limit.
+One turn owns one Card 2.0 message. Reasoning, todos, retries, compaction, hooks, nested code tools, workflows, tool calls, results, and the final answer update that card in serialized order. Streaming updates are throttled, and every payload is bounded to Lark's 28 KiB card limit. A final answer longer than the card preview is also delivered in complete, platform-sized text messages.
 
 The execution panel bounds visible reasoning and recent tool calls. Running cards use an animated loading indicator when `im:resource` is available, replace it with a terminal status icon on completion, and provide a stop action bound to the originating session, chat, and user. The compact footer reports elapsed time, context-window occupancy, cache hits, input, output, and reasoning usage on one line.
 
