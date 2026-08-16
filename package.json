@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-lark",
   "description": "Feishu/Lark bridge for DeepSeek Harness with turn, tool, and approval cards",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "LPX-E5BD8",
   "type": "module",
   "repository": {
@@ -53,6 +53,7 @@
   },
   "scripts": {
     "build": "tsc -b",
+    "check:release-version": "node scripts/check-release-version.mjs",
     "check": "npm test && npm run typecheck && npm run build",
     "prepare": "npm run build",
     "test:pack": "node scripts/pack-smoke.mjs",
