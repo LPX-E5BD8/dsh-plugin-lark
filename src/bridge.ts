@@ -35,8 +35,8 @@ export interface LarkBridgeOptions {
   inboundDeduplicator?: InboundDeduplicator
 }
 
-interface ChatSession {
-  readonly chatId: string
+interface ConversationSession {
+  readonly baseId: string
   handle: AgentHandle
   sessionId: string
 }
@@ -86,6 +86,8 @@ interface MessageRoute {
   readonly chatId: string
   readonly openId: string
   readonly replyToMessageId: string
+  readonly sessionBaseId: string
+  readonly replyInThread?: true
 }
 
 interface RouteQueue {
@@ -134,6 +136,7 @@ interface PendingStop {
 }
 
 const SESSION_RESET_SEPARATOR = ':'
+const GROUP_SESSION_SCOPE_VERSION = 'group-v1'
 const RECENT_INBOUND_LIMIT = 1024
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear'])
@@ -288,12 +291,19 @@ function actionToast(type: 'success' | 'error' | 'info', content: string): LarkC
 }
 
 function routeDeliveryOptions(route: MessageRoute): LarkDeliveryOptions {
-  return { replyToMessageId: route.replyToMessageId }
+  return {
+    replyToMessageId: route.replyToMessageId,
+    ...(route.replyInThread === true ? { replyInThread: true } : {}),
+  }
 }
 
 function inboundCommand(text: string): string | undefined {
   const stripped = text.trim().replace(/^@_user_\d+\s+/, '').trim()
   return stripped.startsWith('/') ? stripped : undefined
+}
+
+function hasPlatformId(value: string | undefined): value is string {
+  return value !== undefined && value !== ''
 }
 
 function isApprovalAsked(event: SessionEvent): boolean {
@@ -380,7 +390,8 @@ export class LarkBridge {
   private readonly model: string
   private readonly streamUpdateIntervalMs: number
   private readonly cwd: string
-  private readonly chats = new Map<string, ChatSession>()
+  private readonly conversations = new Map<string, ConversationSession>()
+  private readonly conversationOpenings = new Map<string, Promise<ConversationSession>>()
   private readonly handles = new Map<string, Promise<AgentHandle>>()
   private readonly queuedRoutes = new Map<string, RouteQueue>()
   private readonly turns = new Map<string, Map<number, TurnState>>()
@@ -395,8 +406,7 @@ export class LarkBridge {
   private readonly completedInboundKeys: string[] = []
   private readonly inboundDeduplicator: InboundDeduplicator | undefined
   private readonly sessionOperations = new Map<string, Promise<void>>()
-  private sharedSessionId: string | undefined
-  private lastSessionGeneration = 0
+  private readonly lastSessionGenerations = new Map<string, number>()
   private disposeEvents: (() => void) | undefined
   private disposeApproval: (() => void) | undefined
   private approvalWaterfallBound = false
@@ -491,7 +501,8 @@ export class LarkBridge {
     await this.drainDeliveries(failures)
     await collectSettled([Promise.resolve().then(() => this.client.stop())], failures)
     const agents = await collectSettled(this.handles.values(), failures)
-    this.chats.clear()
+    this.conversations.clear()
+    this.conversationOpenings.clear()
     this.handles.clear()
     this.inboundTasks.clear()
     this.activeInboundTasks.clear()
@@ -547,10 +558,13 @@ export class LarkBridge {
   private async handleInboundOnce(msg: LarkInbound): Promise<void> {
     const command = inboundCommand(msg.text)
     if (msg.chatType === 'group' && !msg.mentioned && command === undefined) return
+    const replyInThread = msg.chatType === 'group' && hasPlatformId(msg.threadId)
     const route: MessageRoute = {
       chatId: msg.chatId,
       openId: msg.openId,
       replyToMessageId: msg.messageId,
+      sessionBaseId: this.sessionBaseId(msg),
+      ...(replyInThread ? { replyInThread: true } : {}),
     }
     if (!this.authorized(msg.openId)) {
       await this.safeSend(route.chatId, this.text.denied, routeDeliveryOptions(route))
@@ -561,15 +575,15 @@ export class LarkBridge {
       return
     }
     await this.resetBarrier
-    const chat = await this.ensureChat(msg.chatId)
-    this.enqueueRoute(chat.sessionId, route)
+    const conversation = await this.ensureConversation(route.sessionBaseId)
+    this.enqueueRoute(conversation.sessionId, route)
     try {
-      chat.handle.agent.followup(createUserMessage({
+      conversation.handle.agent.followup(createUserMessage({
         content: [{ type: 'text', text: msg.text.trim() }],
         source: { kind: 'user' },
       }))
     } catch (error) {
-      this.removeQueuedRoute(chat.sessionId, route)
+      this.removeQueuedRoute(conversation.sessionId, route)
       this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
       await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
       throw error
@@ -779,7 +793,7 @@ export class LarkBridge {
         await this.resetBarrier
         await this.safeSend(
           route.chatId,
-          this.commandHelp((await this.ensureChat(route.chatId)).handle.agent),
+          this.commandHelp((await this.ensureConversation(route.sessionBaseId)).handle.agent),
           routeDeliveryOptions(route),
         )
         break
@@ -818,10 +832,10 @@ export class LarkBridge {
   private executeRuntimeCommand(route: MessageRoute, text: string, command: string): Promise<void> {
     let operation: Promise<void> = Promise.resolve()
     const admission = this.resetBarrier.then(async () => {
-      const chat = await this.ensureChat(route.chatId)
+      const conversation = await this.ensureConversation(route.sessionBaseId)
       operation = this.enqueueSessionOperation(
-        chat.sessionId,
-        () => this.executeRuntimeCommandNow(chat, route, text, command),
+        conversation.baseId,
+        () => this.executeRuntimeCommandNow(conversation, route, text, command),
       )
     })
     this.resetBarrier = admission.catch(() => {})
@@ -829,64 +843,64 @@ export class LarkBridge {
   }
 
   private async executeRuntimeCommandNow(
-    chat: ChatSession,
+    conversation: ConversationSession,
     route: MessageRoute,
     text: string,
     command: string,
   ): Promise<void> {
     const deliveryOptions = routeDeliveryOptions(route)
     if (UNSUPPORTED_RUNTIME_COMMANDS.has(command.slice(1).toLowerCase())) {
-      await this.safeSend(chat.chatId, this.text.unknownCommand(command), deliveryOptions)
+      await this.safeSend(route.chatId, this.text.unknownCommand(command), deliveryOptions)
       return
     }
     const runtime = this.commandRuntime()
     if (runtime === undefined) {
-      await this.safeSend(chat.chatId, this.text.unknownCommand(command), deliveryOptions)
+      await this.safeSend(route.chatId, this.text.unknownCommand(command), deliveryOptions)
       return
     }
     try {
-      const execution = await runtime.execute(chat.handle.agent, text, this.commandAbort.signal)
+      const execution = await runtime.execute(conversation.handle.agent, text, this.commandAbort.signal)
       if (execution === undefined) {
-        await this.safeSend(chat.chatId, this.text.unknownCommand(command), deliveryOptions)
+        await this.safeSend(route.chatId, this.text.unknownCommand(command), deliveryOptions)
       } else if (execution.result.text !== undefined && execution.result.text !== '') {
-        await this.safeSend(chat.chatId, execution.result.text, deliveryOptions)
+        await this.safeSend(route.chatId, execution.result.text, deliveryOptions)
       } else if (execution.result.kind === 'error') {
-        await this.safeSend(chat.chatId, this.text.commandFailed, deliveryOptions)
+        await this.safeSend(route.chatId, this.text.commandFailed, deliveryOptions)
       }
     } catch (error) {
       this.ctx.logger.error('[lark] command failed: %s', messageOf(error))
-      await this.safeSend(chat.chatId, this.text.commandFailed, deliveryOptions)
+      await this.safeSend(route.chatId, this.text.commandFailed, deliveryOptions)
     }
   }
 
-  private enqueueSessionOperation<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
-    const operation = (this.sessionOperations.get(sessionId) ?? Promise.resolve()).then(task)
+  private enqueueSessionOperation<T>(baseId: string, task: () => Promise<T>): Promise<T> {
+    const operation = (this.sessionOperations.get(baseId) ?? Promise.resolve()).then(task)
     const tail = operation.then(() => {}, () => {})
-    this.sessionOperations.set(sessionId, tail)
+    this.sessionOperations.set(baseId, tail)
     void tail.then(() => {
-      if (this.sessionOperations.get(sessionId) === tail) this.sessionOperations.delete(sessionId)
+      if (this.sessionOperations.get(baseId) === tail) this.sessionOperations.delete(baseId)
     })
     return operation
   }
 
   private scheduleReset(route: MessageRoute): Promise<void> {
     const reset = this.resetBarrier.then(async () => {
-      const chat = await this.ensureChat(route.chatId)
-      await this.sessionOperations.get(chat.sessionId)
-      await this.resetChat(route)
+      const conversation = await this.ensureConversation(route.sessionBaseId)
+      await this.sessionOperations.get(conversation.baseId)
+      await this.resetConversation(route)
     })
     this.resetBarrier = reset.catch(() => {})
     return reset
   }
 
-  private async resetChat(route: MessageRoute): Promise<void> {
+  private async resetConversation(route: MessageRoute): Promise<void> {
     const chatId = route.chatId
-    const chat = await this.ensureChat(chatId)
-    const previousSessionId = chat.sessionId
-    const previousHandle = chat.handle
-    const baseId = this.sessionBaseId(chatId)
-    const generation = Math.max(Date.now(), this.lastSessionGeneration + 1)
-    this.lastSessionGeneration = generation
+    const conversation = await this.ensureConversation(route.sessionBaseId)
+    const previousSessionId = conversation.sessionId
+    const previousHandle = conversation.handle
+    const baseId = conversation.baseId
+    const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
+    this.lastSessionGenerations.set(baseId, generation)
     const sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
     const handle = await this.ensureHandle(sessionId, false, true)
     try {
@@ -903,12 +917,8 @@ export class LarkBridge {
       }
       throw flushError
     }
-    if (this.sharedSessionBaseId !== undefined) this.sharedSessionId = String(sessionId)
-    for (const entry of this.chats.values()) {
-      if (entry.sessionId !== previousSessionId) continue
-      entry.handle = handle
-      entry.sessionId = String(sessionId)
-    }
+    conversation.handle = handle
+    conversation.sessionId = String(sessionId)
     this.clearSessionState(previousSessionId)
     try {
       await previousHandle.dispose()
@@ -919,12 +929,24 @@ export class LarkBridge {
     await this.safeSend(chatId, this.text.freshSession, routeDeliveryOptions(route))
   }
 
-  private async ensureChat(chatId: string): Promise<ChatSession> {
-    const existing = this.chats.get(chatId)
+  private async ensureConversation(baseId: string): Promise<ConversationSession> {
+    const existing = this.conversations.get(baseId)
     if (existing !== undefined) return existing
-    const binding = this.sharedSessionId === undefined
-      ? await this.resolveSessionBinding(this.sessionBaseId(chatId))
-      : { sessionId: SessionId(this.sharedSessionId), persisted: false, generation: this.lastSessionGeneration }
+    const pending = this.conversationOpenings.get(baseId)
+    if (pending !== undefined) return pending
+    const opening = this.openConversation(baseId)
+    this.conversationOpenings.set(baseId, opening)
+    try {
+      return await opening
+    } finally {
+      if (this.conversationOpenings.get(baseId) === opening) {
+        this.conversationOpenings.delete(baseId)
+      }
+    }
+  }
+
+  private async openConversation(baseId: string): Promise<ConversationSession> {
+    const binding = await this.resolveSessionBinding(baseId)
     const handle = await this.ensureHandle(
       binding.sessionId,
       binding.persisted,
@@ -932,16 +954,29 @@ export class LarkBridge {
       binding.agentPreset,
     )
     const sessionId = binding.sessionId
-    this.lastSessionGeneration = Math.max(this.lastSessionGeneration, binding.generation)
-    if (this.sharedSessionBaseId !== undefined) this.sharedSessionId = String(sessionId)
-    const entry: ChatSession = { chatId, handle, sessionId: String(sessionId) }
-    this.chats.set(chatId, entry)
+    this.lastSessionGenerations.set(
+      baseId,
+      Math.max(this.lastSessionGenerations.get(baseId) ?? 0, binding.generation),
+    )
+    const entry: ConversationSession = { baseId, handle, sessionId: String(sessionId) }
+    this.conversations.set(baseId, entry)
     return entry
   }
 
-  private sessionBaseId(chatId: string): string {
-    return this.sharedSessionBaseId
-      ?? `${DEFAULT_CONFIG.sessionPrefix}${SESSION_RESET_SEPARATOR}${chatId}`
+  private sessionBaseId(msg: Pick<
+    LarkInbound,
+    'chatId' | 'chatType' | 'messageId' | 'rootId' | 'threadId'
+  >): string {
+    if (this.sharedSessionBaseId !== undefined) return this.sharedSessionBaseId
+    if (msg.chatType !== 'group') {
+      return `${DEFAULT_CONFIG.sessionPrefix}${SESSION_RESET_SEPARATOR}${msg.chatId}`
+    }
+    const chatId = encodeURIComponent(msg.chatId)
+    if (hasPlatformId(msg.threadId)) {
+      return `${DEFAULT_CONFIG.sessionPrefix}:${GROUP_SESSION_SCOPE_VERSION}:${chatId}:thread:${encodeURIComponent(msg.threadId)}`
+    }
+    const rootId = hasPlatformId(msg.rootId) ? msg.rootId : msg.messageId
+    return `${DEFAULT_CONFIG.sessionPrefix}:${GROUP_SESSION_SCOPE_VERSION}:${chatId}:root:${encodeURIComponent(rootId)}`
   }
 
   private async resolveSessionBinding(baseId: string): Promise<SessionBinding> {

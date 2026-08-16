@@ -145,6 +145,7 @@ interface SdkMessageCall {
     receive_id?: string
     msg_type?: string
     content?: string
+    reply_in_thread?: boolean
   }
 }
 
@@ -193,12 +194,53 @@ test('SDK sendText delivers every long reply chunk in order', async () => {
   const chunks = replies.map((call) => {
     assert.equal(call.path?.message_id, 'om_inbound')
     assert.equal(call.data?.msg_type, 'text')
+    assert.equal('reply_in_thread' in (call.data ?? {}), false)
     return (JSON.parse(call.data?.content ?? '{}') as { text?: string }).text ?? ''
   })
   assert.equal(creates, 0)
   assert.ok(chunks.length > 1)
   assert.ok(chunks.every((chunk) => [...chunk].length <= 4_000))
   assert.equal(chunks.join(''), answer)
+})
+
+test('SDK thread replies mark every text chunk and card', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const replies: SdkMessageCall[] = []
+  let creates = 0
+  setSdkMessageApi(client, {
+    async create() {
+      creates += 1
+      return { data: { message_id: 'om_unexpected' } }
+    },
+    async reply(call) {
+      replies.push(call)
+      return { data: { message_id: `om_reply_${replies.length}` } }
+    },
+  })
+  const answer = `start-${'答'.repeat(8_000)}-end`
+  const options = { replyToMessageId: 'om_thread_message', replyInThread: true }
+
+  await client.sendText('oc_chat', answer, options)
+  const cardId = await client.sendCard('oc_chat', { schema: '2.0' }, options)
+
+  const textReplies = replies.slice(0, -1)
+  assert.ok(textReplies.length > 1)
+  assert.equal(textReplies.map((call) => {
+    assert.equal(call.path?.message_id, 'om_thread_message')
+    assert.equal(call.data?.msg_type, 'text')
+    assert.equal(call.data?.reply_in_thread, true)
+    return (JSON.parse(call.data?.content ?? '{}') as { text?: string }).text ?? ''
+  }).join(''), answer)
+  assert.deepEqual(replies.at(-1), {
+    path: { message_id: 'om_thread_message' },
+    data: {
+      msg_type: 'interactive',
+      content: JSON.stringify({ schema: '2.0' }),
+      reply_in_thread: true,
+    },
+  })
+  assert.equal(cardId, `om_reply_${replies.length}`)
+  assert.equal(creates, 0)
 })
 
 test('SDK delivery creates without a reply target and replies cards with one', async () => {
@@ -216,7 +258,7 @@ test('SDK delivery creates without a reply target and replies cards with one', a
     },
   })
 
-  await client.sendText('oc_chat', 'plain', { replyToMessageId: '' })
+  await client.sendText('oc_chat', 'plain', { replyToMessageId: '', replyInThread: true })
   const cardId = await client.sendCard(
     'oc_chat',
     { schema: '2.0', body: { elements: [] } },
@@ -325,6 +367,66 @@ test('unwrapCardAction reads operator and button value', () => {
   assert.equal(action.chatId, 'oc_1')
   assert.equal(action.messageId, 'om_1')
   assert.equal(action.value.decision, 'allowed-once')
+})
+
+test('SDK inbound maps native reply-tree and thread identifiers', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  const start = Lark.WSClient.prototype.start
+  let receiveMessage: ((data: unknown) => Promise<void>) | undefined
+  let received: LarkInbound | undefined
+  prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  Lark.WSClient.prototype.start = async function captureDispatcher({ eventDispatcher }) {
+    const dispatcher = eventDispatcher as unknown as {
+      handles: Map<string, (data: unknown) => Promise<void>>
+    }
+    receiveMessage = dispatcher.handles.get('im.message.receive_v1')
+    const client = this as unknown as { onReady?: () => void }
+    client.onReady?.()
+  }
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const internals = client as unknown as { prepareLoadingImage: () => Promise<void> }
+  internals.prepareLoadingImage = async () => {}
+  client.onMessage(async (message) => { received = message })
+  try {
+    await client.start()
+    assert.ok(receiveMessage)
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_thread_chat',
+        chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 continue here' }),
+        message_id: 'om_current',
+        message_type: 'text',
+        mentions: [{ key: '@_user_1', id: { open_id: 'test-bot' } }],
+        root_id: 'om_root',
+        parent_id: 'om_parent',
+        thread_id: 'omt_thread',
+      },
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_sender' },
+      },
+    })
+
+    assert.deepEqual(received, {
+      chatId: 'oc_thread_chat',
+      chatType: 'group',
+      openId: 'ou_sender',
+      text: 'continue here',
+      messageId: 'om_current',
+      rootId: 'om_root',
+      parentId: 'om_parent',
+      threadId: 'omt_thread',
+      mentioned: true,
+    })
+  } finally {
+    await client.stop()
+    prototype.request = request
+    Lark.WSClient.prototype.start = start
+  }
 })
 
 test('SDK startup failures reject client startup', async () => {

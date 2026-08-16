@@ -56,7 +56,7 @@ The bundled Cordis patch uses these defaults:
     locale: zh-CN                # zh-CN / en-US
     allowAllUsers: false
     allowFrom: []                # authorized Feishu/Lark open_id values
-    defaultSessionId: ''         # empty = one session per chat
+    defaultSessionId: ''         # empty = scoped private/group conversations
     provider: deepseek-official
     model: deepseek-v4-flash
     streamUpdateIntervalMs: 1000
@@ -66,7 +66,11 @@ The bundled Cordis patch uses these defaults:
 
 The `0.1.0` release was credential-smoke-tested against Feishu. The Lark domain path uses the official SDK domain switch and automated coverage. The release runbook covers credential-backed checks for both domains; a recorded Lark run is still required before claiming that domain as credential-smoke-tested.
 
-Leave `defaultSessionId` empty for `lark:<chatId>` isolation. Set it only when every authorized chat should share one Harness session. With a Harness session-persistence backend, the bridge resumes the latest session generation after restart. `/new` and `/clear` acknowledge only after the fresh generation reaches the durability checkpoint; storage or resume failures never fall back to an empty session.
+Leave `defaultSessionId` empty for conversation isolation. Direct chats retain the compatible `lark:<chatId>` session. In group chats, each ordinary reply tree uses its root message as a resumable scope, while each native Lark thread uses its chat and thread IDs. `parent_id` never selects a session. Set `defaultSessionId` only when every authorized direct chat, reply tree, and thread should share one Harness session.
+
+With a Harness session-persistence backend, the bridge resumes the latest generation for the exact conversation scope after restart. `/new` and `/clear` reset only that direct chat, reply tree, or thread; with `defaultSessionId`, they intentionally reset the global shared session. An acknowledgement arrives only after the fresh generation reaches the durability checkpoint, and storage or resume failures never fall back to an empty session.
+
+Group sessions created before `0.3.0` were chat-wide and cannot be assigned safely to one reply root. They remain in storage for rollback or export, but `0.3.0` does not auto-attach them to a new reply-tree or thread session. Direct-chat and explicit `defaultSessionId` sessions keep their existing identities.
 
 Successfully handled inbound messages are remembered in a durable 1,024-receipt window, so WebSocket redelivery after a normal restart does not repeat a follow-up or command. The receipt medium (normally `$DSH_HOME/storages/lark_inbound.json` in the Web profile) stores only SHA-256 digests, not plaintext app, chat, or message IDs. Custom profiles must mount the Harness storage hub, one durable KV backend, and `storage-domain` before this plugin.
 
@@ -79,6 +83,8 @@ Bridge commands: `/help`, `/new`, `/clear`. When the DSH command runtime is moun
 One turn owns one Card 2.0 message. Reasoning, todos, retries, compaction, hooks, nested code tools, workflows, tool calls, results, and the final answer update that card in serialized order. Streaming updates are throttled, and every payload is bounded to Lark's 28 KiB card limit. A final answer longer than the card preview is also delivered in complete, platform-sized text messages.
 
 Command results and each turn's initial cards, approval cards, text fallbacks, and long-answer continuations reply to the Lark message that triggered them. Later card changes patch the bot message returned by that reply, so concurrent chats sharing one Harness session keep independent reply targets.
+
+For a native Lark thread, every initial text or card reply also carries `reply_in_thread: true`, so delivery remains inside that thread. Ordinary group reply trees keep replying to the current inbound message without being converted into native threads.
 
 The execution panel bounds visible reasoning and recent tool calls. Running cards use an animated loading indicator when `im:resource` is available, replace it with a terminal status icon on completion, and provide a stop action bound to the originating session, chat, and user. The compact footer reports elapsed time, context-window occupancy, cache hits, input, output, and reasoning usage on one line.
 
