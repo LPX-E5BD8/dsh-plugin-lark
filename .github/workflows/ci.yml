@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -13,11 +15,92 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
+      - if: github.event_name == 'pull_request'
+        env:
+          RELEASE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: npm run check:release-version
       - run: npm run check
       - run: npm audit --omit=dev
       - run: npm run test:pack
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PREVIOUS_MAIN_SHA: ${{ github.event.before }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+      - name: Wait for the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base_version="$(git show "${PREVIOUS_MAIN_SHA}:package.json" | node -e "let value=''; process.stdin.on('data', chunk => value += chunk); process.stdin.on('end', () => console.log(JSON.parse(value).version))")"
+          base_tag="v${base_version}"
+          for attempt in $(seq 1 36); do
+            git fetch --tags --force
+            if git rev-parse --verify --quiet "refs/tags/${base_tag}" >/dev/null; then
+              base_target="$(git rev-list -n 1 "$base_tag")"
+              if [ "$base_target" != "$PREVIOUS_MAIN_SHA" ]; then
+                echo "::error::${base_tag} points to ${base_target}, not previous main ${PREVIOUS_MAIN_SHA}"
+                exit 1
+              fi
+              if gh release view "$base_tag" >/dev/null 2>&1; then
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo "::error::previous release ${base_tag} was not available"
+          exit 1
+      - name: Tag the tested commit
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+            target="$(git rev-list -n 1 "$tag")"
+            if [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::${tag} already points to ${target}, not ${GITHUB_SHA}"
+              exit 1
+            fi
+          else
+            RELEASE_BASE_SHA="$PREVIOUS_MAIN_SHA" node scripts/check-release-version.mjs
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -a "$tag" -m "dsh-plugin-lark ${version}" "$GITHUB_SHA"
+            git push origin "refs/tags/${tag}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --verify-tag \
+            --target "$GITHUB_SHA" \
+            --title "dsh-plugin-lark ${VERSION}" \
+            --generate-notes

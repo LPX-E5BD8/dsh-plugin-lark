@@ -8,6 +8,11 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Continue long final answers in platform-sized text messages after the execution-card preview.
 - Provide one credential-backed smoke runbook for Feishu and Lark deployments.
 
+## 0.1.2 — Delivery automation
+
+- Rebase-merge owner-authored pull requests after required CI passes.
+- Validate one forward package version per feature pull request and release the tested `main` commit automatically.
+
 ## Later 0.1.x — Reliability
 
 - Persist inbound-event deduplication across restarts.

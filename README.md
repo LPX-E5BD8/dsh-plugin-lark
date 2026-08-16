@@ -99,6 +99,14 @@ npm run test:pack
 
 `npm run check` runs unit/integration tests, the real assembled Harness E2E, type checking, and build. `npm run test:pack` installs the generated tarball into an isolated consumer and imports its public API.
 
+## Releases
+
+Keep each user-facing feature in its own pull request and advance the stable version in both `package.json` and `package-lock.json`. CI rejects a pull request whose version is not newer than the latest `v*` release.
+
+Non-draft pull requests authored by the repository owner are automatically set to rebase-merge after the required `test` check passes. The resulting `main` build tags that tested commit and creates the matching GitHub Release. Pull requests from other authors still require an explicit maintainer merge.
+
+Auto-merge uses the repository Actions secret `AUTO_MERGE_TOKEN`, provisioned with owner `repo` and `workflow` scopes. It deliberately does not fall back to `GITHUB_TOKEN`, whose anti-recursion behavior would suppress the post-merge `main` release workflow. Rotate the secret whenever the owner token is replaced or revoked.
+
 ## License
 
 Apache-2.0
