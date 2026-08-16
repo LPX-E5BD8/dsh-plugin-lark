@@ -1464,7 +1464,10 @@ export class LarkBridge {
 
   private trackDelivery(delivery: Promise<void>): void {
     this.deliveryTasks.add(delivery)
-    void delivery.finally(() => this.deliveryTasks.delete(delivery))
+    const cleanup = (): void => {
+      this.deliveryTasks.delete(delivery)
+    }
+    void delivery.then(cleanup, cleanup)
   }
 
   private async drainDeliveries(failures: unknown[]): Promise<void> {
