@@ -100,6 +100,12 @@ The bridge sends only text to the Agent. Images, files, audio, and other non-tex
 
 Group messages require a bot mention or slash command. Attachment ingestion, an administration UI, and a generic card framework remain intentionally out of scope.
 
+## Operations
+
+When the Harness `webServer` service is mounted, the plugin registers `GET /api/lark/health` (and `HEAD` for probes). HTTP `200` means the official Lark SDK WebSocket is connected; startup, reconnecting, stopped, failed, malformed, and unavailable states return `503`. The JSON response contains only the component name, readiness, normalized connection state, reconnect count, and optional reconnect timestamps. It does not test REST permissions, the model provider, storage, or an end-to-end chat turn.
+
+Custom headless profiles do not need `webServer`; chat operation remains available without this endpoint. Responses use `Cache-Control: no-store`, and other methods receive `405 Method Not Allowed` with `Allow: GET, HEAD`.
+
 ## Roadmap
 
 See [ROADMAP.md](./ROADMAP.md) for planned reliability, conversation, and release work.

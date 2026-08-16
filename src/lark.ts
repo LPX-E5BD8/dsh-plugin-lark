@@ -39,8 +39,26 @@ export interface LarkDeliveryOptions {
   replyInThread?: boolean
 }
 
+export type LarkConnectionState =
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'failed'
+  | 'stopped'
+  | 'unknown'
+
+export interface LarkConnectionHealth {
+  state: LarkConnectionState
+  ready: boolean
+  reconnectAttempts: number
+  lastAttemptAt?: string
+  nextAttemptAt?: string
+}
+
 export interface LarkClientLike {
   readonly loadingImageKey?: string
+  connectionHealth?(): LarkConnectionHealth
   start(): Promise<void>
   stopReceiving?(): Promise<void>
   stop(): Promise<void>
@@ -175,12 +193,75 @@ interface LarkMessageResponse {
   data?: { message_id?: string }
 }
 
+interface LarkConnectionStatus {
+  state?: unknown
+  reconnectAttempts?: unknown
+  lastConnectTime?: unknown
+  nextConnectTime?: unknown
+}
+
+type LarkWs = {
+  close?: (params?: { force?: boolean }) => void
+  getConnectionStatus?: () => unknown
+}
+
+function connectionState(value: unknown): Exclude<LarkConnectionState, 'stopped' | 'unknown'> | undefined {
+  switch (value) {
+    case 'idle':
+    case 'connecting':
+    case 'connected':
+    case 'reconnecting':
+    case 'failed':
+      return value
+    default:
+      return undefined
+  }
+}
+
+function safeCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined
+}
+
+function safeTimestamp(value: unknown): string | undefined {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return undefined
+  try {
+    return new Date(value).toISOString()
+  } catch {
+    return undefined
+  }
+}
+
+function basicConnectionHealth(state: LarkConnectionState): LarkConnectionHealth {
+  return { state, ready: state === 'connected', reconnectAttempts: 0 }
+}
+
+function normalizeConnectionHealth(value: unknown): LarkConnectionHealth {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return basicConnectionHealth('unknown')
+  }
+  const status = value as LarkConnectionStatus
+  const state = connectionState(status.state)
+  if (state === undefined) return basicConnectionHealth('unknown')
+  const reconnectAttempts = safeCount(status.reconnectAttempts) ?? 0
+  const lastAttemptAt = safeTimestamp(status.lastConnectTime)
+  const nextAttemptAt = safeTimestamp(status.nextConnectTime)
+  return {
+    state,
+    ready: state === 'connected',
+    reconnectAttempts,
+    ...(lastAttemptAt === undefined ? {} : { lastAttemptAt }),
+    ...(nextAttemptAt === undefined ? {} : { nextAttemptAt }),
+  }
+}
+
 /** Real WS long-connection client via official Node SDK. */
 export class LarkSdkClient implements LarkClientLike {
   loadingImageKey: string | undefined
   private handler: ((msg: LarkInbound) => Promise<void>) | undefined
   private cardHandler: ((action: LarkCardAction) => Promise<LarkCardActionResult>) | undefined
-  private ws: { close?: (params?: { force?: boolean }) => void } | undefined
+  private ws: LarkWs | undefined
   private rest: LarkRest | undefined
   private cancelStart: ((error: Error) => void) | undefined
   private receivingStopped = false
@@ -193,6 +274,17 @@ export class LarkSdkClient implements LarkClientLike {
 
   onCardAction(handler: (action: LarkCardAction) => Promise<LarkCardActionResult>): void {
     this.cardHandler = handler
+  }
+
+  connectionHealth(): LarkConnectionHealth {
+    if (this.receivingStopped) return basicConnectionHealth('stopped')
+    try {
+      const getConnectionStatus = this.ws?.getConnectionStatus
+      if (typeof getConnectionStatus !== 'function') return basicConnectionHealth('unknown')
+      return normalizeConnectionHealth(getConnectionStatus.call(this.ws))
+    } catch {
+      return basicConnectionHealth('unknown')
+    }
   }
 
   async start(): Promise<void> {

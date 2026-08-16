@@ -9,6 +9,8 @@ import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import * as Lark from '@larksuiteoapi/node-sdk'
 import { LarkBridge } from '../src/bridge.ts'
+import { LARK_HEALTH_PATH } from '../src/health.ts'
+import type { WebServerLike } from '../src/health.ts'
 import { apply } from '../src/index.ts'
 import {
   LarkSdkClient,
@@ -331,8 +333,15 @@ test('SDK stopReceiving closes WebSocket but preserves REST sending until stop',
   const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
   const sent: string[] = []
   let closes = 0
-  const internals = client as unknown as { ws?: { close: () => void } }
-  internals.ws = { close() { closes += 1 } }
+  const internals = client as unknown as {
+    ws?: { close: () => void; getConnectionStatus: () => unknown }
+  }
+  internals.ws = {
+    close() { closes += 1 },
+    getConnectionStatus() {
+      return { state: 'connected', reconnectAttempts: 0 }
+    },
+  }
   setSdkMessageApi(client, {
     async create(call) {
       sent.push((JSON.parse(call.data?.content ?? '{}') as { text?: string }).text ?? '')
@@ -341,13 +350,80 @@ test('SDK stopReceiving closes WebSocket but preserves REST sending until stop',
     async reply() { return { data: { message_id: 'om_reply' } } },
   })
 
+  assert.deepEqual(client.connectionHealth(), {
+    state: 'connected',
+    ready: true,
+    reconnectAttempts: 0,
+  })
   await client.stopReceiving()
   await client.sendText('chat-a', 'still deliverable')
 
   assert.equal(closes, 1)
+  assert.deepEqual(client.connectionHealth(), {
+    state: 'stopped',
+    ready: false,
+    reconnectAttempts: 0,
+  })
   assert.deepEqual(sent, ['still deliverable'])
   await client.stop()
   await assert.rejects(client.sendText('chat-a', 'too late'), /not started/)
+})
+
+test('SDK connection health maps every SDK lifecycle state and valid metadata', () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const internals = client as unknown as { ws?: { getConnectionStatus: () => unknown } }
+  const lastConnectTime = Date.UTC(2026, 7, 16, 10, 20, 30)
+  const nextConnectTime = lastConnectTime + 5_000
+
+  for (const state of ['idle', 'connecting', 'connected', 'reconnecting', 'failed'] as const) {
+    internals.ws = {
+      getConnectionStatus: () => ({
+        state,
+        reconnectAttempts: 3,
+        lastConnectTime,
+        nextConnectTime,
+      }),
+    }
+    assert.deepEqual(client.connectionHealth(), {
+      state,
+      ready: state === 'connected',
+      reconnectAttempts: 3,
+      lastAttemptAt: '2026-08-16T10:20:30.000Z',
+      nextAttemptAt: '2026-08-16T10:20:35.000Z',
+    })
+  }
+})
+
+test('SDK connection health rejects malformed snapshots and filters invalid metadata', () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const internals = client as unknown as {
+    ws?: { getConnectionStatus?: () => unknown }
+  }
+  const unknown = { state: 'unknown', ready: false, reconnectAttempts: 0 }
+
+  assert.deepEqual(client.connectionHealth(), unknown)
+  internals.ws = {}
+  assert.deepEqual(client.connectionHealth(), unknown)
+  internals.ws = { getConnectionStatus: () => { throw new Error('SDK status unavailable') } }
+  assert.deepEqual(client.connectionHealth(), unknown)
+  for (const status of [undefined, null, [], 'connected', {}, { state: 'other' }]) {
+    internals.ws = { getConnectionStatus: () => status }
+    assert.deepEqual(client.connectionHealth(), unknown)
+  }
+
+  internals.ws = {
+    getConnectionStatus: () => ({
+      state: 'reconnecting',
+      reconnectAttempts: -1,
+      lastConnectTime: Number.MAX_SAFE_INTEGER,
+      nextConnectTime: 'soon',
+    }),
+  }
+  assert.deepEqual(client.connectionHealth(), {
+    state: 'reconnecting',
+    ready: false,
+    reconnectAttempts: 0,
+  })
 })
 
 test('plain-text fallback neutralizes platform mentions', () => {
@@ -588,8 +664,12 @@ test('Cordis plugin loading rejects a failed WebSocket connection', async (t) =>
   const start = Lark.WSClient.prototype.start
   const previousAppId = process.env.DSH_LARK_APP_ID
   const previousAppSecret = process.env.DSH_LARK_APP_SECRET
+  const wsStarted = Promise.withResolvers<void>()
+  const failWs = Promise.withResolvers<void>()
   prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
   Lark.WSClient.prototype.start = async function startWithError() {
+    wsStarted.resolve()
+    await failWs.promise
     const client = this as unknown as { onError?: (error: Error) => void }
     client.onError?.(new Error('startup unavailable'))
   }
@@ -601,6 +681,19 @@ test('Cordis plugin loading rejects a failed WebSocket connection', async (t) =>
   await ctx.plugin(Storage)
   await ctx.plugin(StorageJson, { root })
   await ctx.plugin(StorageDomain, { backend: 'json' })
+  let activeRoute: Parameters<WebServerLike['register']>[0] | undefined
+  let healthDisposals = 0
+  await ctx.plugin((providerCtx: Context) => {
+    providerCtx.provide('webServer', {
+      register(route) {
+        activeRoute = route
+        return () => {
+          activeRoute = undefined
+          healthDisposals += 1
+        }
+      },
+    } satisfies WebServerLike)
+  })
   const plugin = {
     name: 'lark-startup-test',
     inject: ['storageDomain'],
@@ -608,9 +701,30 @@ test('Cordis plugin loading rejects a failed WebSocket connection', async (t) =>
   }
   const fiber = ctx.plugin(plugin as never, {})
   try {
-    await assert.rejects(fiber.await(), /startup unavailable/)
+    const failure = assert.rejects(fiber.await(), /startup unavailable/)
+    await wsStarted.promise
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(activeRoute?.path, LARK_HEALTH_PATH)
+    let healthStatus = 0
+    await activeRoute.handler(
+      { method: 'GET' } as never,
+      {
+        writeHead(status: number) {
+          healthStatus = status
+          return this
+        },
+        end() { return this },
+      } as never,
+    )
+    assert.equal(healthStatus, 503)
+
+    failWs.resolve()
+    await failure
+    assert.equal(activeRoute, undefined)
+    assert.equal(healthDisposals, 1)
     assert.equal(ctx.storageDomain.get('lark_inbound'), undefined)
   } finally {
+    failWs.resolve()
     await fiber.dispose()
     await ctx.fiber.dispose()
     prototype.request = request
