@@ -13,9 +13,10 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Rebase-merge owner-authored pull requests after required CI passes.
 - Validate one forward package version per feature pull request and release the tested `main` commit automatically.
 
-## Later 0.1.x — Reliability
+## 0.1.3 — Inbound durability
 
-- Persist inbound-event deduplication across restarts.
+- Persist a bounded inbound-message receipt window across restarts.
+- Finish each platform callback only after its successful handling receipt is durable.
 
 ## 0.2 — Conversation context
 

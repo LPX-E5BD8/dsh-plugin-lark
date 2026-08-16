@@ -11,6 +11,7 @@ import type { ToolCardItem, TurnCard, TurnCardStatus, TurnCardTodo, TurnCardUsag
 import { DEFAULT_CONFIG, MIN_STREAM_UPDATE_INTERVAL_MS } from './config.ts'
 import { projectActivity, sessionEventPolicy } from './events.ts'
 import type { ActivityProjection, CatalogSessionEvent } from './events.ts'
+import type { InboundDeduplicator } from './inbound-dedup.ts'
 import type { LarkCardAction, LarkCardActionResult, LarkClientLike, LarkInbound } from './lark.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
@@ -25,6 +26,7 @@ export interface LarkBridgeOptions {
   streamUpdateIntervalMs?: number
   cwd?: string
   client: LarkClientLike
+  inboundDeduplicator?: InboundDeduplicator
 }
 
 interface ChatSession {
@@ -380,7 +382,9 @@ export class LarkBridge {
   private readonly deliveryTasks = new Set<Promise<void>>()
   private readonly warnedEventTypes = new Set<string>()
   private readonly inboundTasks = new Map<string, Promise<void>>()
+  private readonly activeInboundTasks = new Set<Promise<void>>()
   private readonly completedInboundKeys: string[] = []
+  private readonly inboundDeduplicator: InboundDeduplicator | undefined
   private readonly sessionOperations = new Map<string, Promise<void>>()
   private sharedSessionId: string | undefined
   private lastSessionGeneration = 0
@@ -388,6 +392,7 @@ export class LarkBridge {
   private disposeApproval: (() => void) | undefined
   private approvalWaterfallBound = false
   private startPromise: Promise<void> | undefined
+  private stopPromise: Promise<void> | undefined
   private clientStarted = false
   private stopping = false
   private commandAbort = new AbortController()
@@ -397,6 +402,7 @@ export class LarkBridge {
   constructor(ctx: Context, options: LarkBridgeOptions) {
     this.ctx = ctx
     this.client = options.client
+    this.inboundDeduplicator = options.inboundDeduplicator
     this.locale = options.locale ?? DEFAULT_CONFIG.locale
     this.text = localeCopy(this.locale).bridge
     this.allowFrom = new Set((options.allowFrom ?? []).map((openId) => openId.trim()).filter(Boolean))
@@ -414,6 +420,9 @@ export class LarkBridge {
   }
 
   start(): Promise<void> {
+    if (this.stopPromise !== undefined) {
+      return Promise.reject(new Error('lark: bridge is stopping'))
+    }
     if (this.disposeEvents !== undefined) return this.startPromise ?? Promise.resolve()
     this.stopping = false
     this.clientStarted = false
@@ -431,7 +440,17 @@ export class LarkBridge {
     return start
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.stopPromise !== undefined) return this.stopPromise
+    let stop: Promise<void>
+    stop = this.stopOnce().finally(() => {
+      if (this.stopPromise === stop) this.stopPromise = undefined
+    })
+    this.stopPromise = stop
+    return stop
+  }
+
+  private async stopOnce(): Promise<void> {
     const failures: unknown[] = []
     this.stopping = true
     this.commandAbort.abort()
@@ -449,11 +468,16 @@ export class LarkBridge {
     this.pendingStops.clear()
     const start = this.startPromise
     this.startPromise = undefined
-    if (!this.clientStarted) {
+    const stopReceiving = this.client.stopReceiving
+    if (stopReceiving !== undefined) {
+      await collectSettled([
+        Promise.resolve().then(() => stopReceiving.call(this.client)),
+      ], failures)
+    } else if (!this.clientStarted) {
       await collectSettled([Promise.resolve().then(() => this.client.stop())], failures)
     }
     if (start !== undefined) await Promise.allSettled([start])
-    await collectSettled(this.inboundTasks.values(), failures)
+    await collectSettled([...this.activeInboundTasks], failures)
     this.clearAllStreamTimers()
     await this.drainDeliveries(failures)
     await collectSettled([Promise.resolve().then(() => this.client.stop())], failures)
@@ -461,6 +485,7 @@ export class LarkBridge {
     this.chats.clear()
     this.handles.clear()
     this.inboundTasks.clear()
+    this.activeInboundTasks.clear()
     this.completedInboundKeys.length = 0
     this.clearRoutes()
     await collectSettled([...new Set(agents)].map((handle) => handle.dispose()), failures)
@@ -469,31 +494,45 @@ export class LarkBridge {
   }
 
   async handleInbound(msg: LarkInbound): Promise<void> {
-    if (this.stopping) return
+    if (this.stopping) throw new Error('lark: bridge is stopping')
     const key = msg.messageId === '' ? undefined : `${msg.chatId}\0${msg.messageId}`
-    if (key === undefined) {
-      await this.handleInboundOnce(msg)
-      return
+    if (key !== undefined) {
+      const existing = this.inboundTasks.get(key)
+      if (existing !== undefined) {
+        await existing
+        return
+      }
+      if (this.inboundDeduplicator?.has(key) === true) return
     }
-    const existing = this.inboundTasks.get(key)
-    if (existing !== undefined) {
-      await existing
-      return
-    }
-    const task = this.handleInboundOnce(msg)
-    this.inboundTasks.set(key, task)
-    try {
-      await task
-    } catch (error) {
-      if (this.inboundTasks.get(key) === task) this.inboundTasks.delete(key)
-      throw error
-    }
-    this.completedInboundKeys.push(key)
-    // In-memory replay window; persist message ids only if cross-restart replay is observed.
-    if (this.completedInboundKeys.length > RECENT_INBOUND_LIMIT) {
-      const oldest = this.completedInboundKeys.shift()
-      if (oldest !== undefined) this.inboundTasks.delete(oldest)
-    }
+    const task = this.runInboundTask(msg, key)
+    if (key !== undefined) this.inboundTasks.set(key, task)
+    this.activeInboundTasks.add(task)
+    await task
+  }
+
+  private runInboundTask(msg: LarkInbound, key: string | undefined): Promise<void> {
+    const work = this.handleInboundOnce(msg).then(async () => {
+      if (key !== undefined) await this.inboundDeduplicator?.complete(key)
+    })
+    let task: Promise<void>
+    task = work.then(
+      () => {
+        this.activeInboundTasks.delete(task)
+        if (key === undefined) return
+        this.completedInboundKeys.push(key)
+        if (this.completedInboundKeys.length <= RECENT_INBOUND_LIMIT) return
+        const oldest = this.completedInboundKeys.shift()
+        if (oldest !== undefined) this.inboundTasks.delete(oldest)
+      },
+      (error: unknown) => {
+        this.activeInboundTasks.delete(task)
+        if (key !== undefined && this.inboundTasks.get(key) === task) {
+          this.inboundTasks.delete(key)
+        }
+        throw error
+      },
+    )
+    return task
   }
 
   private async handleInboundOnce(msg: LarkInbound): Promise<void> {
@@ -520,6 +559,7 @@ export class LarkBridge {
       this.removeQueuedRoute(chat.sessionId, route)
       this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
       await this.safeSend(msg.chatId, this.text.followupFailure)
+      throw error
     }
   }
 

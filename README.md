@@ -6,6 +6,7 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 
 - Node.js 22 or newer
 - DeepSeek Harness `0.1.0-rc.6` compatible packages
+- A durable `storageDomain` service; the stock Web profile supplies its JSON-backed storage stack
 - A self-built Feishu or Lark app with a bot
 
 ## Install
@@ -66,6 +67,10 @@ The bundled Cordis patch uses these defaults:
 The `0.1.0` release was credential-smoke-tested against Feishu. The Lark domain path uses the official SDK domain switch and automated coverage. The release runbook covers credential-backed checks for both domains; a recorded Lark run is still required before claiming that domain as credential-smoke-tested.
 
 Leave `defaultSessionId` empty for `lark:<chatId>` isolation. Set it only when every authorized chat should share one Harness session. With a Harness session-persistence backend, the bridge resumes the latest session generation after restart. `/new` and `/clear` acknowledge only after the fresh generation reaches the durability checkpoint; storage or resume failures never fall back to an empty session.
+
+Successfully handled inbound messages are remembered in a durable 1,024-receipt window, so WebSocket redelivery after a normal restart does not repeat a follow-up or command. The receipt medium (normally `$DSH_HOME/storages/lark_inbound.json` in the Web profile) stores only SHA-256 digests, not plaintext app, chat, or message IDs. Custom profiles must mount the Harness storage hub, one durable KV backend, and `storage-domain` before this plugin.
+
+Delivery remains at-least-once: a hard process failure after an external side effect but before its receipt commit can still repeat that side effect. If a receipt write fails while the window is full, an older receipt may already have been evicted; the callback still rejects, but the effective replay window can temporarily shrink. Do not share one JSON storage root between Harness processes; the backend has no cross-process writer lock. Multiple processes connected to one bot are not an exactly-once configuration even when they use separate roots.
 
 Bridge commands: `/help`, `/new`, `/clear`. When the DSH command runtime is mounted, `/help` also discovers the commands available to the exact Agent. A standard DSH Base profile exposes `/compact`, `/goal`, `/permission`, and `/plan`; channel-incompatible commands are omitted.
 

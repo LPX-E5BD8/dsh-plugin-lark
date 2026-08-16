@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
+import Storage from '@deepseek-ai/dsh-storage'
+import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
+import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import * as Lark from '@larksuiteoapi/node-sdk'
 import { LarkBridge } from '../src/bridge.ts'
 import { apply } from '../src/index.ts'
@@ -67,6 +73,7 @@ function fakeCtx(
     list(agent: unknown): ReadonlyArray<{ name: string; description: string; input?: { hint: string } }>
     execute(agent: unknown, line: string, signal: AbortSignal): Promise<unknown>
   },
+  onFollowup?: (message: unknown) => void,
 ) {
   let creates = 0
   const sessionListeners: Array<(s: { id: string }, e: unknown) => void> = []
@@ -98,7 +105,10 @@ function fakeCtx(
           dispose: async () => {},
           agent: {
             session: { id, requestContext: () => undefined },
-            followup(msg: unknown) { followups.push(msg) },
+            followup(msg: unknown) {
+              if (onFollowup === undefined) followups.push(msg)
+              else onFollowup(msg)
+            },
           },
         }
       },
@@ -149,6 +159,26 @@ test('SDK sendText delivers every long reply chunk in order', async () => {
   assert.ok(chunks.length > 1)
   assert.ok(chunks.every((chunk) => [...chunk].length <= 4_000))
   assert.equal(chunks.join(''), answer)
+})
+
+test('SDK stopReceiving closes WebSocket but preserves REST sending until stop', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const sent: string[] = []
+  let closes = 0
+  const internals = client as unknown as {
+    ws?: { close: () => void }
+    sendImpl?: (chatId: string, text: string) => Promise<void>
+  }
+  internals.ws = { close() { closes += 1 } }
+  internals.sendImpl = async (_chatId, text) => { sent.push(text) }
+
+  await client.stopReceiving()
+  await client.sendText('chat-a', 'still deliverable')
+
+  assert.equal(closes, 1)
+  assert.deepEqual(sent, ['still deliverable'])
+  await client.stop()
+  await assert.rejects(client.sendText('chat-a', 'too late'), /not started/)
 })
 
 test('plain-text fallback neutralizes platform mentions', () => {
@@ -226,7 +256,7 @@ test('SDK client can reply while the optional loading image is still uploading',
   }
 })
 
-test('Cordis plugin loading rejects a failed WebSocket connection', async () => {
+test('Cordis plugin loading rejects a failed WebSocket connection', async (t) => {
   const prototype = Lark.Client.prototype as unknown as {
     request: (options: unknown) => Promise<unknown>
   }
@@ -242,18 +272,49 @@ test('Cordis plugin loading rejects a failed WebSocket connection', async () => 
   process.env.DSH_LARK_APP_ID = ['cli', '0'.repeat(16)].join('_')
   process.env.DSH_LARK_APP_SECRET = 'test-only-secret'
   const ctx = new Context()
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-startup-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  await ctx.plugin(Storage)
+  await ctx.plugin(StorageJson, { root })
+  await ctx.plugin(StorageDomain, { backend: 'json' })
   const plugin = {
     name: 'lark-startup-test',
-    inject: [],
+    inject: ['storageDomain'],
     apply: (pluginCtx: Context) => apply(pluginCtx, {}),
   }
   const fiber = ctx.plugin(plugin as never, {})
   try {
     await assert.rejects(fiber.await(), /startup unavailable/)
+    assert.equal(ctx.storageDomain.get('lark_inbound'), undefined)
   } finally {
     await fiber.dispose()
+    await ctx.fiber.dispose()
     prototype.request = request
     Lark.WSClient.prototype.start = start
+    if (previousAppId === undefined) delete process.env.DSH_LARK_APP_ID
+    else process.env.DSH_LARK_APP_ID = previousAppId
+    if (previousAppSecret === undefined) delete process.env.DSH_LARK_APP_SECRET
+    else process.env.DSH_LARK_APP_SECRET = previousAppSecret
+  }
+})
+
+test('plugin construction failure releases its inbound domain', async (t) => {
+  const previousAppId = process.env.DSH_LARK_APP_ID
+  const previousAppSecret = process.env.DSH_LARK_APP_SECRET
+  process.env.DSH_LARK_APP_ID = ['cli', '1'.repeat(16)].join('_')
+  process.env.DSH_LARK_APP_SECRET = 'test-only-secret'
+  const ctx = new Context()
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-construction-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  try {
+    await ctx.plugin(Storage)
+    await ctx.plugin(StorageJson, { root })
+    await ctx.plugin(StorageDomain, { backend: 'json' })
+
+    await assert.rejects(apply(ctx, { streamUpdateIntervalMs: 99 }), /streamUpdateIntervalMs/)
+    assert.equal(ctx.storageDomain.get('lark_inbound'), undefined)
+  } finally {
+    await ctx.fiber.dispose()
     if (previousAppId === undefined) delete process.env.DSH_LARK_APP_ID
     else process.env.DSH_LARK_APP_ID = previousAppId
     if (previousAppSecret === undefined) delete process.env.DSH_LARK_APP_SECRET
@@ -347,6 +408,164 @@ test('duplicate inbound message becomes one followup', async () => {
   ])
   assert.equal(followups.length, 1)
   await bridge.stop()
+})
+
+test('durable inbound receipt skips an already completed message', async () => {
+  const client = fakeClient()
+  const followups: unknown[] = []
+  const checked: string[] = []
+  const bridge = new LarkBridge(fakeCtx(followups) as never, {
+    client,
+    allowAllUsers: true,
+    inboundDeduplicator: {
+      has(key) {
+        checked.push(key)
+        return true
+      },
+      async complete() {
+        assert.fail('a durable hit must not be completed again')
+      },
+    },
+  })
+  await bridge.start()
+
+  await client.handler?.(inbound({ chatId: 'oc_1', text: 'already handled' }))
+
+  assert.deepEqual(checked, ['oc_1\0m1'])
+  assert.equal(followups.length, 0)
+  await bridge.stop()
+})
+
+test('a failed durable completion rejects the handler and permits retry', async () => {
+  const client = fakeClient()
+  const followups: unknown[] = []
+  let checks = 0
+  let completions = 0
+  const bridge = new LarkBridge(fakeCtx(followups) as never, {
+    client,
+    allowAllUsers: true,
+    inboundDeduplicator: {
+      has() {
+        checks += 1
+        return false
+      },
+      async complete() {
+        completions += 1
+        if (completions === 1) throw new Error('receipt unavailable')
+      },
+    },
+  })
+  await bridge.start()
+  const message = inbound({ chatId: 'oc_1', text: 'retry me' })
+
+  await assert.rejects(client.handler!(message), /receipt unavailable/)
+  await client.handler!(message)
+
+  assert.equal(checks, 2)
+  assert.equal(completions, 2)
+  assert.equal(followups.length, 2)
+  await bridge.stop()
+})
+
+test('a failed agent followup is not durably completed and permits retry', async () => {
+  const client = fakeClient()
+  const followups: unknown[] = []
+  let attempts = 0
+  let completions = 0
+  const ctx = fakeCtx(followups, undefined, (message) => {
+    attempts += 1
+    if (attempts === 1) throw new Error('followup unavailable')
+    followups.push(message)
+  })
+  const bridge = new LarkBridge(ctx as never, {
+    client,
+    allowAllUsers: true,
+    inboundDeduplicator: {
+      has: () => false,
+      async complete() { completions += 1 },
+    },
+  })
+  await bridge.start()
+  const message = inbound({ chatId: 'oc_1', text: 'admit me' })
+
+  await assert.rejects(client.handler!(message), /followup unavailable/)
+  assert.equal(completions, 0)
+  assert.deepEqual(client.sent, ['消息提交失败，请重试。'])
+  await client.handler!(message)
+
+  assert.equal(attempts, 2)
+  assert.equal(completions, 1)
+  assert.equal(followups.length, 1)
+  await bridge.stop()
+})
+
+test('stop closes inbound admission before draining receipts and fully stopping', async () => {
+  const client = fakeClient()
+  const events: string[] = []
+  const receiptStarted = Promise.withResolvers<void>()
+  const receipt = Promise.withResolvers<void>()
+  client.stopReceiving = async () => { events.push('stop-receiving') }
+  client.stop = async () => { events.push('stop') }
+  const bridge = new LarkBridge(fakeCtx([]) as never, {
+    client,
+    allowAllUsers: true,
+    inboundDeduplicator: {
+      has: () => false,
+      async complete() {
+        events.push('receipt-start')
+        receiptStarted.resolve()
+        await receipt.promise
+        events.push('receipt-complete')
+      },
+    },
+  })
+  await bridge.start()
+  const handling = client.handler!(inbound({ chatId: 'oc_1', text: 'in progress' }))
+  await receiptStarted.promise
+
+  const stopping = bridge.stop()
+  await Promise.resolve()
+  await Promise.resolve()
+
+  assert.deepEqual(events, ['receipt-start', 'stop-receiving'])
+  await assert.rejects(
+    client.handler!(inbound({ chatId: 'oc_1', text: 'too late', messageId: 'm2' })),
+    /bridge is stopping/,
+  )
+  assert.equal(events.includes('stop'), false)
+
+  receipt.resolve()
+  await handling
+  await stopping
+  assert.deepEqual(events, ['receipt-start', 'stop-receiving', 'receipt-complete', 'stop'])
+})
+
+test('start rejects during teardown and can restart after teardown settles', async () => {
+  const client = fakeClient()
+  const stopReceivingStarted = Promise.withResolvers<void>()
+  const releaseStopReceiving = Promise.withResolvers<void>()
+  let starts = 0
+  let stops = 0
+  client.start = async () => { starts += 1 }
+  client.stopReceiving = async () => {
+    stopReceivingStarted.resolve()
+    await releaseStopReceiving.promise
+  }
+  client.stop = async () => { stops += 1 }
+  const bridge = new LarkBridge(fakeCtx([]) as never, { client, allowAllUsers: true })
+  await bridge.start()
+
+  const stopping = bridge.stop()
+  await stopReceivingStarted.promise
+  assert.equal(bridge.stop(), stopping)
+  await assert.rejects(bridge.start(), /bridge is stopping/)
+
+  releaseStopReceiving.resolve()
+  await stopping
+  await bridge.start()
+  await bridge.stop()
+  assert.equal(starts, 2)
+  assert.equal(stops, 2)
 })
 
 test('group text without mention is ignored', async () => {

@@ -2,12 +2,13 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { LarkBridge } from './bridge.ts'
 import { DEFAULT_CONFIG, LARK_APP_ID_PATTERN } from './config.ts'
+import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { LarkSdkClient } from './lark.ts'
 import { LARK_LOCALES } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 
 export const name = 'lark'
-export const inject = ['agents']
+export const inject = ['agents', 'storageDomain']
 
 export interface LarkConfig {
   domain?: 'feishu' | 'lark'
@@ -38,6 +39,26 @@ function firstNonEmpty(...values: Array<string | undefined>): string | undefined
   return undefined
 }
 
+async function cleanupRuntime(
+  bridge: LarkBridge | undefined,
+  deduplicator: DurableInboundDeduplicator,
+): Promise<unknown[]> {
+  const failures: unknown[] = []
+  if (bridge !== undefined) {
+    try {
+      await bridge.stop()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  try {
+    await deduplicator.close()
+  } catch (error) {
+    failures.push(error)
+  }
+  return failures
+}
+
 export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<void>> {
   const appId = firstNonEmpty(process.env.DSH_LARK_APP_ID)
   const appSecret = firstNonEmpty(
@@ -50,33 +71,43 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
   if (!LARK_APP_ID_PATTERN.test(appId)) {
     throw new Error('lark: appId must match cli_<16 hexadecimal characters>')
   }
-  const client = new LarkSdkClient({
-    appId,
-    appSecret,
-    domain: config.domain ?? DEFAULT_CONFIG.domain,
-    locale: config.locale ?? DEFAULT_CONFIG.locale,
-  })
-  const bridge = new LarkBridge(ctx, {
-    client,
-    locale: config.locale ?? DEFAULT_CONFIG.locale,
-    allowFrom: config.allowFrom ?? [],
-    allowAllUsers: config.allowAllUsers ?? DEFAULT_CONFIG.allowAllUsers,
-    defaultSessionId: config.defaultSessionId ?? '',
-    provider: config.provider,
-    model: config.model,
-    streamUpdateIntervalMs: config.streamUpdateIntervalMs,
-  })
   return (async () => {
+    const deduplicator = await DurableInboundDeduplicator.open(ctx.storageDomain, appId)
+    let bridge: LarkBridge | undefined
     try {
+      const client = new LarkSdkClient({
+        appId,
+        appSecret,
+        domain: config.domain ?? DEFAULT_CONFIG.domain,
+        locale: config.locale ?? DEFAULT_CONFIG.locale,
+      })
+      bridge = new LarkBridge(ctx, {
+        client,
+        inboundDeduplicator: deduplicator,
+        locale: config.locale ?? DEFAULT_CONFIG.locale,
+        allowFrom: config.allowFrom ?? [],
+        allowAllUsers: config.allowAllUsers ?? DEFAULT_CONFIG.allowAllUsers,
+        defaultSessionId: config.defaultSessionId ?? '',
+        provider: config.provider,
+        model: config.model,
+        streamUpdateIntervalMs: config.streamUpdateIntervalMs,
+      })
       await bridge.start()
     } catch (error) {
-      const [cleanup] = await Promise.allSettled([bridge.stop()])
-      if (cleanup?.status === 'rejected') {
-        throw new AggregateError([error, cleanup.reason], 'lark: startup and cleanup failed')
+      const failures = await cleanupRuntime(bridge, deduplicator)
+      if (failures.length > 0) {
+        throw new AggregateError([error, ...failures], 'lark: startup and cleanup failed')
       }
       throw error
     }
-    return () => bridge.stop()
+    let teardown: Promise<void> | undefined
+    return () => {
+      teardown ??= (async () => {
+        const failures = await cleanupRuntime(bridge, deduplicator)
+        if (failures.length > 0) throw new AggregateError(failures, 'lark: plugin teardown failed')
+      })()
+      return teardown
+    }
   })()
 }
 
