@@ -96,7 +96,9 @@ Every event in the installed DSH session catalog has an explicit render, consume
 
 ## Scope
 
-The first release accepts text messages only. Group messages require a bot mention or slash command. Attachments, an administration UI, and a generic card framework are intentionally out of scope.
+The bridge sends only text to the Agent. Images, files, audio, and other non-text messages are classified from the platform message type, but the plugin never parses or copies their serialized content, resource keys, names, or resource metadata into its logs, storage, or Agent input. An authorized direct message, or a group message that explicitly mentions the bot, receives a generic localized text-only notice; other group attachments remain silent. This boundary requires no media-download permission.
+
+Group messages require a bot mention or slash command. Attachment ingestion, an administration UI, and a generic card framework remain intentionally out of scope.
 
 ## Roadmap
 

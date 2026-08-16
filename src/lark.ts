@@ -10,6 +10,7 @@ export interface LarkInbound {
   chatType: 'p2p' | 'group' | string
   openId: string
   text: string
+  messageType?: string
   messageId: string
   rootId?: string
   parentId?: string
@@ -245,20 +246,27 @@ export class LarkSdkClient implements LarkClientLike {
             }
             sender?: { sender_type?: string; sender_id?: { open_id?: string } }
           }) => {
-            if (data.sender?.sender_type === 'app') return
+            if (data.sender?.sender_type !== 'user') return
             const message = data.message
-            if (message === undefined || message.message_type !== 'text') return
+            if (message === undefined) return
             const openId = data.sender?.sender_id?.open_id ?? ''
             const chatId = message.chat_id ?? ''
             const messageId = message.message_id ?? ''
-            const normalized = normalizeInboundText(message.content ?? '', message.mentions ?? [], botOpenId)
-            if (normalized.text === '' || openId === '' || chatId === '' || messageId === '') return
+            const messageType = message.message_type ?? ''
+            if (openId === '' || chatId === '' || messageId === '' || messageType === '') return
+            const mentions = message.mentions ?? []
+            const mentioned = mentions.some((mention) => mention.id?.open_id === botOpenId)
+            const normalized = messageType === 'text'
+              ? normalizeInboundText(message.content ?? '', mentions, botOpenId)
+              : { text: '', mentioned }
+            if (messageType === 'text' && normalized.text === '') return
             if (self.handler === undefined) return
             await self.handler({
               chatId,
               chatType: message.chat_type ?? 'p2p',
               openId,
               text: normalized.text,
+              ...(messageType === 'text' ? {} : { messageType }),
               messageId,
               rootId: message.root_id,
               parentId: message.parent_id,

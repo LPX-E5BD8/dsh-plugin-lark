@@ -369,14 +369,14 @@ test('unwrapCardAction reads operator and button value', () => {
   assert.equal(action.value.decision, 'allowed-once')
 })
 
-test('SDK inbound maps native reply-tree and thread identifiers', async () => {
+test('SDK inbound maps text and keeps unsupported content metadata-only', async () => {
   const prototype = Lark.Client.prototype as unknown as {
     request: (options: unknown) => Promise<unknown>
   }
   const request = prototype.request
   const start = Lark.WSClient.prototype.start
   let receiveMessage: ((data: unknown) => Promise<void>) | undefined
-  let received: LarkInbound | undefined
+  const received: LarkInbound[] = []
   prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
   Lark.WSClient.prototype.start = async function captureDispatcher({ eventDispatcher }) {
     const dispatcher = eventDispatcher as unknown as {
@@ -389,7 +389,7 @@ test('SDK inbound maps native reply-tree and thread identifiers', async () => {
   const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
   const internals = client as unknown as { prepareLoadingImage: () => Promise<void> }
   internals.prepareLoadingImage = async () => {}
-  client.onMessage(async (message) => { received = message })
+  client.onMessage(async (message) => { received.push(message) })
   try {
     await client.start()
     assert.ok(receiveMessage)
@@ -411,7 +411,7 @@ test('SDK inbound maps native reply-tree and thread identifiers', async () => {
       },
     })
 
-    assert.deepEqual(received, {
+    assert.deepEqual(received[0], {
       chatId: 'oc_thread_chat',
       chatType: 'group',
       openId: 'ou_sender',
@@ -422,6 +422,66 @@ test('SDK inbound maps native reply-tree and thread identifiers', async () => {
       threadId: 'omt_thread',
       mentioned: true,
     })
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_thread_chat',
+        chat_type: 'group',
+        content: JSON.stringify({ image_key: 'private-image-key', file_name: 'private.png' }),
+        message_id: 'om_image',
+        message_type: 'image',
+        mentions: [{ key: '@_user_1', id: { open_id: 'test-bot' } }],
+        root_id: 'om_root',
+        parent_id: 'om_current',
+        thread_id: 'omt_thread',
+      },
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_sender' },
+      },
+    })
+    assert.deepEqual(received[1], {
+      chatId: 'oc_thread_chat',
+      chatType: 'group',
+      openId: 'ou_sender',
+      text: '',
+      messageType: 'image',
+      messageId: 'om_image',
+      rootId: 'om_root',
+      parentId: 'om_current',
+      threadId: 'omt_thread',
+      mentioned: true,
+    })
+    assert.doesNotMatch(JSON.stringify(received[1]), /private-image-key|private\.png/)
+
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_thread_chat',
+        chat_type: 'group',
+        content: JSON.stringify({ file_key: 'bot-file-key' }),
+        message_id: 'om_bot_file',
+        message_type: 'file',
+      },
+      sender: {
+        sender_type: 'bot',
+        sender_id: { open_id: 'ou_bot' },
+      },
+    })
+    assert.equal(received.length, 2)
+
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_thread_chat',
+        chat_type: 'group',
+        content: JSON.stringify({ file_key: 'missing-id-key' }),
+        message_id: '',
+        message_type: 'file',
+      },
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou_sender' },
+      },
+    })
+    assert.equal(received.length, 2)
   } finally {
     await client.stop()
     prototype.request = request
@@ -1025,8 +1085,12 @@ test('en-US localizes authorization and help messages', async () => {
   await bridge.handleInbound(inbound({
     chatId: 'oc_1', openId: 'owner', text: '/help', messageId: 'help-message',
   }))
+  await bridge.handleInbound(inbound({
+    chatId: 'oc_1', openId: 'owner', text: '', messageId: 'file-message', messageType: 'file',
+  }))
 
   assert.equal(client.sent[0], "You don't have permission.")
   assert.match(client.sent[1] ?? '', /start a fresh session/)
+  assert.match(client.sent[2] ?? '', /non-text messages are not supported/)
   await bridge.stop()
 })

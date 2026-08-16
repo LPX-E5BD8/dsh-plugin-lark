@@ -63,6 +63,7 @@ Perform the same checks in a direct chat on each domain:
 4. Trigger a protected tool when approval is mounted. Verify only the initiating user in the original chat can Allow once or Deny.
 5. Request a response longer than 6,000 Unicode code points. When the model produces one, verify the card keeps a preview and subsequent text messages include the final tail without loss.
 6. Stop the process cleanly and start it again. Verify the next message resumes the prior chat session with the same Agent preset and tools.
+7. Send an image or file in the direct chat. Verify one generic text-only notice is returned and no attachment content appears in the Agent session or plugin logs.
 
 Repeat these group-chat checks:
 
@@ -70,6 +71,7 @@ Repeat these group-chat checks:
 2. A root message and its ordinary replies retain one conversation; a second root does not inherit that context.
 3. A native thread keeps command, card, approval, fallback, and long-answer delivery inside that thread.
 4. `/new` in one reply tree does not reset another tree. With an explicit `defaultSessionId`, verify that the same command intentionally resets the shared session instead.
+5. An unmentioned attachment stays silent; an attachment that explicitly mentions the bot receives the same generic text-only notice and is never downloaded.
 
 ## Record and clean up
 

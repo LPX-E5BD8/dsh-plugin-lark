@@ -556,7 +556,8 @@ export class LarkBridge {
   }
 
   private async handleInboundOnce(msg: LarkInbound): Promise<void> {
-    const command = inboundCommand(msg.text)
+    const isTextMessage = msg.messageType === undefined || msg.messageType === 'text'
+    const command = isTextMessage ? inboundCommand(msg.text) : undefined
     if (msg.chatType === 'group' && !msg.mentioned && command === undefined) return
     const replyInThread = msg.chatType === 'group' && hasPlatformId(msg.threadId)
     const route: MessageRoute = {
@@ -568,6 +569,10 @@ export class LarkBridge {
     }
     if (!this.authorized(msg.openId)) {
       await this.safeSend(route.chatId, this.text.denied, routeDeliveryOptions(route))
+      return
+    }
+    if (!isTextMessage) {
+      await this.safeSend(route.chatId, this.text.unsupportedInput, routeDeliveryOptions(route))
       return
     }
     if (command !== undefined) {
