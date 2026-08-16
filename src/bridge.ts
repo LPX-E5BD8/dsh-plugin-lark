@@ -120,12 +120,10 @@ interface TurnState {
 }
 
 interface PendingApproval {
-  resolve: (outcome: ApprovalOutcome) => void
+  settle: (outcome: ApprovalOutcome, messageId?: string) => Promise<void>
   readonly sessionId: string
   readonly chatId: string
   readonly openId: string
-  messageId?: string
-  readonly toolName: string
 }
 
 interface PendingStop {
@@ -474,7 +472,7 @@ export class LarkBridge {
       this.disposeApproval = undefined
     }
     this.approvalWaterfallBound = false
-    for (const pending of this.pending.values()) pending.resolve(APPROVAL_OUTCOME.cancelled)
+    for (const pending of this.pending.values()) void pending.settle(APPROVAL_OUTCOME.cancelled)
     this.pending.clear()
     this.pendingStops.clear()
     const start = this.startPromise
@@ -597,9 +595,8 @@ export class LarkBridge {
       this.ctx.logger.warn('[lark] rejected approval from a different chat or user')
       return actionToast('error', this.text.approvalWrongContext)
     }
-    const messageId = action.messageId !== '' ? action.messageId : pending.messageId
-    pending.resolve(outcome)
-    if (messageId !== undefined) await this.updateApprovalCard(messageId, outcome, pending.toolName)
+    const messageId = action.messageId !== '' ? action.messageId : undefined
+    await pending.settle(outcome, messageId)
     const content = outcome === APPROVAL_OUTCOME.allowedOnce
       ? this.text.approvalAllowed
       : this.text.approvalRejected
@@ -682,37 +679,51 @@ export class LarkBridge {
     const sessionId = String(req.agent.session.id)
     const route = this.approvalRoute(sessionId)
     if (route === undefined) return next()
+    if (this.stopping) return Promise.resolve(APPROVAL_OUTCOME.unavailable)
     if (this.client.sendCard === undefined) {
       this.ctx.logger.warn('[lark] sendCard missing; skip approval card')
       return next()
     }
+    if (this.client.updateCard === undefined) {
+      this.ctx.logger.warn('[lark] updateCard missing; skip approval card')
+      return next()
+    }
+    const sendCard = this.client.sendCard
     const requestId = randomUUID()
     const toolName = req.toolName
     const card = renderApprovalCard({ requestId, toolName, reason: req.reason, locale: this.locale })
     return new Promise((resolve) => {
-      const finish = (outcome: ApprovalOutcome): void => {
-        req.signal?.removeEventListener('abort', onAbort)
-        this.pending.delete(requestId)
-        resolve(outcome)
+      let settledOutcome: ApprovalOutcome | undefined
+      let deliveredMessageId: string | undefined
+      let closePromise: Promise<void> | undefined
+      const closeCard = (messageId: string, outcome: ApprovalOutcome): Promise<void> => {
+        if (closePromise !== undefined) return closePromise
+        closePromise = this.updateApprovalCard(messageId, outcome, toolName)
+        this.trackDelivery(closePromise)
+        return closePromise
+      }
+      const settle = (outcome: ApprovalOutcome, messageId?: string): Promise<void> => {
+        if (settledOutcome === undefined) {
+          settledOutcome = outcome
+          req.signal?.removeEventListener('abort', onAbort)
+          this.pending.delete(requestId)
+          resolve(outcome)
+        }
+        const targetMessageId = messageId ?? deliveredMessageId
+        return targetMessageId === undefined
+          ? Promise.resolve()
+          : closeCard(targetMessageId, settledOutcome)
       }
       const onAbort = (): void => {
-        const pending = this.pending.get(requestId)
-        finish(APPROVAL_OUTCOME.cancelled)
-        if (pending?.messageId !== undefined) {
-          this.trackDelivery(this.updateApprovalCard(
-            pending.messageId,
-            APPROVAL_OUTCOME.cancelled,
-            toolName,
-          ))
-        }
+        void settle(APPROVAL_OUTCOME.cancelled)
       }
-      this.pending.set(requestId, {
-        resolve: finish,
+      const pending: PendingApproval = {
+        settle,
         sessionId,
         chatId: route.chatId,
         openId: route.openId,
-        toolName,
-      })
+      }
+      this.pending.set(requestId, pending)
       if (req.signal !== undefined) {
         if (req.signal.aborted) {
           onAbort()
@@ -720,18 +731,28 @@ export class LarkBridge {
         }
         req.signal.addEventListener('abort', onAbort, { once: true })
       }
-      const delivery = this.client.sendCard!(route.chatId, card, routeDeliveryOptions(route)).then((messageId) => {
-        const pending = this.pending.get(requestId)
-        if (pending === undefined) return
+      let sending: Promise<string | void>
+      try {
+        sending = Promise.resolve(
+          sendCard.call(this.client, route.chatId, card, routeDeliveryOptions(route)),
+        )
+      } catch (error) {
+        this.ctx.logger.error('[lark] approval card send failed: %s', messageOf(error))
+        void settle(APPROVAL_OUTCOME.unavailable)
+        return
+      }
+      const delivery = sending.then((messageId) => {
         if (typeof messageId === 'string' && messageId !== '') {
-          pending.messageId = messageId
-          return
+          deliveredMessageId = messageId
+          return settledOutcome === undefined
+            ? undefined
+            : settle(settledOutcome, messageId)
         }
         this.ctx.logger.error('[lark] approval card send failed: missing message id')
-        finish(APPROVAL_OUTCOME.unavailable)
+        return settle(APPROVAL_OUTCOME.unavailable)
       }).catch((error: unknown) => {
         this.ctx.logger.error('[lark] approval card send failed: %s', messageOf(error))
-        finish(APPROVAL_OUTCOME.unavailable)
+        return settle(APPROVAL_OUTCOME.unavailable)
       })
       this.trackDelivery(delivery)
     })
@@ -1470,15 +1491,7 @@ export class LarkBridge {
     }
     for (const pending of this.pending.values()) {
       if (pending.sessionId !== sessionId) continue
-      const messageId = pending.messageId
-      pending.resolve(APPROVAL_OUTCOME.cancelled)
-      if (messageId !== undefined) {
-        this.trackDelivery(this.updateApprovalCard(
-          messageId,
-          APPROVAL_OUTCOME.cancelled,
-          pending.toolName,
-        ))
-      }
+      void pending.settle(APPROVAL_OUTCOME.cancelled)
     }
   }
 
