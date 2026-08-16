@@ -2,7 +2,13 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { LarkBridge } from '../src/bridge.ts'
 import { CARD_LIMITS } from '../src/cards.ts'
-import type { LarkCardAction, LarkCardActionResult, LarkClientLike, LarkInbound } from '../src/lark.ts'
+import type {
+  LarkCardAction,
+  LarkCardActionResult,
+  LarkClientLike,
+  LarkDeliveryOptions,
+  LarkInbound,
+} from '../src/lark.ts'
 
 interface SentText {
   chatId: string
@@ -13,6 +19,8 @@ type TestClient = LarkClientLike & {
   sent: SentText[]
   cards: Array<{ chatId: string; card: unknown; messageId: string }>
   updated: Array<{ messageId: string; card: unknown }>
+  textDeliveryOptions: Array<LarkDeliveryOptions | undefined>
+  cardDeliveryOptions: Array<LarkDeliveryOptions | undefined>
   messageHandler?: (message: LarkInbound) => Promise<void>
   cardHandler?: (action: LarkCardAction) => Promise<LarkCardActionResult>
 }
@@ -22,12 +30,18 @@ function createClient(): TestClient {
     sent: [],
     cards: [],
     updated: [],
+    textDeliveryOptions: [],
+    cardDeliveryOptions: [],
     async start() {},
     async stop() {},
-    async sendText(chatId, text) { client.sent.push({ chatId, text }) },
-    async sendCard(chatId, card) {
+    async sendText(chatId, text, options) {
+      client.sent.push({ chatId, text })
+      client.textDeliveryOptions.push(options)
+    },
+    async sendCard(chatId, card, options) {
       const messageId = `card-${client.cards.length + 1}`
       client.cards.push({ chatId, card, messageId })
+      client.cardDeliveryOptions.push(options)
       return messageId
     },
     async updateCard(messageId, card) { client.updated.push({ messageId, card }) },
@@ -51,6 +65,7 @@ function createHost(persistence?: TestPersistence) {
   let resumeCount = 0
   let flushCount = 0
   let cancelCount = 0
+  const cancelKeepInbox: boolean[] = []
   const createdSessionIds: string[] = []
   const resumedSessionIds: string[] = []
   const disposedSessionIds: string[] = []
@@ -108,7 +123,10 @@ function createHost(persistence?: TestPersistence) {
                 : { provider: 'provider', model: 'model', contextWindow: persistence.contextWindow },
             },
             status: 'running',
-            cancel() { cancelCount += 1 },
+            cancel(_cause: unknown, options?: { keepInbox?: boolean }) {
+              cancelCount += 1
+              cancelKeepInbox.push(options?.keepInbox === true)
+            },
             followup() { persistence?.sessions.add(sessionId) },
           },
         }
@@ -132,7 +150,10 @@ function createHost(persistence?: TestPersistence) {
                 : { provider: 'provider', model: 'model', contextWindow: persistence.contextWindow },
             },
             status: 'running',
-            cancel() { cancelCount += 1 },
+            cancel(_cause: unknown, options?: { keepInbox?: boolean }) {
+              cancelCount += 1
+              cancelKeepInbox.push(options?.keepInbox === true)
+            },
             followup() { persistence.sessions.add(sessionId) },
           },
         }
@@ -160,6 +181,7 @@ function createHost(persistence?: TestPersistence) {
     resumeCount() { return resumeCount },
     flushCount() { return flushCount },
     cancelCount() { return cancelCount },
+    cancelKeepInbox() { return cancelKeepInbox },
     createdSessionIds() { return createdSessionIds },
     resumedSessionIds() { return resumedSessionIds },
     disposedSessionIds() { return disposedSessionIds },
@@ -292,8 +314,28 @@ test('e2e: shared session routes queued turns to their originating chats', async
   await flushDeliveries()
 
   assert.deepEqual(client.cards.map((card) => card.chatId), ['chat-a', 'chat-b'])
+  assert.deepEqual(client.cardDeliveryOptions, [
+    { replyToMessageId: 'chat-a-first' },
+    { replyToMessageId: 'chat-b-second' },
+  ])
   assert.match(JSON.stringify(client.updated), /reply-a/)
   assert.match(JSON.stringify(client.updated), /reply-b/)
+  await bridge.stop()
+})
+
+test('e2e: help replies to the command message', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/help'),
+    messageId: 'help-message',
+  })
+
+  assert.equal(client.sent.length, 1)
+  assert.deepEqual(client.textDeliveryOptions, [{ replyToMessageId: 'help-message' }])
   await bridge.stop()
 })
 
@@ -640,6 +682,7 @@ test('e2e: stop cancels only the originating active turn', async () => {
   })
   assert.equal(stopped?.toast.type, 'success')
   assert.equal(host.cancelCount(), 1)
+  assert.deepEqual(host.cancelKeepInbox(), [true])
 
   const duplicate = await client.cardHandler?.({
     openId: 'owner', chatId: 'chat-a', messageId: 'card-1',
@@ -832,9 +875,13 @@ test('e2e: approval cards are Card 2.0 and concurrent duplicate decisions are id
     reason: 'Run the repository test suite with <private> input.',
   })
   await Promise.resolve()
-  const approval = client.cards.find((card) => requestId(card.card) !== '')
+  const approvalIndex = client.cards.findIndex((card) => requestId(card.card) !== '')
+  const approval = client.cards[approvalIndex]
   const id = requestId(approval?.card)
   assert.ok(id !== '')
+  assert.deepEqual(client.cardDeliveryOptions[approvalIndex], {
+    replyToMessageId: 'chat-a-run a protected tool',
+  })
 
   const action = {
     openId: 'owner',
@@ -987,6 +1034,9 @@ test('e2e: long card replies keep a preview and deliver the complete answer', as
   assert.match(card, /answer-start/)
   assert.doesNotMatch(card, /answer-end/)
   assert.equal(client.sent[0]?.text, `回复较长，以下为完整内容：\n\n${answer}`)
+  assert.deepEqual(client.textDeliveryOptions, [
+    { replyToMessageId: 'chat-a-write a long answer' },
+  ])
   await bridge.stop()
 })
 
@@ -1206,6 +1256,9 @@ test('e2e: plain-text fallback sends only final assistant messages', async () =>
   await flushDeliveries()
 
   assert.deepEqual(client.sent, [{ chatId: 'chat-a', text: 'Inspection complete.' }])
+  assert.deepEqual(client.textDeliveryOptions, [
+    { replyToMessageId: 'chat-a-inspect then answer' },
+  ])
   await bridge.stop()
 })
 

@@ -12,7 +12,13 @@ import { DEFAULT_CONFIG, MIN_STREAM_UPDATE_INTERVAL_MS } from './config.ts'
 import { projectActivity, sessionEventPolicy } from './events.ts'
 import type { ActivityProjection, CatalogSessionEvent } from './events.ts'
 import type { InboundDeduplicator } from './inbound-dedup.ts'
-import type { LarkCardAction, LarkCardActionResult, LarkClientLike, LarkInbound } from './lark.ts'
+import type {
+  LarkCardAction,
+  LarkCardActionResult,
+  LarkClientLike,
+  LarkDeliveryOptions,
+  LarkInbound,
+} from './lark.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 
@@ -79,6 +85,7 @@ interface CommandRuntimeLike {
 interface MessageRoute {
   readonly chatId: string
   readonly openId: string
+  readonly replyToMessageId: string
 }
 
 interface RouteQueue {
@@ -280,6 +287,10 @@ function approvalOutcome(decision: string): ApprovalOutcome | undefined {
 
 function actionToast(type: 'success' | 'error' | 'info', content: string): LarkCardActionResult {
   return { toast: { type, content } }
+}
+
+function routeDeliveryOptions(route: MessageRoute): LarkDeliveryOptions {
+  return { replyToMessageId: route.replyToMessageId }
 }
 
 function inboundCommand(text: string): string | undefined {
@@ -538,17 +549,21 @@ export class LarkBridge {
   private async handleInboundOnce(msg: LarkInbound): Promise<void> {
     const command = inboundCommand(msg.text)
     if (msg.chatType === 'group' && !msg.mentioned && command === undefined) return
+    const route: MessageRoute = {
+      chatId: msg.chatId,
+      openId: msg.openId,
+      replyToMessageId: msg.messageId,
+    }
     if (!this.authorized(msg.openId)) {
-      await this.safeSend(msg.chatId, this.text.denied)
+      await this.safeSend(route.chatId, this.text.denied, routeDeliveryOptions(route))
       return
     }
     if (command !== undefined) {
-      await this.handleCommand(msg.chatId, command)
+      await this.handleCommand(route, command)
       return
     }
     await this.resetBarrier
     const chat = await this.ensureChat(msg.chatId)
-    const route = { chatId: msg.chatId, openId: msg.openId }
     this.enqueueRoute(chat.sessionId, route)
     try {
       chat.handle.agent.followup(createUserMessage({
@@ -558,7 +573,7 @@ export class LarkBridge {
     } catch (error) {
       this.removeQueuedRoute(chat.sessionId, route)
       this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
-      await this.safeSend(msg.chatId, this.text.followupFailure)
+      await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
       throw error
     }
   }
@@ -614,7 +629,7 @@ export class LarkBridge {
         this.pendingStops.delete(requestId)
         return actionToast('info', this.text.stopExpired)
       }
-      resolved.agent.cancel({ kind: 'user' })
+      resolved.agent.cancel({ kind: 'user' }, { keepInbox: true })
       return actionToast('success', this.text.stopRequested)
     } catch (error) {
       this.pendingStops.delete(requestId)
@@ -705,7 +720,7 @@ export class LarkBridge {
         }
         req.signal.addEventListener('abort', onAbort, { once: true })
       }
-      const delivery = this.client.sendCard!(route.chatId, card).then((messageId) => {
+      const delivery = this.client.sendCard!(route.chatId, card, routeDeliveryOptions(route)).then((messageId) => {
         const pending = this.pending.get(requestId)
         if (pending === undefined) return
         if (typeof messageId === 'string' && messageId !== '') {
@@ -735,20 +750,24 @@ export class LarkBridge {
     }
   }
 
-  private async handleCommand(chatId: string, text: string): Promise<void> {
+  private async handleCommand(route: MessageRoute, text: string): Promise<void> {
     const command = text.split(/\s+/)[0] ?? ''
     switch (command) {
       case '/start':
       case '/help':
         await this.resetBarrier
-        await this.safeSend(chatId, this.commandHelp((await this.ensureChat(chatId)).handle.agent))
+        await this.safeSend(
+          route.chatId,
+          this.commandHelp((await this.ensureChat(route.chatId)).handle.agent),
+          routeDeliveryOptions(route),
+        )
         break
       case '/new':
       case '/clear':
-        await this.scheduleReset(chatId)
+        await this.scheduleReset(route)
         break
       default:
-        await this.executeRuntimeCommand(chatId, text, command)
+        await this.executeRuntimeCommand(route, text, command)
     }
   }
 
@@ -775,41 +794,47 @@ export class LarkBridge {
     return commands.length === 0 ? this.text.help : `${this.text.help}\n${commands.join('\n')}`
   }
 
-  private executeRuntimeCommand(chatId: string, text: string, command: string): Promise<void> {
+  private executeRuntimeCommand(route: MessageRoute, text: string, command: string): Promise<void> {
     let operation: Promise<void> = Promise.resolve()
     const admission = this.resetBarrier.then(async () => {
-      const chat = await this.ensureChat(chatId)
+      const chat = await this.ensureChat(route.chatId)
       operation = this.enqueueSessionOperation(
         chat.sessionId,
-        () => this.executeRuntimeCommandNow(chat, text, command),
+        () => this.executeRuntimeCommandNow(chat, route, text, command),
       )
     })
     this.resetBarrier = admission.catch(() => {})
     return admission.then(() => operation)
   }
 
-  private async executeRuntimeCommandNow(chat: ChatSession, text: string, command: string): Promise<void> {
+  private async executeRuntimeCommandNow(
+    chat: ChatSession,
+    route: MessageRoute,
+    text: string,
+    command: string,
+  ): Promise<void> {
+    const deliveryOptions = routeDeliveryOptions(route)
     if (UNSUPPORTED_RUNTIME_COMMANDS.has(command.slice(1).toLowerCase())) {
-      await this.safeSend(chat.chatId, this.text.unknownCommand(command))
+      await this.safeSend(chat.chatId, this.text.unknownCommand(command), deliveryOptions)
       return
     }
     const runtime = this.commandRuntime()
     if (runtime === undefined) {
-      await this.safeSend(chat.chatId, this.text.unknownCommand(command))
+      await this.safeSend(chat.chatId, this.text.unknownCommand(command), deliveryOptions)
       return
     }
     try {
       const execution = await runtime.execute(chat.handle.agent, text, this.commandAbort.signal)
       if (execution === undefined) {
-        await this.safeSend(chat.chatId, this.text.unknownCommand(command))
+        await this.safeSend(chat.chatId, this.text.unknownCommand(command), deliveryOptions)
       } else if (execution.result.text !== undefined && execution.result.text !== '') {
-        await this.safeSend(chat.chatId, execution.result.text)
+        await this.safeSend(chat.chatId, execution.result.text, deliveryOptions)
       } else if (execution.result.kind === 'error') {
-        await this.safeSend(chat.chatId, this.text.commandFailed)
+        await this.safeSend(chat.chatId, this.text.commandFailed, deliveryOptions)
       }
     } catch (error) {
       this.ctx.logger.error('[lark] command failed: %s', messageOf(error))
-      await this.safeSend(chat.chatId, this.text.commandFailed)
+      await this.safeSend(chat.chatId, this.text.commandFailed, deliveryOptions)
     }
   }
 
@@ -823,17 +848,18 @@ export class LarkBridge {
     return operation
   }
 
-  private scheduleReset(chatId: string): Promise<void> {
+  private scheduleReset(route: MessageRoute): Promise<void> {
     const reset = this.resetBarrier.then(async () => {
-      const chat = await this.ensureChat(chatId)
+      const chat = await this.ensureChat(route.chatId)
       await this.sessionOperations.get(chat.sessionId)
-      await this.resetChat(chatId)
+      await this.resetChat(route)
     })
     this.resetBarrier = reset.catch(() => {})
     return reset
   }
 
-  private async resetChat(chatId: string): Promise<void> {
+  private async resetChat(route: MessageRoute): Promise<void> {
+    const chatId = route.chatId
     const chat = await this.ensureChat(chatId)
     const previousSessionId = chat.sessionId
     const previousHandle = chat.handle
@@ -869,7 +895,7 @@ export class LarkBridge {
     } catch (error) {
       this.ctx.logger.error('[lark] previous session disposal failed: %s', messageOf(error))
     }
-    await this.safeSend(chatId, this.text.freshSession)
+    await this.safeSend(chatId, this.text.freshSession, routeDeliveryOptions(route))
   }
 
   private async ensureChat(chatId: string): Promise<ChatSession> {
@@ -1174,7 +1200,13 @@ export class LarkBridge {
       if (state.deliveryDisabled !== true) this.queueTurnCard(state)
       return
     }
-    if (text !== undefined && !callsTool) this.trackDelivery(this.safeSend(state.route.chatId, text))
+    if (text !== undefined && !callsTool) {
+      this.trackDelivery(this.safeSend(
+        state.route.chatId,
+        text,
+        routeDeliveryOptions(state.route),
+      ))
+    }
   }
 
   private turnState(sessionId: string, turn: number): TurnState | undefined {
@@ -1369,7 +1401,11 @@ export class LarkBridge {
       await this.deliverLongAnswer(state, longAnswer)
       return
     }
-    const messageId = await this.client.sendCard!(state.route.chatId, card)
+    const messageId = await this.client.sendCard!(
+      state.route.chatId,
+      card,
+      routeDeliveryOptions(state.route),
+    )
     if (typeof messageId === 'string' && messageId !== '') {
       state.messageId = messageId
       if (answer !== undefined) state.deliveredAnswer = answer
@@ -1387,13 +1423,21 @@ export class LarkBridge {
     if (state.deliveredAnswer === answer || state.textFallbackSent === true) return
     if (answer === undefined || answer === '') return
     state.textFallbackSent = true
-    this.trackDelivery(this.safeSend(state.route.chatId, answer))
+    this.trackDelivery(this.safeSend(
+      state.route.chatId,
+      answer,
+      routeDeliveryOptions(state.route),
+    ))
   }
 
   private async deliverLongAnswer(state: TurnState, answer: string | undefined): Promise<void> {
     if (answer === undefined || state.longAnswerSent === true) return
     state.longAnswerSent = true
-    await this.client.sendText(state.route.chatId, `${this.text.longAnswer}\n\n${answer}`)
+    await this.client.sendText(
+      state.route.chatId,
+      `${this.text.longAnswer}\n\n${answer}`,
+      routeDeliveryOptions(state.route),
+    )
     state.deliveredAnswer = answer
   }
 
@@ -1453,9 +1497,13 @@ export class LarkBridge {
     }
   }
 
-  private async safeSend(chatId: string, text: string): Promise<void> {
+  private async safeSend(
+    chatId: string,
+    text: string,
+    deliveryOptions?: LarkDeliveryOptions,
+  ): Promise<void> {
     try {
-      await this.client.sendText(chatId, text)
+      await this.client.sendText(chatId, text, deliveryOptions)
     } catch (error) {
       this.ctx.logger.error('[lark] delivery failed: %s', messageOf(error))
     }

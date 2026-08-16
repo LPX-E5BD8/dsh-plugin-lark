@@ -78,6 +78,8 @@ Bridge commands: `/help`, `/new`, `/clear`. When the DSH command runtime is moun
 
 One turn owns one Card 2.0 message. Reasoning, todos, retries, compaction, hooks, nested code tools, workflows, tool calls, results, and the final answer update that card in serialized order. Streaming updates are throttled, and every payload is bounded to Lark's 28 KiB card limit. A final answer longer than the card preview is also delivered in complete, platform-sized text messages.
 
+Command results and each turn's initial cards, approval cards, text fallbacks, and long-answer continuations reply to the Lark message that triggered them. Later card changes patch the bot message returned by that reply, so concurrent chats sharing one Harness session keep independent reply targets.
+
 The execution panel bounds visible reasoning and recent tool calls. Running cards use an animated loading indicator when `im:resource` is available, replace it with a terminal status icon on completion, and provide a stop action bound to the originating session, chat, and user. The compact footer reports elapsed time, context-window occupancy, cache hits, input, output, and reasoning usage on one line.
 
 Ordinary replies have no attention header. Failed, blocked, cancelled, and token-limited turns use semantic headers. If Card APIs are unavailable, final assistant text still falls back to text delivery.

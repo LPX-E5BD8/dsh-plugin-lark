@@ -18,9 +18,14 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Persist a bounded inbound-message receipt window across restarts.
 - Finish each platform callback only after its successful handling receipt is durable.
 
-## 0.2 — Conversation context
+## 0.2.0 — Reply delivery
 
-- Preserve reply and thread context when mapping messages to sessions.
+- Deliver command results, execution cards, approvals, fallbacks, and long-answer continuations as replies to the triggering message.
+- Preserve the originating reply target when a shared Harness session serves concurrent chats.
+
+## Later 0.2.x — Conversation context
+
+- Map group reply trees and threads to isolated, resumable Harness sessions.
 - Define safe handling for image and file input before enabling it.
 - Add connection-health diagnostics for operators.
 

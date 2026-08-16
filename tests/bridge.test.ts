@@ -138,6 +138,33 @@ function inbound(partial: Partial<LarkInbound> & Pick<LarkInbound, 'chatId' | 't
   }
 }
 
+interface SdkMessageCall {
+  params?: { receive_id_type?: string }
+  path?: { message_id?: string }
+  data?: {
+    receive_id?: string
+    msg_type?: string
+    content?: string
+  }
+}
+
+interface SdkMessageResponse {
+  code?: number
+  msg?: string
+  data?: { message_id?: string }
+}
+
+function setSdkMessageApi(
+  client: LarkSdkClient,
+  api: {
+    create: (call: SdkMessageCall) => Promise<SdkMessageResponse>
+    reply: (call: SdkMessageCall) => Promise<SdkMessageResponse>
+  },
+): void {
+  const internals = client as unknown as { rest: unknown }
+  internals.rest = { im: { v1: { message: api } } }
+}
+
 test('splitText chunks long replies', () => {
   const chunks = splitText('abcdefghij', 4)
   assert.deepEqual(chunks, ['abcd', 'efgh', 'ij'])
@@ -147,30 +174,130 @@ test('splitText chunks long replies', () => {
 
 test('SDK sendText delivers every long reply chunk in order', async () => {
   const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
-  const chunks: string[] = []
-  const internals = client as unknown as {
-    sendImpl: (chatId: string, text: string) => Promise<void>
-  }
-  internals.sendImpl = async (_chatId, text) => { chunks.push(text) }
+  const replies: SdkMessageCall[] = []
+  let creates = 0
+  setSdkMessageApi(client, {
+    async create() {
+      creates += 1
+      return { data: { message_id: 'om_unexpected' } }
+    },
+    async reply(call) {
+      replies.push(call)
+      return { data: { message_id: `om_reply_${replies.length}` } }
+    },
+  })
   const answer = `start-${'答'.repeat(8_000)}-end`
 
-  await client.sendText('chat-a', answer)
+  await client.sendText('chat-a', answer, { replyToMessageId: 'om_inbound' })
 
+  const chunks = replies.map((call) => {
+    assert.equal(call.path?.message_id, 'om_inbound')
+    assert.equal(call.data?.msg_type, 'text')
+    return (JSON.parse(call.data?.content ?? '{}') as { text?: string }).text ?? ''
+  })
+  assert.equal(creates, 0)
   assert.ok(chunks.length > 1)
   assert.ok(chunks.every((chunk) => [...chunk].length <= 4_000))
   assert.equal(chunks.join(''), answer)
+})
+
+test('SDK delivery creates without a reply target and replies cards with one', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const creates: SdkMessageCall[] = []
+  const replies: SdkMessageCall[] = []
+  setSdkMessageApi(client, {
+    async create(call) {
+      creates.push(call)
+      return { data: { message_id: 'om_created' } }
+    },
+    async reply(call) {
+      replies.push(call)
+      return { data: { message_id: 'om_reply' } }
+    },
+  })
+
+  await client.sendText('oc_chat', 'plain', { replyToMessageId: '' })
+  const cardId = await client.sendCard(
+    'oc_chat',
+    { schema: '2.0', body: { elements: [] } },
+    { replyToMessageId: 'om_inbound' },
+  )
+
+  assert.equal(cardId, 'om_reply')
+  assert.deepEqual(creates, [{
+    params: { receive_id_type: 'chat_id' },
+    data: {
+      receive_id: 'oc_chat',
+      msg_type: 'text',
+      content: JSON.stringify({ text: 'plain' }),
+    },
+  }])
+  assert.deepEqual(replies, [{
+    path: { message_id: 'om_inbound' },
+    data: {
+      msg_type: 'interactive',
+      content: JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+    },
+  }])
+})
+
+test('SDK reply failures do not fall back to chat delivery', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  let creates = 0
+  setSdkMessageApi(client, {
+    async create() {
+      creates += 1
+      return { data: { message_id: 'om_unexpected' } }
+    },
+    async reply() {
+      throw new Error('reply unavailable')
+    },
+  })
+
+  await assert.rejects(
+    client.sendText('oc_chat', 'answer', { replyToMessageId: 'om_inbound' }),
+    /reply unavailable/,
+  )
+  assert.equal(creates, 0)
+})
+
+test('SDK resolved delivery errors and missing message ids reject without fallback', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  let creates = 0
+  let response: SdkMessageResponse = { code: 230_071, msg: 'reply target unavailable' }
+  setSdkMessageApi(client, {
+    async create() {
+      creates += 1
+      return { data: { message_id: 'om_unexpected' } }
+    },
+    async reply() { return response },
+  })
+
+  await assert.rejects(
+    client.sendText('oc_chat', 'answer', { replyToMessageId: 'om_inbound' }),
+    /230071.*reply target unavailable/,
+  )
+  response = { code: 0, data: {} }
+  await assert.rejects(
+    client.sendCard('oc_chat', { schema: '2.0' }, { replyToMessageId: 'om_inbound' }),
+    /missing message_id/,
+  )
+  assert.equal(creates, 0)
 })
 
 test('SDK stopReceiving closes WebSocket but preserves REST sending until stop', async () => {
   const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
   const sent: string[] = []
   let closes = 0
-  const internals = client as unknown as {
-    ws?: { close: () => void }
-    sendImpl?: (chatId: string, text: string) => Promise<void>
-  }
+  const internals = client as unknown as { ws?: { close: () => void } }
   internals.ws = { close() { closes += 1 } }
-  internals.sendImpl = async (_chatId, text) => { sent.push(text) }
+  setSdkMessageApi(client, {
+    async create(call) {
+      sent.push((JSON.parse(call.data?.content ?? '{}') as { text?: string }).text ?? '')
+      return { data: { message_id: 'om_created' } }
+    },
+    async reply() { return { data: { message_id: 'om_reply' } } },
+  })
 
   await client.stopReceiving()
   await client.sendText('chat-a', 'still deliverable')
@@ -236,7 +363,7 @@ test('SDK client can reply while the optional loading image is still uploading',
   const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
   const internals = client as unknown as {
     prepareLoadingImage: () => Promise<void>
-    sendImpl?: unknown
+    rest?: unknown
   }
   internals.prepareLoadingImage = async () => {
     loadingStarted.resolve()
@@ -245,9 +372,44 @@ test('SDK client can reply while the optional loading image is still uploading',
   try {
     const starting = client.start()
     await loadingStarted.promise
-    assert.equal(typeof internals.sendImpl, 'function')
+    assert.notEqual(internals.rest, undefined)
     loading.resolve()
     await starting
+  } finally {
+    loading.resolve()
+    await client.stop()
+    prototype.request = request
+    Lark.WSClient.prototype.start = start
+  }
+})
+
+test('SDK startup rejects when the client stops during loading image preparation', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  const start = Lark.WSClient.prototype.start
+  const loading = Promise.withResolvers<void>()
+  const loadingStarted = Promise.withResolvers<void>()
+  prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  Lark.WSClient.prototype.start = async function startReady() {
+    const client = this as unknown as { onReady?: () => void }
+    client.onReady?.()
+  }
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const internals = client as unknown as { prepareLoadingImage: () => Promise<void> }
+  internals.prepareLoadingImage = async () => {
+    loadingStarted.resolve()
+    await loading.promise
+  }
+  try {
+    const starting = client.start()
+    await loadingStarted.promise
+    await client.stop()
+    loading.resolve()
+
+    await assert.rejects(starting, /client stopped during startup/)
+    await assert.rejects(client.sendText('chat-a', 'too late'), /not started/)
   } finally {
     loading.resolve()
     await client.stop()
