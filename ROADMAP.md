@@ -49,9 +49,13 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Keep live conversation handles within a configurable steady-state target by releasing least-recently-used idle entries after a confirmed durability checkpoint.
 - Preserve active turns, pending inbox work, and bridge operations, then cold-resume the exact persisted conversation scope when an evicted conversation is used again.
 
+## 0.6.1 — Documentation
+
+- Publish equivalent English and Simplified Chinese READMEs with a complete, scannable feature overview.
+- Document provider-key ownership and the current project/model switching boundary explicitly.
+
 ## Later 0.x — Usability
 
-- Publish a Chinese README alongside the English documentation and add a complete feature overview.
 - Let each authorized conversation select a validated project/workspace without affecting other conversations.
 - Let each conversation select and persist an available provider/model without cross-session leakage.
 
