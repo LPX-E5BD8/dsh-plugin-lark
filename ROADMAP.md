@@ -39,9 +39,13 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Classify unsupported non-text input without parsing or retaining its platform content or resource metadata.
 - Reply with a generic text-only notice only after the existing authorization and group-mention gates.
 
-## Later 0.x — Input and operations
+## 0.5.0 — Connection readiness
 
-- Add connection-health diagnostics for operators.
+- Expose the official SDK WebSocket connection state through an optional Web-profile readiness endpoint.
+- Return only sanitized reconnect metadata, with non-connected states failing readiness.
+
+## Later 0.x — Operations
+
 - Bound idle in-memory conversation handles after their durable checkpoint.
 
 ## 1.0 — Stable release

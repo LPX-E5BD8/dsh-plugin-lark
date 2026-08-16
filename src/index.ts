@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { LarkBridge } from './bridge.ts'
 import { DEFAULT_CONFIG, LARK_APP_ID_PATTERN } from './config.ts'
+import { installLarkHealthRoute } from './health.ts'
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { LarkSdkClient } from './lark.ts'
 import { LARK_LOCALES } from './locale.ts'
@@ -81,6 +82,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
         domain: config.domain ?? DEFAULT_CONFIG.domain,
         locale: config.locale ?? DEFAULT_CONFIG.locale,
       })
+      installLarkHealthRoute(ctx, () => client.connectionHealth())
       bridge = new LarkBridge(ctx, {
         client,
         inboundDeduplicator: deduplicator,
@@ -121,6 +123,8 @@ export type {
   LarkCardAction,
   LarkCardActionResult,
   LarkClientLike,
+  LarkConnectionHealth,
+  LarkConnectionState,
   LarkDeliveryOptions,
   LarkInbound,
 } from './lark.ts'

@@ -53,6 +53,15 @@ dsh web: http://127.0.0.1:3080
 [ws] ws client ready
 ```
 
+When the Web profile is mounted, also verify the sanitized readiness response:
+
+```sh
+curl --fail-with-body http://127.0.0.1:3080/api/lark/health
+curl --fail --head http://127.0.0.1:3080/api/lark/health
+```
+
+Both requests must return HTTP `200` only after the SDK WebSocket is connected. The JSON body may contain `component`, `ready`, `state`, `reconnectAttempts`, `lastAttemptAt`, and `nextAttemptAt`; it must not contain credentials, platform identifiers, message/session data, or raw errors. A headless profile has no HTTP readiness route by design.
+
 ## Exercise the deployment
 
 Perform the same checks in a direct chat on each domain:
@@ -94,7 +103,7 @@ unset DSH_LARK_APP_ID DSH_LARK_APP_SECRET DEEPSEEK_API_KEY
 
 ## Common failures
 
-- No `[ws] ws client ready`: confirm the app domain, long-connection mode, credentials, and event subscription.
+- No `[ws] ws client ready` or readiness stays at `503`: confirm the app domain, long-connection mode, credentials, and event subscription. This endpoint reports SDK WebSocket state only; it does not diagnose REST permissions, model access, or storage.
 - The bot receives nothing: confirm `im.message.receive_v1`, bot availability, group mentions, and the `allowFrom` entry.
 - The bot receives but cannot reply: confirm message-send permissions and that the app version containing those permissions is published.
 - The loading image is static: grant `im:resource` if animation is required; this cosmetic fallback does not fail the smoke run.
