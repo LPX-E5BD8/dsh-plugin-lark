@@ -38,6 +38,7 @@ Create an overlay outside the checkout, such as `/tmp/dsh-lark-smoke.yml`:
     allowAllUsers: false
     allowFrom:
       - <tester-open-id>
+    maxConversationHandles: 1 # exercise cold resume after idle LRU eviction
 ```
 
 Start the Web profile. The Web app intentionally accepts loopback only; Feishu/Lark event delivery uses the outbound WebSocket and does not require a public HTTP listener.
@@ -81,6 +82,7 @@ Repeat these group-chat checks:
 3. A native thread keeps command, card, approval, fallback, and long-answer delivery inside that thread.
 4. `/new` in one reply tree does not reset another tree. With an explicit `defaultSessionId`, verify that the same command intentionally resets the shared session instead.
 5. An unmentioned attachment stays silent; an attachment that explicitly mentions the bot receives the same generic text-only notice and is never downloaded.
+6. With `maxConversationHandles: 1`, complete one turn in reply root A, then one in root B, and return to A with a question that requires A's earlier context. Verify A cold-resumes its prior history without inheriting B, losing its Agent preset or tools, duplicating the prompt, or interrupting either in-flight turn.
 
 ## Record and clean up
 
@@ -90,7 +92,7 @@ Record only sanitized facts:
 - Harness, Node.js, and SDK versions;
 - `feishu` or `lark` domain;
 - UTC timestamp;
-- pass/fail for startup, direct chat, group chat, cards, commands, approvals, long reply, and restart;
+- pass/fail for startup, direct chat, group chat, cards, commands, approvals, long reply, restart, and bounded-cache cold resume;
 - redacted error code and remediation when a check fails.
 
 Never record app credentials, API keys, `open_id`, chat/message identifiers, message contents, session logs, or private filesystem paths.
@@ -106,5 +108,6 @@ unset DSH_LARK_APP_ID DSH_LARK_APP_SECRET DEEPSEEK_API_KEY
 - No `[ws] ws client ready` or readiness stays at `503`: confirm the app domain, long-connection mode, credentials, and event subscription. This endpoint reports SDK WebSocket state only; it does not diagnose REST permissions, model access, or storage.
 - The bot receives nothing: confirm `im.message.receive_v1`, bot availability, group mentions, and the `allowFrom` entry.
 - The bot receives but cannot reply: confirm message-send permissions and that the app version containing those permissions is published.
+- The live conversation count remains above `maxConversationHandles`: wait for running commands and turns to become idle, then check for durability or cleanup warnings. The setting is a steady-state target; busy or non-durable handles are retained rather than cancelled or discarded.
 - The loading image is static: grant `im:resource` if animation is required; this cosmetic fallback does not fail the smoke run.
 - A Lark app is tested with `domain: feishu` (or the reverse): fix the overlay before diagnosing credentials or permissions.

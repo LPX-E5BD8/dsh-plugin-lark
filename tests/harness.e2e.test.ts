@@ -122,6 +122,17 @@ function command(text: string): LarkInbound {
   }
 }
 
+function conversationCommand(chatId: string, text: string): LarkInbound {
+  return {
+    chatId,
+    chatType: 'p2p',
+    openId: 'owner',
+    text,
+    messageId: `message-${chatId}-${text}`,
+    mentioned: false,
+  }
+}
+
 function approvalRequestId(card: unknown): string {
   const payload = card as {
     body?: {
@@ -144,7 +155,7 @@ interface HarnessPreset {
 const HARNESS_DEDUP_NAMESPACE = 'harness-e2e-app'
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     if (predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 2))
   }
@@ -184,6 +195,7 @@ async function mount(
   adapter?: LlmAdapter,
   locale?: LarkLocale,
   preset?: HarnessPreset,
+  maxConversationHandles?: number,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
@@ -231,6 +243,7 @@ async function mount(
       allowFrom: ['owner'],
       provider: adapter === undefined ? undefined : 'mock',
       model: adapter === undefined ? undefined : 'mock',
+      maxConversationHandles,
     })
     await bridge.start()
     let disposal: Promise<void> | undefined
@@ -392,4 +405,54 @@ test('harness e2e: Lark agents mount and resume their persisted agent preset', a
     'resumed preset-scoped tools must reach the model request',
   )
   await second.dispose()
+})
+
+test('harness e2e: bounded conversations unregister and cold-resume exact JSONL history', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-conversation-cache-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    textResponse('answer-a-first'),
+    textResponse('answer-b-first'),
+    textResponse('answer-a-second'),
+  ])
+  const harness = await mount(root, adapter, undefined, undefined, 1)
+  t.after(() => harness.dispose())
+
+  await harness.client.messageHandler?.(conversationCommand('chat-a', 'prompt-a-first'))
+  await waitFor(() => adapter.requests.length >= 1)
+  const firstA = harness.ctx.agents.list().find((agent) => String(agent.id) === 'lark:chat-a')
+  assert.ok(firstA !== undefined)
+  await firstA.whenIdle()
+
+  await harness.client.messageHandler?.(conversationCommand('chat-b', 'prompt-b-first'))
+  await waitFor(() => adapter.requests.length >= 2)
+  const firstB = harness.ctx.agents.list().find((agent) => String(agent.id) === 'lark:chat-b')
+  assert.ok(firstB !== undefined)
+  await firstB.whenIdle()
+  await waitFor(() => (
+    harness.ctx.agents.get(firstA.id) === undefined
+    && harness.ctx.sessions.get(firstA.session.id) === undefined
+  ))
+
+  const persistedA = await harness.ctx.sessionPersistence.inspect(firstA.id)
+  assert.ok(persistedA.events.some((event) => (
+    event.type === 'assistant/message'
+    && JSON.stringify(event.data).includes('answer-a-first')
+  )))
+
+  await harness.client.messageHandler?.(conversationCommand('chat-a', 'prompt-a-second'))
+  await waitFor(() => adapter.requests.length >= 3)
+  const resumedA = harness.ctx.agents.get(firstA.id)
+  assert.ok(resumedA !== undefined)
+  assert.notEqual(resumedA, firstA)
+  assert.equal(resumedA.session.firstLiveSeq, persistedA.events.length)
+  await resumedA.whenIdle()
+
+  const resumedRequest = JSON.stringify(adapter.requests[2]?.messages)
+  assert.match(resumedRequest, /prompt-a-first/)
+  assert.match(resumedRequest, /answer-a-first/)
+  assert.match(resumedRequest, /prompt-a-second/)
+  assert.doesNotMatch(resumedRequest, /prompt-b-first|answer-b-first/)
+
+  await harness.dispose()
 })
