@@ -11,6 +11,9 @@ export interface LarkInbound {
   openId: string
   text: string
   messageId: string
+  rootId?: string
+  parentId?: string
+  threadId?: string
   mentioned: boolean
 }
 
@@ -32,6 +35,7 @@ export interface LarkCardActionResult {
 
 export interface LarkDeliveryOptions {
   replyToMessageId?: string
+  replyInThread?: boolean
 }
 
 export interface LarkClientLike {
@@ -235,6 +239,9 @@ export class LarkSdkClient implements LarkClientLike {
               message_id?: string
               message_type?: string
               mentions?: LarkMention[]
+              root_id?: string
+              parent_id?: string
+              thread_id?: string
             }
             sender?: { sender_type?: string; sender_id?: { open_id?: string } }
           }) => {
@@ -253,6 +260,9 @@ export class LarkSdkClient implements LarkClientLike {
               openId,
               text: normalized.text,
               messageId,
+              rootId: message.root_id,
+              parentId: message.parent_id,
+              threadId: message.thread_id,
               mentioned: normalized.mentioned,
             })
           },
@@ -324,7 +334,11 @@ export class LarkSdkClient implements LarkClientLike {
     const res = replyToMessageId !== undefined && replyToMessageId !== ''
       ? await this.rest.im.v1.message.reply({
         path: { message_id: replyToMessageId },
-        data: { msg_type: msgType, content },
+        data: {
+          msg_type: msgType,
+          content,
+          ...(options?.replyInThread === true ? { reply_in_thread: true } : {}),
+        },
       })
       : await this.rest.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },

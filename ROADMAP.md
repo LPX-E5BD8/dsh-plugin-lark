@@ -23,11 +23,22 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Deliver command results, execution cards, approvals, fallbacks, and long-answer continuations as replies to the triggering message.
 - Preserve the originating reply target when a shared Harness session serves concurrent chats.
 
-## Later 0.2.x — Conversation context
+## 0.2.1–0.2.2 — Delivery reliability
+
+- Close approval cards exactly once when cancellation, reset, or shutdown races card creation.
+- Clean up rejected delivery tasks without creating unhandled derived promise rejections.
+
+## 0.3.0 — Conversation context
 
 - Map group reply trees and threads to isolated, resumable Harness sessions.
+- Keep direct-chat session identities compatible and preserve explicit global session binding.
+- Deliver native-thread replies inside the originating thread without changing ordinary reply-tree delivery.
+
+## Later 0.x — Input and operations
+
 - Define safe handling for image and file input before enabling it.
 - Add connection-health diagnostics for operators.
+- Bound idle in-memory conversation handles after their durable checkpoint.
 
 ## 1.0 — Stable release
 

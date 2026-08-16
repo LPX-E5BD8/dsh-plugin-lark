@@ -64,7 +64,12 @@ Perform the same checks in a direct chat on each domain:
 5. Request a response longer than 6,000 Unicode code points. When the model produces one, verify the card keeps a preview and subsequent text messages include the final tail without loss.
 6. Stop the process cleanly and start it again. Verify the next message resumes the prior chat session with the same Agent preset and tools.
 
-Repeat one group-chat check: ordinary unmentioned text must be ignored, while a bot mention or slash command must be handled.
+Repeat these group-chat checks:
+
+1. Ordinary unmentioned text is ignored, while a bot mention or slash command is handled.
+2. A root message and its ordinary replies retain one conversation; a second root does not inherit that context.
+3. A native thread keeps command, card, approval, fallback, and long-answer delivery inside that thread.
+4. `/new` in one reply tree does not reset another tree. With an explicit `defaultSessionId`, verify that the same command intentionally resets the shared session instead.
 
 ## Record and clean up
 

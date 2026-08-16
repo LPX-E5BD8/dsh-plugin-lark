@@ -65,11 +65,13 @@ function createHost(persistence?: TestPersistence) {
   let createCount = 0
   let resumeCount = 0
   let flushCount = 0
+  let listCount = 0
   let cancelCount = 0
   const cancelKeepInbox: boolean[] = []
   const createdSessionIds: string[] = []
   const resumedSessionIds: string[] = []
   const disposedSessionIds: string[] = []
+  const followupSessionIds: string[] = []
   const warnings: unknown[][] = []
   const sessionListeners: Array<(session: { id: string }, event: never) => void> = []
   const approvalListeners: Array<(
@@ -95,6 +97,7 @@ function createHost(persistence?: TestPersistence) {
       if (name === 'sessionPersistence' && persistence !== undefined) {
         return {
           async list() {
+            listCount += 1
             return [...persistence.sessions].map((id) => ({ id }))
           },
         }
@@ -128,7 +131,10 @@ function createHost(persistence?: TestPersistence) {
               cancelCount += 1
               cancelKeepInbox.push(options?.keepInbox === true)
             },
-            followup() { persistence?.sessions.add(sessionId) },
+            followup() {
+              followupSessionIds.push(sessionId)
+              persistence?.sessions.add(sessionId)
+            },
           },
         }
       },
@@ -155,7 +161,10 @@ function createHost(persistence?: TestPersistence) {
               cancelCount += 1
               cancelKeepInbox.push(options?.keepInbox === true)
             },
-            followup() { persistence.sessions.add(sessionId) },
+            followup() {
+              followupSessionIds.push(sessionId)
+              persistence.sessions.add(sessionId)
+            },
           },
         }
       },
@@ -181,11 +190,13 @@ function createHost(persistence?: TestPersistence) {
     createCount() { return createCount },
     resumeCount() { return resumeCount },
     flushCount() { return flushCount },
+    listCount() { return listCount },
     cancelCount() { return cancelCount },
     cancelKeepInbox() { return cancelKeepInbox },
     createdSessionIds() { return createdSessionIds },
     resumedSessionIds() { return resumedSessionIds },
     disposedSessionIds() { return disposedSessionIds },
+    followupSessionIds() { return followupSessionIds },
     warnings() { return warnings },
   }
 }
@@ -198,6 +209,17 @@ function inbound(chatId: string, openId: string, text: string): LarkInbound {
     text,
     messageId: `${chatId}-${text}`,
     mentioned: false,
+  }
+}
+
+function groupInbound(
+  partial: Partial<LarkInbound> & Pick<LarkInbound, 'chatId' | 'text' | 'messageId'>,
+): LarkInbound {
+  return {
+    chatType: 'group',
+    openId: 'owner',
+    mentioned: true,
+    ...partial,
   }
 }
 
@@ -358,6 +380,305 @@ test('e2e: shared session stays shared after reset', async () => {
 
   assert.equal(host.createCount(), 2)
   await bridge.stop()
+})
+
+test('e2e: group reply trees share their root scope and isolate other roots and chats', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'root a', messageId: 'root-a', parentId: 'shared-parent',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'child a', messageId: 'child-a',
+    rootId: 'root-a', parentId: 'root-a',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'nested a', messageId: 'nested-a',
+    rootId: 'root-a', parentId: 'child-a', threadId: '',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'root b', messageId: 'root-b', parentId: 'shared-parent',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-b', text: 'same root id', messageId: 'child-b', rootId: 'root-a',
+  }))
+
+  const rootA = 'lark:group-v1:chat-a:root:root-a'
+  assert.deepEqual(host.createdSessionIds(), [
+    rootA,
+    'lark:group-v1:chat-a:root:root-b',
+    'lark:group-v1:chat-b:root:root-a',
+  ])
+  assert.deepEqual(host.followupSessionIds(), [
+    rootA,
+    rootA,
+    rootA,
+    'lark:group-v1:chat-a:root:root-b',
+    'lark:group-v1:chat-b:root:root-a',
+  ])
+  await bridge.stop()
+})
+
+test('e2e: true threads isolate sessions and mark only thread replies', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'thread a', messageId: 'thread-a-1',
+    rootId: 'root-a', threadId: 'thread-a',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: '/help', messageId: 'thread-a-help',
+    rootId: 'other-root-value', parentId: 'thread-a-1', threadId: 'thread-a',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'thread b', messageId: 'thread-b-1',
+    rootId: 'root-a', threadId: 'thread-b',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: '/help', messageId: 'reply-help', rootId: 'root-a',
+  }))
+
+  assert.deepEqual(host.createdSessionIds(), [
+    'lark:group-v1:chat-a:thread:thread-a',
+    'lark:group-v1:chat-a:thread:thread-b',
+    'lark:group-v1:chat-a:root:root-a',
+  ])
+  assert.deepEqual(client.textDeliveryOptions, [
+    { replyToMessageId: 'thread-a-help', replyInThread: true },
+    { replyToMessageId: 'reply-help' },
+  ])
+  await bridge.stop()
+})
+
+test('e2e: thread metadata reaches execution, approval, and long-answer delivery', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  const controller = new AbortController()
+  await bridge.start()
+  const sessionId = 'lark:group-v1:chat-a:thread:thread-a'
+  const answer = `answer-start\n${'内容'.repeat(CARD_LIMITS.maxAnswerRunes)}\nanswer-end`
+
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'run and answer', messageId: 'thread-message',
+    rootId: 'root-a', threadId: 'thread-a',
+  }))
+  host.emit(sessionId, { type: 'turn/start', data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: sessionId } },
+    toolName: 'exec_command',
+    reason: 'Run tests.',
+    signal: controller.signal,
+  })
+  await waitFor(() => client.cards.some((entry) => requestId(entry.card) !== ''))
+  controller.abort()
+  assert.equal(await outcome, 'cancelled')
+
+  host.emit(sessionId, assistantMessage(1, answer))
+  host.emit(sessionId, {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.length === 1)
+
+  assert.deepEqual(client.cardDeliveryOptions, [
+    { replyToMessageId: 'thread-message', replyInThread: true },
+    { replyToMessageId: 'thread-message', replyInThread: true },
+  ])
+  assert.deepEqual(client.textDeliveryOptions, [
+    { replyToMessageId: 'thread-message', replyInThread: true },
+  ])
+  await bridge.stop()
+})
+
+test('e2e: p2p and unknown chat types ignore reply-tree and thread identifiers', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', 'remember this'),
+    messageId: 'p2p-1', rootId: 'root-a', parentId: 'parent-a', threadId: 'thread-a',
+  })
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/help'),
+    chatType: 'future-chat-kind', messageId: 'p2p-help',
+    rootId: 'root-b', parentId: 'parent-b', threadId: 'thread-b',
+  })
+
+  assert.deepEqual(host.createdSessionIds(), ['lark:chat-a'])
+  assert.deepEqual(client.textDeliveryOptions, [{ replyToMessageId: 'p2p-help' }])
+  await bridge.stop()
+})
+
+test('e2e: concurrent first messages resolve one conversation binding', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const client = createClient()
+  const host = createHost(persistence)
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await Promise.all([
+    client.messageHandler?.(groupInbound({
+      chatId: 'chat-a', text: 'first', messageId: 'child-a', rootId: 'root-a',
+    })),
+    client.messageHandler?.(groupInbound({
+      chatId: 'chat-a', text: 'second', messageId: 'child-b', rootId: 'root-a',
+    })),
+  ])
+
+  assert.equal(host.listCount(), 1)
+  assert.equal(host.createCount(), 1)
+  assert.deepEqual(host.followupSessionIds(), [
+    'lark:group-v1:chat-a:root:root-a',
+    'lark:group-v1:chat-a:root:root-a',
+  ])
+  await bridge.stop()
+})
+
+test('e2e: defaultSessionId overrides every conversation scope and resets globally', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner'],
+    defaultSessionId: 'shared',
+  })
+  await bridge.start()
+
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'reply tree', messageId: 'root-a',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-b', text: 'thread', messageId: 'thread-b', threadId: 'thread-b',
+  }))
+  await client.messageHandler?.(inbound('chat-c', 'owner', 'private'))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-b', text: '/new', messageId: 'reset-thread', threadId: 'thread-b',
+  }))
+  const freshSessionId = host.createdSessionIds().at(-1) ?? ''
+  await client.messageHandler?.(inbound('chat-c', 'owner', 'after reset'))
+
+  assert.equal(host.createCount(), 2)
+  assert.deepEqual(host.createdSessionIds().slice(0, 1), ['shared'])
+  assert.match(freshSessionId, /^shared:\d+-/)
+  assert.deepEqual(host.followupSessionIds(), [
+    'shared',
+    'shared',
+    'shared',
+    freshSessionId,
+  ])
+  assert.deepEqual(client.textDeliveryOptions.at(-1), {
+    replyToMessageId: 'reset-thread',
+    replyInThread: true,
+  })
+  await bridge.stop()
+})
+
+test('e2e: /new resets only the current group reply tree', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'root a', messageId: 'root-a',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'root b', messageId: 'root-b',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: '/new', messageId: 'reset-a', rootId: 'root-a',
+  }))
+  const freshRootA = host.createdSessionIds().at(-1) ?? ''
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'new a', messageId: 'child-a', rootId: 'root-a',
+  }))
+  await client.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'same b', messageId: 'child-b', rootId: 'root-b',
+  }))
+
+  assert.match(freshRootA, /^lark:group-v1:chat-a:root:root-a:\d+-/)
+  assert.deepEqual(host.followupSessionIds(), [
+    'lark:group-v1:chat-a:root:root-a',
+    'lark:group-v1:chat-a:root:root-b',
+    freshRootA,
+    'lark:group-v1:chat-a:root:root-b',
+  ])
+  await bridge.stop()
+})
+
+test('e2e: group reply-tree sessions resume without claiming legacy chat sessions', async () => {
+  const persistence: TestPersistence = { sessions: new Set(['lark:chat-a']) }
+  const firstClient = createClient()
+  const firstHost = createHost(persistence)
+  const firstBridge = new LarkBridge(firstHost as never, {
+    client: firstClient,
+    allowFrom: ['owner'],
+  })
+  await firstBridge.start()
+  await firstClient.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'new scoped context', messageId: 'root-a',
+  }))
+  const scopedSessionId = 'lark:group-v1:chat-a:root:root-a'
+  assert.deepEqual(firstHost.createdSessionIds(), [scopedSessionId])
+  assert.equal(firstHost.resumeCount(), 0)
+  await firstBridge.stop()
+
+  const secondClient = createClient()
+  const secondHost = createHost(persistence)
+  const secondBridge = new LarkBridge(secondHost as never, {
+    client: secondClient,
+    allowFrom: ['owner'],
+  })
+  await secondBridge.start()
+  await secondClient.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'continue scoped context', messageId: 'child-a', rootId: 'root-a',
+  }))
+
+  assert.deepEqual(secondHost.resumedSessionIds(), [scopedSessionId])
+  assert.equal(secondHost.createCount(), 0)
+  await secondBridge.stop()
+})
+
+test('e2e: a reset group reply tree resumes its fresh generation after restart', async () => {
+  const persistence: TestPersistence = { sessions: new Set() }
+  const firstClient = createClient()
+  const firstHost = createHost(persistence)
+  const firstBridge = new LarkBridge(firstHost as never, {
+    client: firstClient,
+    allowFrom: ['owner'],
+  })
+  await firstBridge.start()
+  await firstClient.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'old context', messageId: 'root-a',
+  }))
+  await firstClient.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: '/new', messageId: 'reset-a', rootId: 'root-a',
+  }))
+  const freshSessionId = firstHost.createdSessionIds().at(-1)
+  assert.match(freshSessionId ?? '', /^lark:group-v1:chat-a:root:root-a:\d+-/)
+  await firstBridge.stop()
+
+  const secondClient = createClient()
+  const secondHost = createHost(persistence)
+  const secondBridge = new LarkBridge(secondHost as never, {
+    client: secondClient,
+    allowFrom: ['owner'],
+  })
+  await secondBridge.start()
+  await secondClient.messageHandler?.(groupInbound({
+    chatId: 'chat-a', text: 'new context', messageId: 'child-a', rootId: 'root-a',
+  }))
+
+  assert.deepEqual(secondHost.resumedSessionIds(), [freshSessionId])
+  await secondBridge.stop()
 })
 
 test('e2e: a persisted chat session resumes after bridge restart', async () => {
