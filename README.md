@@ -1,6 +1,19 @@
 # dsh-plugin-lark
 
+English | [简体中文](./README.zh-CN.md)
+
 Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Incoming text becomes an agent follow-up; each turn, tool lifecycle, and approval is rendered back into the originating chat with Card 2.0.
+
+## Features
+
+- **No inbound public endpoint:** receives Feishu/Lark events through the official SDK WebSocket long connection.
+- **Isolated, resumable conversations:** direct chats, group reply trees, and native threads keep separate durable Harness sessions; an explicit global session remains available when desired.
+- **Live execution cards:** streams reasoning, todos, retries, compaction, hooks, workflows, tool calls, results, token usage, and the final answer into one bounded Card 2.0 message.
+- **Safe tool approval and cancellation:** approval and stop actions are bound to the originating session, chat, and user, with stale or cross-chat actions failing closed.
+- **Reliable reply delivery:** keeps cards and fallbacks attached to the triggering message or native thread, continues long answers in full, and durably suppresses normal WebSocket redelivery duplicates.
+- **Bounded process residency:** releases durably checkpointed least-recently-used idle Agents and cold-resumes their exact session without deleting transcripts.
+- **Localized and observable:** includes `zh-CN` and `en-US` UI copy plus an optional, sanitized WebSocket readiness endpoint.
+- **Fail-closed boundaries:** authorization defaults to deny, Lark app credentials stay launch-environment-only, non-text payloads are never ingested, and approval failures never grant access.
 
 ## Requirements
 
@@ -31,6 +44,19 @@ In the Feishu/Lark developer console:
 4. Grant the bot `im:message` send/receive access.
 5. Optionally grant `im:resource` to enable the bundled animated loading indicator; without it, the card uses a static icon.
 
+## Run
+
+Start DSH from the project that the Lark Agent should work on:
+
+```sh
+cd /path/to/target-project
+export DSH_LARK_APP_ID='<app-id>'
+export DSH_LARK_APP_SECRET='<app-secret>'
+dsh --profile web --host 127.0.0.1 --port 3080
+```
+
+The invocation directory becomes the workspace for each fresh Lark session. A persisted session resumes its stored workspace instead. Until conversation-level project switching is available, changing a conversation's project requires restarting DSH from the new directory and then using `/new` in that conversation. Binding the Web UI beyond loopback is deployment-specific; Feishu/Lark event delivery itself uses the outbound long connection and needs no inbound public listener.
+
 ## Credentials
 
 The plugin reads app credentials only from environment variables. It does not accept them in plugin config.
@@ -40,7 +66,21 @@ export DSH_LARK_APP_ID='<app-id>'
 export DSH_LARK_APP_SECRET='<app-secret>'
 ```
 
-`FEISHU_APP_SECRET` remains an environment-only fallback for existing deployments. Local `.env*`, `.credentials.yaml`, and `.dsh/` state are ignored by Git.
+These `DSH_*` values must be inherited by the DSH launch process. DSH `0.1.0-rc.6` rejects `DSH_*` entries in both the invocation directory's `.env` and `$DSH_HOME/.env`; export them in the launching shell or inject them through the service/container environment. `FEISHU_APP_SECRET` remains a launch-environment-only fallback for existing deployments.
+
+Model credentials belong to the Harness provider rather than this plugin. For the default provider, use the Web profile's Models page or store the following mapping in `$DSH_HOME/.credentials.yaml` with file mode `0600`:
+
+```yaml
+DEEPSEEK_API_KEY: <provider-api-key>
+```
+
+For a per-run override, export it before starting DSH:
+
+```sh
+export DEEPSEEK_API_KEY='<provider-api-key>'
+```
+
+With the stock Web profile, each request resolves this key in order from the inherited launch environment, managed `.credentials.yaml`, invocation-directory `.env`, then `$DSH_HOME/.env`. The two `.env` layers are accepted as lower-priority fallbacks for this provider key, but all secret-bearing files must remain untracked. Never put a resolved key in `cordis.patch.yml` or commit it.
 
 See [SMOKE_TESTS.md](./SMOKE_TESTS.md) for the repeatable credential-backed Feishu and Lark release checks.
 
@@ -81,7 +121,9 @@ Successfully handled inbound messages are remembered in a durable 1,024-receipt 
 
 Delivery remains at-least-once: a hard process failure after an external side effect but before its receipt commit can still repeat that side effect. If a receipt write fails while the window is full, an older receipt may already have been evicted; the callback still rejects, but the effective replay window can temporarily shrink. Do not share one JSON storage root between Harness processes; the backend has no cross-process writer lock. Multiple processes connected to one bot are not an exactly-once configuration even when they use separate roots.
 
-Bridge commands: `/help`, `/new`, `/clear`. When the DSH command runtime is mounted, `/help` also discovers the commands available to the exact Agent. A standard DSH Base profile exposes `/compact`, `/goal`, `/permission`, and `/plan`; channel-incompatible commands are omitted.
+Bridge commands: `/start` (an alias for `/help`), `/help`, `/new`, `/clear`. When the DSH command runtime is mounted, `/help` also discovers the commands available to the exact Agent. A standard DSH Base profile exposes `/compact`, `/goal`, `/permission`, and `/plan`; channel-incompatible commands are omitted.
+
+`provider` and `model` currently come from plugin configuration; a fresh session gets the invocation directory as its workspace, while a persisted session resumes its stored workspace. Conversation-level project/workspace and provider/model switching are tracked in the roadmap and are not available in `0.6.x` yet.
 
 ## Cards and approvals
 
