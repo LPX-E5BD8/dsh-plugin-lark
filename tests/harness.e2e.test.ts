@@ -10,11 +10,15 @@ import LlmRuntime, { CallId, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore from '@deepseek-ai/dsh-session'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import Storage from '@deepseek-ai/dsh-storage'
+import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
+import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import type { PreToolDecision } from '@deepseek-ai/dsh-tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import { LarkBridge } from '../src/bridge.ts'
+import { DurableInboundDeduplicator } from '../src/inbound-dedup.ts'
 import type {
   LarkCardAction,
   LarkCardActionResult,
@@ -137,12 +141,42 @@ interface HarnessPreset {
   readonly withEchoTool?: boolean
 }
 
+const HARNESS_DEDUP_NAMESPACE = 'harness-e2e-app'
+
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return
     await new Promise((resolve) => setTimeout(resolve, 2))
   }
   assert.fail('condition was not met before timeout')
+}
+
+async function cleanupHarness(
+  ctx: Context,
+  bridge: LarkBridge | undefined,
+  deduplicator: DurableInboundDeduplicator | undefined,
+): Promise<unknown[]> {
+  const failures: unknown[] = []
+  if (bridge !== undefined) {
+    try {
+      await bridge.stop()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  if (deduplicator !== undefined) {
+    try {
+      await deduplicator.close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  try {
+    await ctx.fiber.dispose()
+  } catch (error) {
+    failures.push(error)
+  }
+  return failures
 }
 
 async function mount(
@@ -157,48 +191,69 @@ async function mount(
   dispose(): Promise<void>
 }> {
   const ctx = new Context()
-  await ctx.plugin(LlmRuntime)
-  await ctx.plugin(SessionStore)
-  await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRuntime)
-  await ctx.plugin(AgentRegistry)
-  await ctx.plugin(AgentLoop, { agents: [] })
-  await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
-  await ctx.plugin(ApprovalService)
-  if (preset !== undefined) {
-    ctx.provide('agentPresets', {
-      resolve(id?: string) {
-        return Promise.resolve({ id: id ?? preset.defaultId })
-      },
-      async mount(agentCtx: Context, id?: string) {
-        const resolved = id ?? preset.defaultId
-        preset.mounted.push(resolved)
-        if (preset.withEchoTool === true) agentCtx.tools.register(echoTool())
-        return { id: resolved }
-      },
+  let bridge: LarkBridge | undefined
+  let deduplicator: DurableInboundDeduplicator | undefined
+  try {
+    await ctx.plugin(Storage)
+    await ctx.plugin(StorageJson, { root: join(root, 'inbound-dedup') })
+    await ctx.plugin(StorageDomain, { backend: 'json' })
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
+    await ctx.plugin(ApprovalService)
+    if (preset !== undefined) {
+      ctx.provide('agentPresets', {
+        resolve(id?: string) {
+          return Promise.resolve({ id: id ?? preset.defaultId })
+        },
+        async mount(agentCtx: Context, id?: string) {
+          const resolved = id ?? preset.defaultId
+          preset.mounted.push(resolved)
+          if (preset.withEchoTool === true) agentCtx.tools.register(echoTool())
+          return { id: resolved }
+        },
+      })
+    }
+    if (adapter !== undefined) ctx.llm.registerAdapter(['mock'], adapter)
+    deduplicator = await DurableInboundDeduplicator.open(
+      ctx.storageDomain,
+      HARNESS_DEDUP_NAMESPACE,
+    )
+    const client = createClient()
+    bridge = new LarkBridge(ctx, {
+      client,
+      inboundDeduplicator: deduplicator,
+      locale,
+      allowFrom: ['owner'],
+      provider: adapter === undefined ? undefined : 'mock',
+      model: adapter === undefined ? undefined : 'mock',
     })
-  }
-  if (adapter !== undefined) ctx.llm.registerAdapter(['mock'], adapter)
-  const client = createClient()
-  const bridge = new LarkBridge(ctx, {
-    client,
-    locale,
-    allowFrom: ['owner'],
-    provider: adapter === undefined ? undefined : 'mock',
-    model: adapter === undefined ? undefined : 'mock',
-  })
-  bridge.start()
-  let disposed = false
-  return {
-    ctx,
-    bridge,
-    client,
-    async dispose() {
-      if (disposed) return
-      disposed = true
-      await bridge.stop()
-      await ctx.fiber.dispose()
-    },
+    await bridge.start()
+    let disposal: Promise<void> | undefined
+    return {
+      ctx,
+      bridge,
+      client,
+      dispose() {
+        disposal ??= (async () => {
+          const failures = await cleanupHarness(ctx, bridge, deduplicator)
+          if (failures.length > 0) {
+            throw new AggregateError(failures, 'harness e2e cleanup failed')
+          }
+        })()
+        return disposal
+      },
+    }
+  } catch (error) {
+    const failures = await cleanupHarness(ctx, bridge, deduplicator)
+    if (failures.length > 0) {
+      throw new AggregateError([error, ...failures], 'harness e2e mount and cleanup failed')
+    }
+    throw error
   }
 }
 
@@ -221,6 +276,26 @@ test('harness e2e: /new materializes and resumes its session across restart', as
   await second.client.messageHandler?.(command('/help'))
   assert.equal(second.ctx.agents.list()[0]?.id, freshSessionId)
   assert.equal(second.ctx.agents.list()[0]?.session.firstLiveSeq, 1)
+  await second.dispose()
+})
+
+test('harness e2e: a persisted /new receipt suppresses replay after restart', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-new-dedup-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const inbound = command('/new')
+
+  const first = await mount(root)
+  t.after(() => first.dispose())
+  await first.client.messageHandler?.(inbound)
+  assert.equal(first.ctx.agents.list().length, 1)
+  assert.equal(first.client.sent.length, 1)
+  await first.dispose()
+
+  const second = await mount(root)
+  t.after(() => second.dispose())
+  await second.client.messageHandler?.(inbound)
+  assert.equal(second.ctx.agents.list().length, 0)
+  assert.deepEqual(second.client.sent, [])
   await second.dispose()
 })
 
@@ -264,10 +339,10 @@ test('harness e2e: message, tool approval, cards, and teardown stay assembled', 
     entry.messageId === approval?.messageId && JSON.stringify(entry.card).includes('Approved')
   )))
 
-  await harness.bridge.stop()
+  const agents = harness.ctx.agents
+  await harness.dispose()
   assert.equal(harness.client.stopped, true)
-  assert.equal(harness.ctx.agents.list().length, 0)
-  await harness.ctx.fiber.dispose()
+  assert.equal(agents.list().length, 0)
 })
 
 test('harness e2e: Lark agents mount and resume their persisted agent preset', async (t) => {

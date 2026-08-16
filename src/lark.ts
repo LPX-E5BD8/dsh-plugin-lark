@@ -33,6 +33,7 @@ export interface LarkCardActionResult {
 export interface LarkClientLike {
   readonly loadingImageKey?: string
   start(): Promise<void>
+  stopReceiving?(): Promise<void>
   stop(): Promise<void>
   sendText(chatId: string, text: string): Promise<void>
   onMessage(handler: (msg: LarkInbound) => Promise<void>): void
@@ -167,6 +168,7 @@ export class LarkSdkClient implements LarkClientLike {
   private rest: LarkRest | undefined
   private sendImpl: ((chatId: string, text: string) => Promise<void>) | undefined
   private cancelStart: ((error: Error) => void) | undefined
+  private receivingStopped = false
 
   constructor(private readonly options: LarkSdkOptions) {}
 
@@ -179,7 +181,9 @@ export class LarkSdkClient implements LarkClientLike {
   }
 
   async start(): Promise<void> {
+    this.receivingStopped = false
     const Lark = await import('@larksuiteoapi/node-sdk')
+    if (this.receivingStopped) throw new Error('lark: client stopped during startup')
     const cancelled = Promise.withResolvers<never>()
     this.cancelStart = cancelled.reject
     const domain = this.options.domain === 'lark' ? Lark.Domain.Lark : Lark.Domain.Feishu
@@ -255,6 +259,7 @@ export class LarkSdkClient implements LarkClientLike {
         Promise.race([ready.promise, cancelled.promise]),
         'lark: WebSocket startup timed out',
       )
+      if (this.receivingStopped) throw new Error('lark: client stopped during startup')
       this.rest = rest
       this.sendImpl = async (chatId, text) => {
         await client.im.v1.message.create({
@@ -334,11 +339,20 @@ export class LarkSdkClient implements LarkClientLike {
     })
   }
 
-  async stop(): Promise<void> {
+  async stopReceiving(): Promise<void> {
+    this.receivingStopped = true
     this.cancelStart?.(new Error('lark: client stopped during startup'))
-    this.ws?.close?.({ force: true })
+    const ws = this.ws
     this.ws = undefined
-    this.rest = undefined
-    this.sendImpl = undefined
+    ws?.close?.({ force: true })
+  }
+
+  async stop(): Promise<void> {
+    try {
+      await this.stopReceiving()
+    } finally {
+      this.rest = undefined
+      this.sendImpl = undefined
+    }
   }
 }
