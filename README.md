@@ -2,7 +2,7 @@
 
 English | [简体中文](./README.zh-CN.md)
 
-Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Incoming text becomes an agent follow-up; each turn, tool lifecycle, and approval is rendered back into the originating chat with Card 2.0.
+Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Incoming text becomes an agent follow-up; each turn, tool lifecycle, approval, and structured question is rendered back into the originating chat with Card 2.0.
 
 ## Features
 
@@ -11,6 +11,7 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 - **Bounded session navigation:** lists eligible history in the exact conversation scope with stored titles, timestamps, project labels, and opaque references, then atomically resumes one selected transcript without accepting raw Session IDs or paths.
 - **Project registration and selection:** project managers can register the active Session directory or remove a registration from a direct chat; every authorized conversation can list and select registered Workspaces without accepting arbitrary paths from chat.
 - **Conversation model selection:** lists live providers and their advertised models, accepts exact adapter-resolved provider/model routes, and preserves each conversation's choice across fresh generations and recovery.
+- **Structured human input:** renders the official `ask_user_question` tool as a bounded native single-choice, multiple-choice, or free-text Card and returns the authorized answer to the same running turn.
 - **Live execution cards:** streams reasoning, todos, retries, compaction, hooks, workflows, tool calls, results, token usage, and the final answer into one bounded Card 2.0 message.
 - **Safe tool approval and cancellation:** approval and stop actions are bound to the originating session, chat, and user, with stale or cross-chat actions failing closed.
 - **Reliable reply delivery:** keeps cards and fallbacks attached to the triggering message or native thread, continues long answers in full, and durably suppresses normal WebSocket redelivery duplicates.
@@ -23,6 +24,7 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 - Node.js 22.x, or Node.js 24.x with plugin v0.8.5 or newer
 - One coherent DeepSeek Harness `0.1.0-rc.6` package cohort
 - The Harness `agents` and `sessions` services; the stock Web profile mounts both
+- The Harness `tools` service, Session persistence, and the compatible rc.6 `ask_user_question` definition for structured Lark input; the stock Web profile mounts them
 - A durable `storageDomain` service; the stock Web profile supplies its JSON-backed storage stack
 - Session navigation additionally requires `sessionPersistence`, `sessionQuery`, and `workspaceRegistry`; the stock rc.6 Web profile supplies them
 - A self-built Feishu or Lark app with a bot
@@ -33,13 +35,13 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds real rc.6 Session Query, Session Title fallback, JSONL persistence, and Workspace lifecycle coverage for bounded exact-scope listing and atomic exact-reference resume. |
+| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds bounded exact-scope Session navigation; v0.9.4 adds direct Native structured human input with real checkpoint, restart-repair, Web-provider delegation, and Code Mode fail-closed coverage. |
 | `0.8.7`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 produces the canonical archive; Node 22 and 24 run adjacent-upgrade profile gates. GitHub-hosted macOS 26 arm64 additionally verifies Node 22 and 24 package/runtime compatibility, not Web-profile deployment. |
 | `0.8.6` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Ubuntu support; macOS 26 arm64 package/runtime evidence covers Node 22 only. |
 | `0.8.5` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
 | `0.8.0`–`0.8.4` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported on the original Node 22/Linux baseline; v0.8.4 adds the boot-free Web-profile package lifecycle gate. |
 
-The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, Session Title, SQLite Session Query exact-read path, JSONL persistence, JSON storage-domain, Tools, Approval, and Workspace services. Platform connection, model provider, and browser behavior use controlled doubles; project mutation also has a real Registry persistence lifecycle test. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.9.2 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, semantic checkpoint policy, Session Title, SQLite Session Query exact-read path, JSONL persistence, JSON storage-domain, Tools, User Questions, Approval, and Workspace services. Platform connection, model provider, and browser behavior use controlled doubles; project mutation also has a real Registry persistence lifecycle test. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.9.3 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
 
 The profile gate also pins npm resolution to the registry snapshot immediately after the rc.6 cohort was published. Harness prerelease packages use caret ranges internally, so an exact top-level `dsh@0.1.0-rc.6` alone can otherwise drift to a later prerelease in a clean npm-exec environment; every resolved DSH package is still checked as exactly rc.6.
 
@@ -49,7 +51,7 @@ Starting with v0.8.6, a separate required gate runs engine-strict Node 22 on Git
 
 That Web-profile gate is deliberately boot-free: it validates package installation, upgrade, bundle resolution, and configuration composition, but does not start the Web app or exercise credentials, the SDK WebSocket connection, `/api/lark/health`, the Feishu/Lark network path, or persisted-state migration. Those remain deployment and credential-backed smoke checks.
 
-Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23.x or 25 and newer, Node.js 24 with plugin v0.8.4 or older, later Cordis or Schemastery releases, other Harness cohorts, Ubuntu architectures outside x64, and a host with the optional Approval service completely absent are unverified. Starting with v0.8.7, the macOS evidence is limited to macOS 26 arm64 with Node 22 or 24 package/runtime consumption; Intel Macs, other macOS releases, stock Web-profile operation, and state migration on macOS remain unverified. Alternative persistence stacks are also unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents`, `sessions`, or durable `storageDomain` support is unsupported.
+Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23.x or 25 and newer, Node.js 24 with plugin v0.8.4 or older, later Cordis or Schemastery releases, other Harness cohorts, Ubuntu architectures outside x64, and a host with the optional Approval service completely absent are unverified. Starting with v0.8.7, the macOS evidence is limited to macOS 26 arm64 with Node 22 or 24 package/runtime consumption; Intel Macs, other macOS releases, stock Web-profile operation, and state migration on macOS remain unverified. Alternative persistence stacks are also unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents`, `sessions`, `tools`, or durable `storageDomain` support is unsupported.
 
 ## Install
 
@@ -86,7 +88,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.9.3'
+version='0.9.4'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -193,7 +195,7 @@ The bundled Cordis patch uses these defaults:
     maxConversationHandles: 32  # steady-state live conversation-handle target
 ```
 
-The baseline requires `agents`, `sessions`, and durable `storageDomain` services. Durable reset, project/model/session selection, and cold recovery also require `sessionPersistence`; `/project` requires `workspaceRegistry`, `/session` additionally requires `sessionQuery` plus durable conversation bindings, and `/model` requires the Harness `llm` service. A missing Session Query or Workspace capability makes session navigation return an unavailable result; a plain `/session` listing does not create an Agent. Approval cards and the readiness route depend on the optional `approval` and `webServer` services. The verified matrix uses the stock JSON/JSONL and SQLite exact-read implementations; alternative implementations remain unverified.
+The baseline requires `agents`, `sessions`, `tools`, and durable `storageDomain` services. Durable reset, project/model/session selection, cold recovery, and structured Lark questions also require `sessionPersistence`; `/project` requires `workspaceRegistry`, `/session` additionally requires `sessionQuery` plus durable conversation bindings, and `/model` requires the Harness `llm` service. Structured input requires the exact compatible rc.6 `ask_user_question` definition to remain visible to the Agent. A missing or incompatible definition is diagnosed and delegated rather than replaced by a second provider. A missing Session Query or Workspace capability makes session navigation return an unavailable result; a plain `/session` listing does not create an Agent. Approval cards and the readiness route depend on the optional `approval` and `webServer` services. The verified matrix uses the stock JSON/JSONL and SQLite exact-read implementations; alternative implementations remain unverified.
 
 `allowFrom` is fail-closed: an empty list with `allowAllUsers: false` denies everyone. Use `allowAllUsers: true` only for an intentionally public bot. Use `domain: lark` for apps hosted on `open.larksuite.com`.
 
@@ -243,7 +245,7 @@ Every authorized user can select any exact provider/model route that a mounted a
 
 ## Cards and approvals
 
-One turn owns one Card 2.0 message. Reasoning, todos, retries, compaction, hooks, nested code tools, workflows, tool calls, results, and the final answer update that card in serialized order. Streaming updates are throttled, and every payload is bounded to Lark's 28 KiB card limit. A final answer longer than the card preview is also delivered in complete, platform-sized text messages.
+One turn owns one Card 2.0 message. Reasoning, todos, retries, compaction, hooks, nested code tools, workflows, tool calls, results, and the final answer update that card in serialized order. Streaming updates are throttled, and every payload stays within the plugin's conservative 28 KiB safety budget below the platform's 30 KB cap. A final answer longer than the card preview is also delivered in complete, platform-sized text messages.
 
 Command results and each turn's initial cards, approval cards, text fallbacks, and long-answer continuations reply to the Lark message that triggered them. Later card changes patch the bot message returned by that reply, so concurrent chats sharing one Harness session keep independent reply targets.
 
@@ -252,6 +254,14 @@ For a native Lark thread, every initial text or card reply also carries `reply_i
 The execution panel bounds visible reasoning and recent tool calls. Running cards use an animated loading indicator when `im:resource` is available, replace it with a terminal status icon on completion, and provide a stop action bound to the originating session, chat, and user. The compact footer reports elapsed time, context-window occupancy, cache hits, input, output, and reasoning usage on one line.
 
 Ordinary replies have no attention header. Failed, blocked, cancelled, and token-limited turns use semantic headers. If Card APIs are unavailable, final assistant text still falls back to text delivery.
+
+For a Lark-originated direct Native `ask_user_question` call, the bridge renders at most three questions in one Card: single choice, multiple choice, and bounded free text. A custom answer supplements a multiple choice and overrides a single choice. Model-authored headings, prompts, option labels, and descriptions are rendered as literal plain text, while internal option tokens keep model identifiers out of callback routing. The terminal Card contains no questions, answers, form fields, request token, or buttons. Do not enter credentials or other secrets: the tool-call questions and a successfully committed tool result become part of the Harness Session transcript.
+
+The pending tool call is explicitly checkpointed before the question Card is sent. The 30-minute answer window starts only after Card delivery succeeds. The exact live Agent, turn, Session, conversation scope, chat, Card message, and initiating user must still match when an action arrives; first valid answer or cancellation wins. `/new`, `/clear`, project, session, and model changes stay busy while the question is pending. User cancellation, Stop, reset, delivery failure, timeout, shutdown, and restart all fail closed; immediate action responses replace the Card, with one delayed bounded PATCH as a best-effort lost-response repair. A Web-originated turn with no claimed Lark route continues to the stock Web provider.
+
+On Harness rc.6 this interception supports direct Native calls in `native` mode and direct Native calls in `both` mode. A nested `ask_user_question` inside `run_code` fails quickly without creating a Card: the rc.6 Code Runtime exposes no public way to pause its worker wall-clock budget while waiting for a human. Code-only presets therefore cannot use structured Lark input in this release.
+
+“Answer received” means the running process accepted the answer; it is not a cross-crash durability receipt. Stop can still cancel the turn before its `tool/result` commits. A hard crash in that window repairs the durable incomplete call as `TOOL_OUTCOME_UNKNOWN`, discards the uncommitted answer, and makes the old Card stale; ask again in a new or recovered turn. This boundary avoids claiming an atomic Card callback/Session commit that rc.6 does not provide.
 
 When `@deepseek-ai/dsh-user-approval` is mounted, protected tool calls show Allow once / Deny. A decision is bound to the originating session, chat, and user; duplicate, expired, malformed, or cross-chat actions fail closed. Cancellation and card-delivery failure also close without granting access.
 

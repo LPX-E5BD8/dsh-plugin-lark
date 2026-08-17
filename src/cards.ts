@@ -1,4 +1,6 @@
 import { DEFAULT_CONFIG } from './config.ts'
+import { HUMAN_INPUT_LIMITS } from './human-input.ts'
+import type { HumanInputQuestion, HumanInputRequest } from './human-input.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 
@@ -72,6 +74,12 @@ const CARD_ELEMENT = {
 export const CARD_ACTIONS = {
   toolApproval: 'tool_approval',
   turnStop: 'turn_stop',
+  humanInputCancel: 'human_input_cancel',
+} as const
+
+export const HUMAN_INPUT_CARD_FIELDS = {
+  form: 'human_input_form',
+  submit: 'human_input_submit',
 } as const
 
 const MILLISECONDS_PER_SECOND = 1_000
@@ -124,6 +132,14 @@ export interface ApprovalCard {
   readonly requestId: string
   readonly toolName: string
   readonly reason?: string
+}
+
+export type HumanInputCardOutcome = 'answered' | 'cancelled' | 'timed-out' | 'unavailable'
+
+export interface HumanInputCard {
+  readonly locale?: LarkLocale
+  readonly requestId: string
+  readonly request: HumanInputRequest
 }
 
 const TOOL_STATUS: Record<ToolCardStatus, { mark: string; color: string; icon: string }> = {
@@ -258,6 +274,20 @@ function markdownElement(
     content,
     text_align: CARD_STYLE.alignLeft,
     text_size: textSize,
+    margin: CARD_STYLE.noMargin,
+  }
+}
+
+function plainTextElement(content: string, textColor?: string): Record<string, unknown> {
+  return {
+    tag: CARD_STYLE.tagDiv,
+    text: {
+      tag: CARD_STYLE.tagPlainText,
+      content: escapePlatformMarkup(content),
+      text_size: CARD_STYLE.normalText,
+      ...(textColor === undefined ? {} : { text_color: textColor }),
+      text_align: CARD_STYLE.alignLeft,
+    },
     margin: CARD_STYLE.noMargin,
   }
 }
@@ -640,7 +670,7 @@ export function renderApprovalCard(card: ApprovalCard): Record<string, unknown> 
     approvalElements(card),
   )
   if (payloadBytes(payload) > CARD_LIMITS.maxBytes) {
-    throw new RangeError('lark: approval card exceeds the platform byte limit')
+    throw new RangeError('lark: approval card exceeds the plugin Card byte budget')
   }
   return payload
 }
@@ -653,6 +683,149 @@ export function renderApprovalDecisionCard(
   const decided = approvalDecision(outcome, locale)
   const payload = basePayload(decided.title, [
     markdownElement(CARD_ELEMENT.approval, `**${escapeMarkdown(truncateRunes(toolName, CARD_LIMITS.maxToolNameRunes))}**`),
+  ])
+  payload.header = {
+    title: { tag: CARD_STYLE.tagPlainText, content: decided.title },
+    template: decided.template,
+    padding: CARD_STYLE.padding,
+  }
+  return payload
+}
+
+export function humanInputSelectionFieldName(index: number): string {
+  return `q${index}`
+}
+
+export function humanInputCustomFieldName(index: number): string {
+  return `c${index}`
+}
+
+function humanInputQuestionElements(
+  question: HumanInputQuestion,
+  index: number,
+  locale: LarkLocale,
+): Record<string, unknown>[] {
+  const copy = localeCopy(locale).card
+  const heading = question.header === undefined
+    ? `${index + 1}. ${question.question}`
+    : `${index + 1}. ${question.header}\n${question.question}`
+  // Questions and descriptions are model-authored, high-trust UI. Keep them
+  // literal so they cannot create links, mentions, images, or other Markdown.
+  const elements: Record<string, unknown>[] = [plainTextElement(heading)]
+  if (question.options.length > 0) {
+    const descriptions = question.options
+      .filter((option) => option.description !== undefined)
+      .map((option) => `${option.label} — ${option.description ?? ''}`)
+    if (descriptions.length > 0) {
+      elements.push(plainTextElement(descriptions.join('\n'), 'grey'))
+    }
+    elements.push({
+      tag: question.multiSelect ? 'multi_select_static' : 'select_static',
+      name: humanInputSelectionFieldName(index),
+      required: false,
+      type: 'default',
+      width: CARD_STYLE.widthFill,
+      placeholder: { tag: CARD_STYLE.tagPlainText, content: copy.humanInputSelectPlaceholder },
+      options: question.options.map((option, optionIndex) => ({
+        text: { tag: CARD_STYLE.tagPlainText, content: escapePlatformMarkup(option.label) },
+        value: `q${index}_o${optionIndex}`,
+      })),
+    })
+  }
+  elements.push({
+    tag: 'input',
+    name: humanInputCustomFieldName(index),
+    required: question.options.length === 0,
+    width: CARD_STYLE.widthFill,
+    input_type: 'multiline_text',
+    rows: question.options.length === 0 ? 3 : 2,
+    max_length: HUMAN_INPUT_LIMITS.maxCustomLength,
+    placeholder: {
+      tag: CARD_STYLE.tagPlainText,
+      content: question.options.length === 0
+        ? copy.humanInputTextPlaceholder
+        : copy.humanInputCustomPlaceholder,
+    },
+  })
+  return elements
+}
+
+function humanInputForm(card: HumanInputCard, locale: LarkLocale): Record<string, unknown> {
+  const copy = localeCopy(locale).card
+  const elements: Record<string, unknown>[] = [
+    markdownElement('', `<font color='grey'>${escapeMarkdown(copy.humanInputSafety)}</font>`, CARD_STYLE.metaText),
+  ]
+  for (const [index, question] of card.request.questions.entries()) {
+    elements.push(divider())
+    elements.push(...humanInputQuestionElements(question, index, locale))
+  }
+  elements.push({
+    tag: CARD_STYLE.tagButton,
+    name: HUMAN_INPUT_CARD_FIELDS.submit,
+    text: { tag: CARD_STYLE.tagPlainText, content: copy.humanInputSubmit },
+    type: 'primary_filled',
+    width: CARD_STYLE.widthFill,
+    size: CARD_STYLE.buttonMedium,
+    form_action_type: 'submit',
+  })
+  return {
+    tag: 'form',
+    name: HUMAN_INPUT_CARD_FIELDS.form,
+    direction: CARD_STYLE.direction,
+    vertical_spacing: CARD_STYLE.panelSpacing,
+    elements,
+  }
+}
+
+function humanInputCancelButton(requestId: string, locale: LarkLocale): Record<string, unknown> {
+  const copy = localeCopy(locale).card
+  return {
+    tag: CARD_STYLE.tagButton,
+    text: { tag: CARD_STYLE.tagPlainText, content: copy.humanInputCancel },
+    type: CARD_STYLE.buttonDefault,
+    width: CARD_STYLE.widthFill,
+    size: CARD_STYLE.buttonMedium,
+    behaviors: [{
+      type: CARD_STYLE.behaviorCallback,
+      value: { action: CARD_ACTIONS.humanInputCancel, request_id: requestId },
+    }],
+  }
+}
+
+export function renderHumanInputCard(card: HumanInputCard): Record<string, unknown> {
+  if (card.requestId.trim() === '' || card.request.questions.length === 0) {
+    throw new TypeError('lark: human-input card requires a request id and questions')
+  }
+  const locale = card.locale ?? DEFAULT_CONFIG.locale
+  const copy = localeCopy(locale).card
+  const payload = basePayload(copy.humanInputSummary, [
+    humanInputForm(card, locale),
+    humanInputCancelButton(card.requestId, locale),
+  ])
+  payload.header = {
+    title: { tag: CARD_STYLE.tagPlainText, content: copy.humanInputTitle },
+    template: 'blue',
+    padding: CARD_STYLE.padding,
+  }
+  if (payloadBytes(payload) > CARD_LIMITS.maxBytes) {
+    throw new RangeError('lark: human-input card exceeds the plugin Card byte budget')
+  }
+  return payload
+}
+
+export function renderHumanInputTerminalCard(
+  outcome: HumanInputCardOutcome,
+  locale: LarkLocale = DEFAULT_CONFIG.locale,
+): Record<string, unknown> {
+  const copy = localeCopy(locale).card
+  const decided = {
+    answered: { title: copy.humanInputSubmitted, template: 'green' },
+    cancelled: { title: copy.humanInputCancelled, template: 'grey' },
+    'timed-out': { title: copy.humanInputTimedOut, template: 'orange' },
+    unavailable: { title: copy.humanInputUnavailable, template: 'red' },
+  }[outcome]
+  const payload = basePayload(decided.title, [
+    markdownElement('', `**${escapeMarkdown(decided.title)}**`),
   ])
   payload.header = {
     title: { tag: CARD_STYLE.tagPlainText, content: decided.title },
@@ -678,7 +851,7 @@ function fitAnswer(card: TurnCard, tools: readonly ToolCardItem[]): RenderedTurn
   let fittedRunes = 0
   let fitted = buildPayload({ ...card, answer: '' }, tools)
   if (payloadBytes(fitted) > CARD_LIMITS.maxBytes) {
-    throw new RangeError('lark: card chrome exceeds the platform byte limit')
+    throw new RangeError('lark: card chrome exceeds the plugin Card byte budget')
   }
   while (low <= high) {
     const middle = low + Math.floor((high - low) / 2)

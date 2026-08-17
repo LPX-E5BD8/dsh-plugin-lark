@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { installModelSelection } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import CodeRuntime from '@deepseek-ai/dsh-code-runtime'
+import type { CodeRunRequest, CodeRunResult } from '@deepseek-ai/dsh-code-runtime'
 import LlmRuntime, { CallId, createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import * as SessionCheckpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import SessionTitleService from '@deepseek-ai/dsh-session-title'
@@ -18,7 +21,9 @@ import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import type { PreToolDecision } from '@deepseek-ai/dsh-tools'
+import * as AskUserQuestionTool from '@deepseek-ai/dsh-tool-ask-user'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
+import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { LarkBridge } from '../src/bridge.ts'
 import { inject as larkInject } from '../src/index.ts'
@@ -87,6 +92,37 @@ function toolResponse(): StreamChunk[] {
   ]
 }
 
+function askUserToolResponse(questions: readonly unknown[], id = 'ask-user-call'): StreamChunk[] {
+  const callId = CallId(id)
+  const args = JSON.stringify({ questions })
+  return [
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: callId, name: 'ask_user_question', argumentsDelta: args },
+    {
+      type: 'block-end',
+      index: 0,
+      block: { type: 'tool-call', id: callId, name: 'ask_user_question', arguments: args },
+    },
+    { type: 'usage', usage: { inputTokens: 10, outputTokens: 2 } },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+}
+
+function runCodeResponse(id = 'run-code-call'): StreamChunk[] {
+  const callId = CallId(id)
+  const args = JSON.stringify({
+    code: 'return await tools.ask_user_question({ questions: [] })',
+    description: 'Ask for a nested choice',
+  })
+  return [
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: callId, name: 'run_code', argumentsDelta: args },
+    { type: 'block-end', index: 0, block: { type: 'tool-call', id: callId, name: 'run_code', arguments: args } },
+    { type: 'usage', usage: { inputTokens: 10, outputTokens: 2 } },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+}
+
 class ScriptedAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
 
@@ -103,6 +139,38 @@ class ScriptedAdapter extends LlmAdapter {
     const response = this.responses.shift()
     if (response === undefined) throw new Error('script exhausted')
     yield* response
+  }
+}
+
+class NestedAskCodeRuntime extends CodeRuntime {
+  readonly language = 'typescript'
+  readonly isolation = 'worker-thread'
+
+  async run(request: CodeRunRequest): Promise<CodeRunResult> {
+    const ask = request.bindings
+      .find(({ global }) => global === 'tools')
+      ?.functions.ask_user_question
+    if (ask === undefined) {
+      return { logs: [], error: { kind: 'exception', message: 'ask tool is unavailable' } }
+    }
+    try {
+      const value = await ask({
+        questions: [{
+          id: 'nested',
+          question: 'Choose inside Code Mode.',
+          options: [{ label: 'A' }, { label: 'B' }],
+        }],
+      })
+      return { logs: [], value }
+    } catch (error) {
+      return {
+        logs: [],
+        error: {
+          kind: 'exception',
+          message: error instanceof Error ? error.message : 'nested ask failed',
+        },
+      }
+    }
   }
 }
 
@@ -154,10 +222,50 @@ function approvalRequestId(card: unknown): string {
   return buttons?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
 }
 
+function isHumanInputCard(card: unknown): boolean {
+  const payload = card as { body?: { elements?: Array<{ tag?: string; name?: string }> } }
+  return payload.body?.elements?.some((element) => (
+    element.tag === 'form' && element.name === 'human_input_form'
+  )) === true
+}
+
+function humanInputCancelRequestId(card: unknown): string {
+  const payload = card as {
+    body?: {
+      elements?: Array<{
+        behaviors?: Array<{ value?: { action?: string; request_id?: string } }>
+      }>
+    }
+  }
+  return payload.body?.elements
+    ?.flatMap((element) => element.behaviors ?? [])
+    .find((behavior) => behavior.value?.action === 'human_input_cancel')
+    ?.value?.request_id ?? ''
+}
+
+function stopRequestId(card: unknown): string {
+  const payload = card as {
+    body?: {
+      elements?: Array<{
+        element_id?: string
+        columns?: Array<{
+          elements?: Array<{
+            behaviors?: Array<{ value?: { request_id?: string } }>
+          }>
+        }>
+      }>
+    }
+  }
+  const actions = payload.body?.elements?.find((element) => element.element_id === 'turn_stop')
+  return actions?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
+}
+
 interface HarnessPreset {
   readonly defaultId: string
   readonly mounted: string[]
   readonly withEchoTool?: boolean
+  readonly denyAskUser?: boolean
+  readonly toolMode?: 'code' | 'both'
 }
 
 interface HarnessWorkspaceSpec {
@@ -257,6 +365,8 @@ async function mount(
   workspaceSpecs?: readonly HarnessWorkspaceSpec[],
   realWorkspaceCwd?: string,
   sessionCompression: 'none' | 'zstd' = 'none',
+  humanInputTimeoutMs?: number,
+  humanInputCardCloseTimeoutMs?: number,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
@@ -280,10 +390,14 @@ async function mount(
       maxTitleBytes: 120,
     })
     await ctx.plugin(SystemPrompt)
+    if (preset?.toolMode !== undefined) await ctx.plugin(NestedAskCodeRuntime)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(UserQuestionService)
+    await ctx.plugin(AskUserQuestionTool)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(JsonlSessionPersistence, { root, compression: sessionCompression })
+    await ctx.plugin(SessionCheckpointPolicy)
     await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
     await ctx.plugin(ApprovalService)
     if (realWorkspaceCwd !== undefined) await ctx.plugin(WorkspaceRegistry)
@@ -296,6 +410,8 @@ async function mount(
           const resolved = id ?? preset.defaultId
           preset.mounted.push(resolved)
           if (preset.withEchoTool === true) agentCtx.tools.register(echoTool())
+          if (preset.denyAskUser === true) agentCtx.tools.restrict({ deny: ['ask_user_question'] })
+          if (preset.toolMode !== undefined) agentCtx.tools.presentAs(preset.toolMode)
           return { id: resolved }
         },
       })
@@ -341,6 +457,8 @@ async function mount(
           provider: adapter === undefined ? undefined : 'mock',
           model: adapter === undefined ? undefined : 'mock',
           maxConversationHandles,
+          humanInputTimeoutMs,
+          humanInputCardCloseTimeoutMs,
           cwd: realWorkspaceCwd,
         })
         bridge = candidate
@@ -664,6 +782,967 @@ test('harness e2e: message, tool approval, cards, and teardown stay assembled', 
   await harness.dispose()
   assert.equal(harness.client.stopped, true)
   assert.equal(agents.list().length, 0)
+})
+
+test('harness e2e: structured Lark input resumes its turn and Web input keeps the stock provider', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const larkQuestions = [
+    {
+      id: 'mode',
+      question: 'Choose a mode.',
+      options: [{ label: 'Safe' }, { label: 'Fast' }],
+    },
+    {
+      id: 'features',
+      question: 'Choose features.',
+      options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }],
+      multi_select: true,
+    },
+    { id: 'note', question: 'Add a note.' },
+  ]
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse(larkQuestions, 'lark-question'),
+    textResponse('continued after Lark answer'),
+    askUserToolResponse([{ id: 'web', question: 'Choose in Web.', options: [{ label: 'Web' }, { label: 'Other' }] }], 'web-question'),
+    textResponse('continued after Web answer'),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  const providerCalls: unknown[] = []
+  const disposeProvider = harness.ctx.userQuestions.registerProvider({
+    async ask(request) {
+      providerCalls.push(request)
+      return {
+        answers: request.questions.map((question) => ({
+          id: question.id,
+          selected: question.options?.[0] === undefined ? [] : [question.options[0].label],
+          ...(question.options?.[0] === undefined ? { custom: 'web custom answer' } : {}),
+        })),
+      }
+    },
+  })
+  t.after(disposeProvider)
+
+  await harness.client.messageHandler?.(command('ask me in Lark'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const wrong = await harness.client.cardHandler?.({
+    openId: 'other-user',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o1', q1: ['q1_o0'], c2: 'note' },
+  })
+  assert.equal(wrong?.toast.type, 'error')
+  assert.equal(providerCalls.length, 0)
+  const wrongChat = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'other-chat',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o1', q1: ['q1_o0'], c2: 'note' },
+  })
+  assert.equal(wrongChat?.toast.type, 'error')
+
+  const malformed = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o99', q1: ['q1_o0'], c2: 'note' },
+  })
+  assert.equal(malformed?.toast.type, 'error')
+  const missingForm = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+  })
+  assert.equal(missingForm?.toast.type, 'error')
+  assert.equal(providerCalls.length, 0)
+  await harness.client.messageHandler?.(command('/new'))
+  assert.match(harness.client.sent.at(-1) ?? '', /left unchanged|保持不变/u)
+
+  const validAction: LarkCardAction = {
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: {
+      q0: 'q0_o1',
+      c0: '',
+      q1: ['q1_o0', 'q1_o2'],
+      c1: 'extra',
+      c2: 'note',
+    },
+  }
+  assert.ok(harness.client.cardHandler !== undefined)
+  const outcomes = await Promise.all([
+    harness.client.cardHandler(validAction),
+    harness.client.cardHandler(validAction),
+  ])
+  const submitted = outcomes.find((outcome) => outcome.toast.type === 'success')
+  const duplicate = outcomes.find((outcome) => outcome.toast.type === 'info')
+  assert.ok(submitted !== undefined)
+  assert.ok(duplicate !== undefined)
+  assert.equal(submitted?.toast.type, 'success')
+  const immediateCard = JSON.stringify(submitted?.card?.data)
+  assert.equal(immediateCard.includes('form'), false)
+  assert.equal(immediateCard.includes('note'), false)
+  assert.equal(duplicate?.toast.type, 'info')
+
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  await waitFor(() => harness.client.updated.some(({ messageId, card }) => (
+    messageId === questionCard.messageId
+      && !JSON.stringify(card).includes('form')
+      && JSON.stringify(card).includes('Answer received')
+  )))
+  assert.equal(providerCalls.length, 0)
+  const larkFollowupHistory = JSON.stringify(adapter.requests[1]?.messages)
+  assert.match(larkFollowupHistory, /Fast/u)
+  assert.equal(larkFollowupHistory.includes('[\\"A\\",\\"C\\"]'), true)
+  assert.match(larkFollowupHistory, /extra/u)
+  assert.match(larkFollowupHistory, /note/u)
+  const humanCardsBeforeWeb = harness.client.cards.filter((entry) => isHumanInputCard(entry.card)).length
+
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'ask me in Web' }],
+    source: { kind: 'user' },
+  }))
+  await agent.whenIdle()
+  assert.equal(providerCalls.length, 1)
+  assert.equal(harness.client.cards.filter((entry) => isHumanInputCard(entry.card)).length, humanCardsBeforeWeb)
+  assert.match(JSON.stringify(adapter.requests[3]?.messages), /Web/u)
+})
+
+test('harness e2e: an external direct tool dispatch cannot steal an active Lark question', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-external-dispatch-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const questions = [{
+    id: 'choice',
+    question: 'Choose in Lark.',
+    options: [{ label: 'A' }, { label: 'B' }],
+  }]
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse(questions, 'shared-call-id'),
+    textResponse('continued after Lark answer'),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  let providerCalls = 0
+  const disposeProvider = harness.ctx.userQuestions.registerProvider({
+    async ask(request) {
+      providerCalls += 1
+      return {
+        answers: request.questions.map(({ id }) => ({ id, selected: ['A'] })),
+      }
+    },
+  })
+  t.after(disposeProvider)
+
+  await harness.client.messageHandler?.(command('ask in Lark'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(questionCard !== undefined)
+  assert.ok(agent !== undefined)
+  const humanCards = harness.client.cards.filter((entry) => isHumanInputCard(entry.card)).length
+
+  const external = await harness.ctx.tools.execute({
+    callId: CallId('shared-call-id'),
+    name: 'ask_user_question',
+    arguments: { questions },
+    agent,
+    signal: new AbortController().signal,
+  })
+  assert.equal(external.isError, false)
+  assert.equal(providerCalls, 1)
+  assert.equal(harness.client.cards.filter((entry) => isHumanInputCard(entry.card)).length, humanCards)
+
+  const submitted = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o1' },
+  })
+  assert.equal(submitted?.toast.type, 'success')
+  await agent.whenIdle()
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /B/u)
+})
+
+test('harness e2e: a preset restriction keeps ask_user_question hidden from the Lark interceptor', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-restricted-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+    textResponse('handled hidden tool'),
+  ])
+  const harness = await mount(root, adapter, 'en-US', {
+    defaultId: 'restricted',
+    mounted: [],
+    denyAskUser: true,
+  })
+  t.after(() => harness.dispose())
+
+  await harness.client.messageHandler?.(command('attempt hidden question'))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  assert.equal(harness.client.cards.some((entry) => isHumanInputCard(entry.card)), false)
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /UNKNOWN_TOOL|unknown tool/iu)
+})
+
+test('harness e2e: a Code Mode nested question fails closed without presenting a Lark Card', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-code-mode-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    runCodeResponse(),
+    textResponse('handled unsupported nested question'),
+  ])
+  const harness = await mount(root, adapter, 'en-US', {
+    defaultId: 'code-mode',
+    mounted: [],
+    toolMode: 'code',
+  })
+  t.after(() => harness.dispose())
+
+  await harness.client.messageHandler?.(command('ask from Code Mode'))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.cards.some((entry) => isHumanInputCard(entry.card)), false)
+  assert.equal(adapter.requests.length, 2)
+  assert.match(
+    JSON.stringify(adapter.requests[1]?.messages),
+    /not supported inside run_code|LARK_HUMAN_INPUT_CODE_MODE_UNSUPPORTED/u,
+  )
+})
+
+test('harness e2e: Both mode keeps a direct Native question interactive', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-both-mode-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{
+      id: 'direct',
+      question: 'Choose directly.',
+      options: [{ label: 'A' }, { label: 'B' }],
+    }], 'both-direct-question'),
+    textResponse('continued in Both mode'),
+  ])
+  const harness = await mount(root, adapter, 'en-US', {
+    defaultId: 'both-mode',
+    mounted: [],
+    toolMode: 'both',
+  })
+  t.after(() => harness.dispose())
+
+  await harness.client.messageHandler?.(command('ask directly in Both mode'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const result = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o0' },
+  })
+  assert.equal(result?.toast.type, 'success')
+  await harness.ctx.agents.list()[0]?.whenIdle()
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /A/u)
+})
+
+test('harness e2e: a pending-call durability checkpoint completes before the Lark Card is created', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-checkpoint-order-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{
+      id: 'choice',
+      question: 'Choose after checkpoint.',
+      options: [{ label: 'A' }, { label: 'B' }],
+    }]),
+    textResponse('continued after durable question'),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  const sessions = harness.ctx.sessions as unknown as {
+    flush(session: Parameters<Context['sessions']['flush']>[0]): Promise<boolean>
+  }
+  const originalFlush = sessions.flush.bind(sessions)
+  const checkpointEntered = Promise.withResolvers<void>()
+  const releaseCheckpoint = Promise.withResolvers<void>()
+  t.after(() => releaseCheckpoint.resolve())
+  sessions.flush = async (session) => {
+    if (session.events.at(-1)?.type === 'tool/call') {
+      checkpointEntered.resolve()
+      await releaseCheckpoint.promise
+    }
+    return originalFlush(session)
+  }
+  t.after(() => { sessions.flush = originalFlush })
+
+  await harness.client.messageHandler?.(command('ask only after a durable call'))
+  await checkpointEntered.promise
+  assert.equal(harness.client.cards.some((entry) => isHumanInputCard(entry.card)), false)
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+
+  releaseCheckpoint.resolve()
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  assert.equal(
+    (await harness.ctx.sessionPersistence.inspect(agent.id)).events.some(({ type }) => type === 'tool/call'),
+    true,
+  )
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o0' },
+  })
+  await agent.whenIdle()
+})
+
+for (const checkpointFailure of ['false', 'reject'] as const) {
+  test(`harness e2e: a ${checkpointFailure} pending-call checkpoint creates no Card or Web fallback`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), `dsh-lark-human-input-checkpoint-${checkpointFailure}-`))
+    t.after(() => rm(root, { recursive: true, force: true }))
+    const adapter = new ScriptedAdapter([
+      askUserToolResponse([{
+        id: 'choice',
+        question: 'This Card must not be sent.',
+        options: [{ label: 'A' }, { label: 'B' }],
+      }]),
+      textResponse('handled checkpoint failure'),
+    ])
+    const harness = await mount(root, adapter, 'en-US')
+    t.after(() => harness.dispose())
+    let providerCalls = 0
+    const disposeProvider = harness.ctx.userQuestions.registerProvider({
+      async ask(request) {
+        providerCalls += 1
+        return { answers: request.questions.map(({ id }) => ({ id, selected: ['A'] })) }
+      },
+    })
+    t.after(disposeProvider)
+    const sessions = harness.ctx.sessions as unknown as {
+      flush(session: Parameters<Context['sessions']['flush']>[0]): Promise<boolean>
+    }
+    const originalFlush = sessions.flush.bind(sessions)
+    let rejected = false
+    sessions.flush = async (session) => {
+      if (session.events.at(-1)?.type !== 'tool/call') return originalFlush(session)
+      if (checkpointFailure === 'false') return false
+      if (!rejected) {
+        rejected = true
+        throw new Error('checkpoint unavailable')
+      }
+      return originalFlush(session)
+    }
+    t.after(() => { sessions.flush = originalFlush })
+
+    await harness.client.messageHandler?.(command(`ask with ${checkpointFailure} checkpoint`))
+    const agent = harness.ctx.agents.list()[0]
+    assert.ok(agent !== undefined)
+    await agent.whenIdle()
+
+    assert.equal(harness.client.cards.some((entry) => isHumanInputCard(entry.card)), false)
+    assert.equal(providerCalls, 0)
+    assert.equal(adapter.requests.length, 2)
+    assert.match(JSON.stringify(adapter.requests[1]?.messages), /checkpoint|durab|error/iu)
+  })
+}
+
+test('harness e2e: cancelling a structured question closes the Card and returns a tool error', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-user-cancel-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+    textResponse('handled cancellation'),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  const postFailureCodes: string[] = []
+  const disposePost = harness.ctx.on('tools/post-execute', (exec, result, next) => {
+    if (exec.name === 'ask_user_question' && result.isError) {
+      postFailureCodes.push(result.error.info?.code ?? '')
+    }
+    return next()
+  })
+  t.after(disposePost)
+
+  await harness.client.messageHandler?.(command('ask then cancel'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const requestId = humanInputCancelRequestId(questionCard.card)
+  assert.ok(requestId !== '')
+  const cancelled = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: { action: 'human_input_cancel', request_id: requestId },
+    tag: 'button',
+    name: '',
+    formValue: {},
+  })
+  assert.equal(cancelled?.toast.type, 'success')
+  assert.match(JSON.stringify(cancelled?.card?.data), /cancelled/u)
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  assert.equal(adapter.requests.length, 2)
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /cancelled/u)
+  assert.deepEqual(postFailureCodes, ['LARK_HUMAN_INPUT_CANCELLED'])
+  assert.match(JSON.stringify(harness.client.updated), /handled cancellation/u)
+})
+
+test('harness e2e: a blocked reset reply cannot delay an authorized human answer', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-reset-answer-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{
+      id: 'choice',
+      question: 'Choose while reset is blocked.',
+      options: [{ label: 'A' }, { label: 'B' }],
+    }]),
+    textResponse('continued after blocked reset'),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  await harness.client.messageHandler?.(command('ask before blocked reset'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+
+  const deliveryEntered = Promise.withResolvers<void>()
+  const releaseDelivery = Promise.withResolvers<void>()
+  const originalSendText = harness.client.sendText.bind(harness.client)
+  harness.client.sendText = async (chatId, text, options) => {
+    if (/left unchanged/u.test(text)) {
+      deliveryEntered.resolve()
+      await releaseDelivery.promise
+    }
+    return originalSendText(chatId, text, options)
+  }
+  const resetting = harness.client.messageHandler?.(command('/new'))
+  await deliveryEntered.promise
+
+  const result = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o1' },
+  })
+  assert.equal(result?.toast.type, 'success')
+  releaseDelivery.resolve()
+  await resetting
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /B/u)
+})
+
+test('harness e2e: Stop cancels a pending question even when a reset reply holds the conversation barrier', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-reset-stop-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{
+      id: 'choice',
+      question: 'Choose unless stopped.',
+      options: [{ label: 'A' }, { label: 'B' }],
+    }]),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  await harness.client.messageHandler?.(command('ask before blocked stop'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  const executionCard = harness.client.cards.find((entry) => stopRequestId(entry.card) !== '')
+  assert.ok(questionCard !== undefined)
+  assert.ok(executionCard !== undefined)
+  const requestId = stopRequestId(executionCard.card)
+
+  const deliveryEntered = Promise.withResolvers<void>()
+  const releaseDelivery = Promise.withResolvers<void>()
+  const originalSendText = harness.client.sendText.bind(harness.client)
+  harness.client.sendText = async (chatId, text, options) => {
+    if (/left unchanged/u.test(text)) {
+      deliveryEntered.resolve()
+      await releaseDelivery.promise
+    }
+    return originalSendText(chatId, text, options)
+  }
+  const resetting = harness.client.messageHandler?.(command('/new'))
+  await deliveryEntered.promise
+
+  const stopped = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: executionCard.messageId,
+    value: { action: 'turn_stop', request_id: requestId },
+    tag: 'button',
+    name: '',
+    formValue: {},
+  })
+  assert.equal(stopped?.toast.type, 'success')
+  const staleAnswer = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o0' },
+  })
+  assert.equal(staleAnswer?.toast.type, 'info')
+
+  releaseDelivery.resolve()
+  await resetting
+  await harness.ctx.agents.list()[0]?.whenIdle()
+  await waitFor(() => harness.client.updated.some(({ messageId, card }) => (
+    messageId === questionCard.messageId && JSON.stringify(card).includes('cancelled')
+  )))
+})
+
+test('harness e2e: an answer accepted before Stop settles once and the turn remains cancellable', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-answer-stop-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{
+      id: 'choice',
+      question: 'Choose before stopping.',
+      options: [{ label: 'A' }, { label: 'B' }],
+    }]),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  const postEntered = Promise.withResolvers<void>()
+  const releasePost = Promise.withResolvers<void>()
+  const disposePost = harness.ctx.on('tools/post-execute', async (exec, _result, next) => {
+    if (exec.name === 'ask_user_question') {
+      postEntered.resolve()
+      await releasePost.promise
+    }
+    return next()
+  })
+  t.after(disposePost)
+
+  await harness.client.messageHandler?.(command('answer then stop'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  const executionCard = harness.client.cards.find((entry) => stopRequestId(entry.card) !== '')
+  assert.ok(questionCard !== undefined)
+  assert.ok(executionCard !== undefined)
+  const answered = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o0' },
+  })
+  assert.equal(answered?.toast.type, 'success')
+  await postEntered.promise
+
+  const stopped = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: executionCard.messageId,
+    value: { action: 'turn_stop', request_id: stopRequestId(executionCard.card) },
+    tag: 'button',
+    name: '',
+    formValue: {},
+  })
+  assert.equal(stopped?.toast.type, 'success')
+  releasePost.resolve()
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  const toolResult = agent.session.events.findLast(({ type }) => type === 'tool/result')
+  assert.match(JSON.stringify(toolResult), /ABORTED/u)
+  const duplicate = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o0' },
+  })
+  assert.equal(duplicate?.toast.type, 'info')
+})
+
+test('harness e2e: a cold crash after answer acceptance repairs the call and expires the old Card', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-crash-source-'))
+  const snapshotParent = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-crash-copy-'))
+  const snapshot = join(snapshotParent, 'snapshot')
+  t.after(() => rm(root, { recursive: true, force: true }))
+  t.after(() => rm(snapshotParent, { recursive: true, force: true }))
+  const firstAdapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'text', question: 'Enter a disposable recovery marker.' }]),
+    textResponse('source process continued'),
+  ])
+  const first = await mount(root, firstAdapter, 'en-US')
+  const postEntered = Promise.withResolvers<void>()
+  const releasePost = Promise.withResolvers<void>()
+  const disposePost = first.ctx.on('tools/post-execute', async (exec, _result, next) => {
+    if (exec.name === 'ask_user_question') {
+      postEntered.resolve()
+      await releasePost.promise
+    }
+    return next()
+  })
+  t.after(disposePost)
+  t.after(async () => {
+    releasePost.resolve()
+    await first.dispose()
+  })
+
+  await first.client.messageHandler?.(command('ask before simulated crash'))
+  await waitFor(() => first.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = first.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const accepted = await first.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { c0: 'ephemeral-answer-marker' },
+  })
+  assert.equal(accepted?.toast.type, 'success')
+  await postEntered.promise
+
+  await cp(root, snapshot, { recursive: true, force: false, errorOnExist: true })
+  const coldAdapter = new ScriptedAdapter([textResponse('cold recovery continued')])
+  const cold = await mount(snapshot, coldAdapter, 'en-US')
+  t.after(() => cold.dispose())
+  await cold.client.messageHandler?.(command('/help'))
+  const coldAgent = cold.ctx.agents.list()[0]
+  assert.ok(coldAgent !== undefined)
+  const repaired = JSON.stringify(coldAgent.session.events)
+  assert.match(repaired, /TOOL_OUTCOME_UNKNOWN|ToolOutcomeUnknownError/u)
+  assert.doesNotMatch(repaired, /ephemeral-answer-marker/u)
+
+  const stale = await cold.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { c0: 'ephemeral-answer-marker' },
+  })
+  assert.equal(stale?.toast.type, 'info')
+  await cold.client.messageHandler?.(conversationCommand('chat-a', 'continue after cold recovery'))
+  await coldAgent.whenIdle()
+  assert.equal(coldAdapter.requests.length, 1)
+  assert.match(JSON.stringify(cold.client.updated), /cold recovery continued/u)
+
+  releasePost.resolve()
+  await first.ctx.agents.list()[0]?.whenIdle()
+})
+
+test('harness e2e: cancelling while a human-input Card create is pending closes the late Card', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-cancel-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  const cardSending = Promise.withResolvers<void>()
+  const releaseCard = Promise.withResolvers<void>()
+  const originalSendCard = harness.client.sendCard?.bind(harness.client)
+  assert.ok(originalSendCard !== undefined)
+  harness.client.sendCard = async (chatId, card, options) => {
+    if (!isHumanInputCard(card)) return originalSendCard(chatId, card, options)
+    cardSending.resolve()
+    await releaseCard.promise
+    return 'late-human-input-card'
+  }
+
+  await harness.client.messageHandler?.(command('ask and cancel'))
+  await cardSending.promise
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  agent.cancel({ kind: 'user' }, { keepInbox: true })
+  let idle = false
+  const idling = agent.whenIdle().then(() => { idle = true })
+  await Promise.resolve()
+  assert.equal(idle, false)
+  releaseCard.resolve()
+  await idling
+  await waitFor(() => harness.client.updated.some(({ messageId }) => messageId === 'late-human-input-card'))
+  const closed = harness.client.updated.findLast(({ messageId }) => messageId === 'late-human-input-card')?.card
+  assert.match(JSON.stringify(closed), /cancelled/u)
+  assert.equal(adapter.requests.length, 1)
+})
+
+test('harness e2e: a human-input timeout closes the Card and resumes the same turn with an error', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-timeout-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'text', question: 'Enter text.' }]),
+    textResponse('handled timeout'),
+  ])
+  const harness = await mount(
+    root,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'none',
+    20,
+  )
+  t.after(() => harness.dispose())
+  const postFailureCodes: string[] = []
+  const disposePost = harness.ctx.on('tools/post-execute', (exec, result, next) => {
+    if (exec.name === 'ask_user_question' && result.isError) {
+      postFailureCodes.push(result.error.info?.code ?? '')
+    }
+    return next()
+  })
+  t.after(disposePost)
+
+  await harness.client.messageHandler?.(command('ask and time out'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  await waitFor(() => harness.client.updated.some(({ messageId, card }) => (
+    messageId === questionCard.messageId && JSON.stringify(card).includes('timed out')
+  )))
+  assert.equal(adapter.requests.length, 2)
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /timed out/u)
+  assert.deepEqual(postFailureCodes, ['LARK_HUMAN_INPUT_TIMEOUT'])
+  assert.match(JSON.stringify(harness.client.updated), /handled timeout/u)
+})
+
+for (const closeOutcome of ['answered', 'cancelled', 'timed-out'] as const) {
+  test(`harness e2e: a synchronous terminal patch failure cannot change the ${closeOutcome} settlement`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), `dsh-lark-human-input-sync-patch-${closeOutcome}-`))
+    t.after(() => rm(root, { recursive: true, force: true }))
+    const adapter = new ScriptedAdapter([
+      askUserToolResponse([{
+        id: 'choice',
+        question: 'Choose or wait.',
+        options: [{ label: 'A' }, { label: 'B' }],
+      }]),
+      textResponse(`handled ${closeOutcome}`),
+    ])
+    const harness = await mount(
+      root,
+      adapter,
+      'en-US',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'none',
+      closeOutcome === 'timed-out' ? 30 : undefined,
+    )
+    t.after(() => harness.dispose())
+    await harness.client.messageHandler?.(command(`ask for sync patch ${closeOutcome}`))
+    await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+    const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+    assert.ok(questionCard !== undefined)
+    const originalUpdateCard = harness.client.updateCard?.bind(harness.client)
+    assert.ok(originalUpdateCard !== undefined)
+    harness.client.updateCard = (messageId, card, options) => {
+      if (messageId === questionCard.messageId) throw new Error('synchronous patch failure')
+      return originalUpdateCard(messageId, card, options)
+    }
+
+    let actionResult: LarkCardActionResult | undefined
+    if (closeOutcome === 'answered') {
+      actionResult = await harness.client.cardHandler?.({
+        openId: 'owner',
+        chatId: 'chat-a',
+        messageId: questionCard.messageId,
+        value: {},
+        tag: 'button',
+        name: 'human_input_submit',
+        formValue: { q0: 'q0_o0' },
+      })
+    } else if (closeOutcome === 'cancelled') {
+      actionResult = await harness.client.cardHandler?.({
+        openId: 'owner',
+        chatId: 'chat-a',
+        messageId: questionCard.messageId,
+        value: {
+          action: 'human_input_cancel',
+          request_id: humanInputCancelRequestId(questionCard.card),
+        },
+        tag: 'button',
+        name: '',
+        formValue: {},
+      })
+    }
+    if (actionResult !== undefined) assert.equal(actionResult.toast.type, 'success')
+    const agent = harness.ctx.agents.list()[0]
+    assert.ok(agent !== undefined)
+    await agent.whenIdle()
+    assert.equal(adapter.requests.length, 2)
+    assert.match(
+      JSON.stringify(adapter.requests[1]?.messages),
+      closeOutcome === 'answered' ? /A/u : closeOutcome === 'cancelled' ? /cancelled/u : /timed out/u,
+    )
+  })
+}
+
+test('harness e2e: Lark question delivery failure never leaks into the Web provider', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-delivery-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'text', question: 'Enter text.' }]),
+    textResponse('handled delivery failure'),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  t.after(() => harness.dispose())
+  let providerCalls = 0
+  const disposeProvider = harness.ctx.userQuestions.registerProvider({
+    async ask(request) {
+      providerCalls += 1
+      return { answers: request.questions.map(({ id }) => ({ id, selected: [], custom: 'web' })) }
+    },
+  })
+  t.after(disposeProvider)
+  const originalSendCard = harness.client.sendCard?.bind(harness.client)
+  assert.ok(originalSendCard !== undefined)
+  harness.client.sendCard = async (chatId, card, options) => {
+    if (isHumanInputCard(card)) throw new Error('question delivery unavailable')
+    return originalSendCard(chatId, card, options)
+  }
+
+  await harness.client.messageHandler?.(command('ask with failed delivery'))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(providerCalls, 0)
+  assert.equal(adapter.requests.length, 2)
+  assert.match(JSON.stringify(adapter.requests[1]?.messages), /unavailable in this Lark conversation/u)
+  assert.match(JSON.stringify(harness.client.updated), /handled delivery failure/u)
+})
+
+test('harness e2e: bridge shutdown drains a pending human-input Card create', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-stop-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+  ])
+  const harness = await mount(root, adapter, 'en-US')
+  const cardSending = Promise.withResolvers<void>()
+  const releaseCard = Promise.withResolvers<void>()
+  const originalSendCard = harness.client.sendCard?.bind(harness.client)
+  const originalUpdateCard = harness.client.updateCard?.bind(harness.client)
+  assert.ok(originalSendCard !== undefined)
+  assert.ok(originalUpdateCard !== undefined)
+  let terminalSignal: AbortSignal | undefined
+  harness.client.sendCard = async (chatId, card, options) => {
+    if (!isHumanInputCard(card)) return originalSendCard(chatId, card, options)
+    cardSending.resolve()
+    await releaseCard.promise
+    return 'shutdown-human-input-card'
+  }
+  harness.client.updateCard = async (messageId, card, options) => {
+    if (messageId === 'shutdown-human-input-card') {
+      terminalSignal = options?.signal
+      assert.ok(terminalSignal !== undefined)
+      terminalSignal.throwIfAborted()
+    }
+    return originalUpdateCard(messageId, card, options)
+  }
+
+  await harness.client.messageHandler?.(command('ask during shutdown'))
+  await cardSending.promise
+  let stopped = false
+  const stopping = harness.dispose().then(() => { stopped = true })
+  await Promise.resolve()
+  assert.equal(stopped, false)
+  releaseCard.resolve()
+  await stopping
+  assert.equal(harness.client.stopped, true)
+  assert.equal(terminalSignal?.aborted, false)
+  assert.ok(harness.client.updated.some(({ messageId }) => messageId === 'shutdown-human-input-card'))
+})
+
+test('harness e2e: shutdown bounds and drains a terminal Card patch that never settles itself', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-stop-patch-timeout-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+  ])
+  const harness = await mount(
+    root,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'none',
+    undefined,
+    20,
+  )
+  await harness.client.messageHandler?.(command('ask during bounded shutdown'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const originalUpdateCard = harness.client.updateCard?.bind(harness.client)
+  assert.ok(originalUpdateCard !== undefined)
+  let terminalSignal: AbortSignal | undefined
+  harness.client.updateCard = (messageId, card, options) => {
+    if (messageId !== questionCard.messageId) return originalUpdateCard(messageId, card, options)
+    terminalSignal = options?.signal
+    return new Promise((_resolve, reject) => {
+      if (terminalSignal?.aborted === true) {
+        reject(terminalSignal.reason)
+        return
+      }
+      terminalSignal?.addEventListener('abort', () => reject(terminalSignal?.reason), { once: true })
+    })
+  }
+
+  await harness.dispose()
+  assert.equal(terminalSignal?.aborted, true)
+  assert.equal(harness.client.stopped, true)
 })
 
 test('harness e2e: an external followup cannot steal a queued Lark reply route', async (t) => {

@@ -337,6 +337,157 @@ test('SDK delivery creates without a reply target and replies cards with one', a
   }])
 })
 
+test('SDK signal-bound Card creation uses one cancellable bounded raw request', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const requests: Array<Record<string, unknown>> = []
+  const internals = client as unknown as { rest?: unknown }
+  internals.rest = {
+    async request(options: Record<string, unknown>) {
+      requests.push(options)
+      return { data: { message_id: 'om_signal_card' } }
+    },
+    im: { v1: { message: {} } },
+  }
+  const controller = new AbortController()
+
+  const messageId = await client.sendCard(
+    'oc_chat',
+    { schema: '2.0' },
+    { replyToMessageId: 'om_inbound', replyInThread: true, signal: controller.signal },
+  )
+
+  assert.equal(messageId, 'om_signal_card')
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]?.method, 'POST')
+  assert.equal(requests[0]?.url, '/open-apis/im/v1/messages/om_inbound/reply')
+  const requestSignal = requests[0]?.signal
+  assert.ok(requestSignal instanceof AbortSignal)
+  assert.notEqual(requestSignal, controller.signal)
+  assert.equal(requestSignal.aborted, false)
+  assert.equal(requests[0]?.timeout, 15_000)
+  assert.deepEqual(requests[0]?.data, {
+    msg_type: 'interactive',
+    content: JSON.stringify({ schema: '2.0' }),
+    reply_in_thread: true,
+  })
+  controller.abort(new Error('late caller cancellation'))
+  assert.equal(requestSignal.aborted, true)
+})
+
+test('SDK signal-bound Card creation aborts without retrying an ambiguous write', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const controller = new AbortController()
+  let calls = 0
+  const internals = client as unknown as { rest?: unknown }
+  internals.rest = {
+    request(options: { signal?: AbortSignal }) {
+      calls += 1
+      return new Promise((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () => { reject(options.signal?.reason) }, { once: true })
+      })
+    },
+    im: { v1: { message: {} } },
+  }
+  const sending = client.sendCard(
+    'oc_chat',
+    { schema: '2.0' },
+    { replyToMessageId: 'om_inbound', signal: controller.signal },
+  )
+  controller.abort(new Error('test cancellation'))
+
+  await assert.rejects(sending, /message\.reply transport failure/u)
+  assert.equal(calls, 1)
+})
+
+test('SDK signal-bound Card creation settles while token acquisition is stalled and suppresses the late write', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const controller = new AbortController()
+  const token = Promise.withResolvers<void>()
+  const entered = Promise.withResolvers<void>()
+  let writes = 0
+  let requestSignal: AbortSignal | undefined
+  const internals = client as unknown as { rest?: unknown }
+  internals.rest = {
+    async request(options: { signal?: AbortSignal }) {
+      requestSignal = options.signal
+      entered.resolve()
+      await token.promise
+      options.signal?.throwIfAborted()
+      writes += 1
+      return { data: { message_id: 'om_must_not_write' } }
+    },
+    im: { v1: { message: {} } },
+  }
+
+  const sending = client.sendCard('oc_chat', { schema: '2.0' }, { signal: controller.signal })
+  await entered.promise
+  controller.abort(new Error('stop during token acquisition'))
+  await assert.rejects(sending, /message\.create transport failure/u)
+  assert.equal(requestSignal?.aborted, true)
+  assert.equal(writes, 0)
+
+  token.resolve()
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(writes, 0)
+})
+
+test('SDK signal-bound Card creation applies its total deadline before a stalled request settles', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const entered = Promise.withResolvers<void>()
+  let requestSignal: AbortSignal | undefined
+  const internals = client as unknown as { rest?: unknown }
+  internals.rest = {
+    request(options: { signal?: AbortSignal }) {
+      requestSignal = options.signal
+      entered.resolve()
+      return new Promise(() => {})
+    },
+    im: { v1: { message: {} } },
+  }
+
+  const sending = client.sendCard(
+    'oc_chat',
+    { schema: '2.0' },
+    { signal: new AbortController().signal },
+  )
+  await entered.promise
+  t.mock.timers.tick(15_000)
+
+  await assert.rejects(sending, /message\.create transport failure/u)
+  assert.equal(requestSignal?.aborted, true)
+})
+
+test('SDK signal-bound Card patch uses one raw request and never falls back or retries', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const controller = new AbortController()
+  const requests: Array<Record<string, unknown>> = []
+  let generatedPatches = 0
+  let generatedUpdates = 0
+  const internals = client as unknown as { rest?: unknown }
+  internals.rest = {
+    async request(options: Record<string, unknown>) {
+      requests.push(options)
+      return { code: 0 }
+    },
+    im: { v1: { message: {
+      async patch() { generatedPatches += 1 },
+      async update() { generatedUpdates += 1 },
+    } } },
+  }
+
+  await client.updateCard('om_card', { schema: '2.0' }, { signal: controller.signal })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0]?.method, 'PATCH')
+  assert.equal(requests[0]?.url, '/open-apis/im/v1/messages/om_card')
+  assert.equal(requests[0]?.timeout, 15_000)
+  const requestSignal = requests[0]?.signal
+  assert.ok(requestSignal instanceof AbortSignal)
+  assert.notEqual(requestSignal, controller.signal)
+  assert.equal(generatedPatches, 0)
+  assert.equal(generatedUpdates, 0)
+})
+
 test('SDK reply failures do not fall back to chat delivery', async () => {
   const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
   let creates = 0
@@ -595,6 +746,16 @@ test('unwrapCardAction reads operator and button value', () => {
   assert.equal(action.value.decision, 'allowed-once')
 })
 
+test('the public Card action type remains source-compatible with pre-form consumers', () => {
+  const legacyAction: LarkCardAction = {
+    openId: 'user',
+    chatId: 'chat',
+    messageId: 'message',
+    value: { action: 'turn_stop' },
+  }
+  assert.equal(legacyAction.value.action, 'turn_stop')
+})
+
 test('SDK inbound maps text and keeps unsupported content metadata-only', async () => {
   const prototype = Lark.Client.prototype as unknown as {
     request: (options: unknown) => Promise<unknown>
@@ -720,6 +881,57 @@ test('SDK inbound maps text and keeps unsupported content metadata-only', async 
       },
     })
     assert.equal(received.length, 2)
+  } finally {
+    await client.stop()
+    prototype.request = request
+    Lark.WSClient.prototype.start = start
+  }
+})
+
+test('SDK Card callback preserves form values and returns a raw terminal Card unchanged', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  const start = Lark.WSClient.prototype.start
+  let receiveAction: ((data: unknown) => Promise<unknown>) | undefined
+  prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  Lark.WSClient.prototype.start = async function captureDispatcher({ eventDispatcher }) {
+    const dispatcher = eventDispatcher as unknown as {
+      handles: Map<string, (data: unknown) => Promise<unknown>>
+    }
+    receiveAction = dispatcher.handles.get('card.action.trigger')
+    ;(this as unknown as { onReady?: () => void }).onReady?.()
+  }
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  ;(client as unknown as { prepareLoadingImage: () => Promise<void> }).prepareLoadingImage = async () => {}
+  const terminal = { schema: '2.0', body: { elements: [{ tag: 'div' }] } }
+  client.onCardAction(async (action) => {
+    assert.equal(action.tag, 'button')
+    assert.equal(action.name, 'human_input_submit')
+    assert.deepEqual(action.formValue, { q0: 'q0_o1', c1: 'text' })
+    return {
+      toast: { type: 'success', content: 'submitted' },
+      card: { type: 'raw', data: terminal },
+    }
+  })
+  try {
+    await client.start()
+    assert.ok(receiveAction !== undefined)
+    const result = await receiveAction({
+      operator: { open_id: 'owner' },
+      action: {
+        tag: 'button',
+        name: 'human_input_submit',
+        value: {},
+        form_value: { q0: 'q0_o1', c1: 'text' },
+      },
+      context: { open_chat_id: 'chat', open_message_id: 'message' },
+    })
+    assert.deepEqual(result, {
+      toast: { type: 'success', content: 'submitted' },
+      card: { type: 'raw', data: terminal },
+    })
   } finally {
     await client.stop()
     prototype.request = request
