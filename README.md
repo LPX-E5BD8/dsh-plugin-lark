@@ -30,16 +30,19 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
-| `0.8.5`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
+| `0.8.6`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 produces the canonical archive; Node 22 and 24 run adjacent-upgrade profile gates. GitHub-hosted macOS 26 arm64/Node 22 additionally verifies package/runtime compatibility, not Web-profile deployment. |
+| `0.8.5` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
 | `0.8.0`–`0.8.4` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported on the original Node 22/Linux baseline; v0.8.4 adds the boot-free Web-profile package lifecycle gate. |
 
-The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.8.4 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.8.5 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
 
-Starting with v0.8.5, that same required job then switches to Node 24, recreates `node_modules` with engine-strict enabled, repeats the complete source/Harness and independent packed-consumer gates, and clean-installs the already packed canonical candidate into another isolated stock profile. Node 24 does not install the v0.8.4 baseline because that older package supports only Node 22. Upgrade the plugin on Node 22 first, then change the runtime in a separate cold restart.
+Starting with v0.8.5, that same Linux release gate then switches to Node 24, recreates `node_modules` with engine-strict enabled, repeats the complete source/Harness and independent packed-consumer gates, and consumes the already packed canonical candidate in an isolated stock profile. The v0.8.5 gate used a clean install because its v0.8.4 baseline supported only Node 22; starting with v0.8.6, Node 24 also verifies the adjacent upgrade from the now-compatible v0.8.5 baseline.
+
+Starting with v0.8.6, a separate required gate runs engine-strict Node 22 on GitHub-hosted macOS 26 arm64. It repeats the complete source/Harness tests, audit, and an independent packed-consumer installation, then downloads and consumes the exact Ubuntu-built canonical archive after Actions artifact-digest verification. It does not run `dsh plugin`, compose a stock Web profile, or validate app startup and stateful operations on macOS.
 
 That Web-profile gate is deliberately boot-free: it validates package installation, upgrade, bundle resolution, and configuration composition, but does not start the Web app or exercise credentials, the SDK WebSocket connection, `/api/lark/health`, the Feishu/Lark network path, or persisted-state migration. Those remain deployment and credential-backed smoke checks.
 
-Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23.x or 25 and newer, Node.js 24 with plugin v0.8.4 or older, later Cordis or Schemastery releases, other Harness cohorts, hosts outside the GitHub-hosted Ubuntu x64 evidence above, alternative persistence stacks, and a host with the optional Approval service completely absent are unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents` or durable `storageDomain` support is unsupported.
+Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23.x or 25 and newer, Node.js 24 with plugin v0.8.4 or older, later Cordis or Schemastery releases, other Harness cohorts, Ubuntu architectures outside x64, and a host with the optional Approval service completely absent are unverified. The macOS evidence is limited to macOS 26 arm64 with Node 22 package/runtime consumption; Node 24, Intel Macs, other macOS releases, stock Web-profile operation, and state migration on macOS remain unverified. Alternative persistence stacks are also unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents` or durable `storageDomain` support is unsupported.
 
 ## Install
 
@@ -52,6 +55,8 @@ npm ci --ignore-scripts
 npm run build
 dsh plugin --profile web add .
 ```
+
+The `dsh plugin` installation and operational procedures in this README remain verified on the Ubuntu/Linux gate. The macOS gate verifies the packaged module only; it does not establish stock Web-profile deployment support.
 
 Keep the checkout in place while the profile uses it. An npm registry release is not required.
 
@@ -74,7 +79,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.8.5'
+version='0.8.6'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"

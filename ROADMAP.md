@@ -102,6 +102,12 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Keep Node.js 22 as the canonical archive producer and adjacent-release upgrade gate, then recreate dependencies under engine-strict Node.js 24 and repeat the assembled Harness and packed-consumer checks.
 - Clean-install the exact canonical candidate archive into an isolated stock rc.6 Web profile under Node.js 24 before upload, without claiming a cross-runtime upgrade, real app boot, credentials, network readiness, or persisted-state migration.
 
+## 0.8.6 — macOS package compatibility
+
+- Require engine-strict Node.js 22 source, assembled Harness, audit, and independently packed-consumer checks on the versioned GitHub-hosted macOS 26 arm64 image.
+- Transfer the exact Ubuntu-built canonical candidate through a digest-checked Actions artifact and install it as a separate macOS consumer without rebuilding or replacing the release archive.
+- Keep the protected `test` context fail-closed across both operating-system gates while leaving macOS Web-profile composition, app boot, credentials, network readiness, state migration, Node.js 24, and Intel hardware unverified.
+
 ## 1.0 — Stable release
 
 - Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and credential-backed Web-profile startup plus persisted-state upgrade paths pass their own evidence-backed gates.
