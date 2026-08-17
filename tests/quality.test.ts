@@ -112,7 +112,7 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
   const harnessVersion = '0.1.0-rc.6'
   const cordisVersion = '4.0.1'
   const schemasteryVersion = '3.18.1'
-  const nodeRange = '>=22 <23'
+  const nodeRange = '>=22 <23 || >=24 <25'
   const manifest = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
     version: string
     engines?: { node?: string }
@@ -196,20 +196,27 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
 
   const [major, minor] = manifest.version.split('.')
   const releaseLine = `${major}.${minor}.x`
+  const node24Floor = '0.8.5'
   for (const path of ['README.md', 'README.zh-CN.md']) {
     const content = readFileSync(join(process.cwd(), path), 'utf8')
-    const matrixRow = content.split('\n').find((line) => line.startsWith(`| \`${releaseLine}\` |`))
+    const matrixRow = content.split('\n')
+      .find((line) => line.startsWith(`| \`${node24Floor}\`–\`${releaseLine}\` |`))
     assert.ok(matrixRow !== undefined, `${path} omits the current compatibility row`)
-    for (const marker of [releaseLine, harnessVersion, cordisVersion, schemasteryVersion, '22.x']) {
+    for (const marker of [releaseLine, harnessVersion, cordisVersion, schemasteryVersion, '22.x', '24.x']) {
       assert.match(matrixRow, new RegExp(`\\x60${marker.replaceAll('.', '\\.')}\\x60`), `${path} omits ${marker}`)
     }
+    const historicalRow = content.split('\n')
+      .find((line) => line.startsWith('| `0.8.0`–`0.8.4` |'))
+    assert.ok(historicalRow !== undefined, `${path} omits the historical Node.js 22 row`)
+    assert.match(historicalRow, /`22\.x`/u)
+    assert.doesNotMatch(historicalRow, /`24\.x`/u)
   }
   const workflow = readFileSync(join(process.cwd(), '.github/workflows/ci.yml'), 'utf8')
   const nodeVersions = [...workflow.matchAll(/node-version:\s*([^\s#]+)/gu)].map((match) => match[1])
   const runners = [...workflow.matchAll(/runs-on:\s*([^\s#]+)/gu)].map((match) => match[1])
   assert.ok(nodeVersions.length > 0)
   assert.ok(runners.length > 0)
-  assert.deepEqual([...new Set(nodeVersions)], ['22'])
+  assert.deepEqual([...new Set(nodeVersions)], ['22', '24'])
   assert.deepEqual([...new Set(runners)], ['ubuntu-latest'])
 })
 

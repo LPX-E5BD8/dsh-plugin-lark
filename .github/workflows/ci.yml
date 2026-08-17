@@ -13,7 +13,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -34,9 +34,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASELINE_DIR: ${{ runner.temp }}/upgrade-baseline
-          BASELINE_TAG: v0.8.3
-          BASELINE_COMMIT: 886fdb68e39de90e3e225b4d7738fef002a4c04a
-          BASELINE_DIGEST: sha256:e2138bac969bad1afd628428b749313ef7431634bb1818c857b8422c08e1ee36
+          BASELINE_TAG: v0.8.4
+          BASELINE_COMMIT: cda5e08348a9568dfad19da372807e3658c183e2
+          BASELINE_DIGEST: sha256:7aae3a70925717ab0995152d370cfcebc02bb97ed071c87fdeba3956a5aab9c0
         run: |
           set -eu
           test ! -e "$BASELINE_DIR"
@@ -105,6 +105,28 @@ jobs:
           set -eu
           version="$(node -p "require('./package.json').version")"
           export DSH_PROFILE_CANDIDATE_PACKAGE="$DSH_PROFILE_CANDIDATE_DIR/dsh-plugin-lark-${version}.tgz"
+          npm run test:profile
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+      - name: Verify Node.js 24 compatibility
+        env:
+          DSH_PROFILE_CANDIDATE_DIR: ${{ runner.temp }}/release-package
+          DSH_PROFILE_CLEAN_ONLY: '1'
+          DSH_PROFILE_EXPECT_NODE_MAJOR: '24'
+          npm_config_cache: ${{ runner.temp }}/node-24-npm-cache
+          npm_config_engine_strict: 'true'
+        run: |
+          set -eu
+          test "$(node -p "process.platform + ':' + process.arch")" = 'linux:x64'
+          test "$(node -p "process.versions.node.split('.')[0]")" = '24'
+          npm ci --ignore-scripts
+          npm run check
+          npm audit --omit=dev
+          npm run test:pack
+          version="$(node -p "require('./package.json').version")"
+          export DSH_PROFILE_CANDIDATE_PACKAGE="$DSH_PROFILE_CANDIDATE_DIR/dsh-plugin-lark-${version}.tgz"
+          test -f "$DSH_PROFILE_CANDIDATE_PACKAGE"
           npm run test:profile
       - name: Upload the tested release archive
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

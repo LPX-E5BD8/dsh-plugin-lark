@@ -19,24 +19,27 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 
 ## Requirements
 
-- Node.js 22.x
+- Node.js 22.x, or Node.js 24.x with plugin v0.8.5 or newer
 - One coherent DeepSeek Harness `0.1.0-rc.6` package cohort
 - A durable `storageDomain` service; the stock Web profile supplies its JSON-backed storage stack
 - A self-built Feishu or Lark app with a bot
 
 ### Supported Harness matrix
 
-The supported row is an exact release-tested baseline. A version accepted by a broad semver range is not automatically a supported combination.
+Each supported row is an exact release-tested baseline. A version accepted by a broad semver range is not automatically a supported combination.
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
-| `0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported; lock-based Linux CI, assembled Harness end-to-end tests, and isolated packed-consumer installation; starting with `0.8.4`, stock rc.6 Web-profile package lifecycle composition |
+| `0.8.5`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
+| `0.8.0`–`0.8.4` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported on the original Node 22/Linux baseline; v0.8.4 adds the boot-free Web-profile package lifecycle gate. |
 
-The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. Starting with `0.8.4`, CI also takes the exact packed candidate archive through a clean install into an isolated stock rc.6 Web profile, then upgrades a second isolated profile from the verified v0.8.3 release package to that candidate. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer; the upgrade path also preserves the profile's user patch.
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.8.4 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
+
+Starting with v0.8.5, that same required job then switches to Node 24, recreates `node_modules` with engine-strict enabled, repeats the complete source/Harness and independent packed-consumer gates, and clean-installs the already packed canonical candidate into another isolated stock profile. Node 24 does not install the v0.8.4 baseline because that older package supports only Node 22. Upgrade the plugin on Node 22 first, then change the runtime in a separate cold restart.
 
 That Web-profile gate is deliberately boot-free: it validates package installation, upgrade, bundle resolution, and configuration composition, but does not start the Web app or exercise credentials, the SDK WebSocket connection, `/api/lark/health`, the Feishu/Lark network path, or persisted-state migration. Those remain deployment and credential-backed smoke checks.
 
-Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23 or newer, later Cordis or Schemastery releases, other Harness cohorts, non-Linux hosts, alternative persistence stacks, and a host with the optional Approval service completely absent are unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents` or durable `storageDomain` support is unsupported.
+Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23.x or 25 and newer, Node.js 24 with plugin v0.8.4 or older, later Cordis or Schemastery releases, other Harness cohorts, hosts outside the GitHub-hosted Ubuntu x64 evidence above, alternative persistence stacks, and a host with the optional Approval service completely absent are unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents` or durable `storageDomain` support is unsupported.
 
 ## Install
 
@@ -71,7 +74,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.8.4'
+version='0.8.5'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"

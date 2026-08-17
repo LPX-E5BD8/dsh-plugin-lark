@@ -2,7 +2,7 @@
 
 English | [简体中文](./UPGRADING.zh-CN.md)
 
-This runbook covers `dsh-plugin-lark` on the supported DeepSeek Harness `0.1.0-rc.6` / Node.js 22.x baseline. It assumes the stock Web profile's JSONL session persistence and JSON storage-domain backend. For custom backends, use their native consistent-snapshot and restore procedures while preserving the same logical units.
+This runbook covers `dsh-plugin-lark` on the supported DeepSeek Harness `0.1.0-rc.6` baseline with Node.js 22.x, or Node.js 24.x starting with plugin v0.8.5. It assumes the stock Web profile's JSONL session persistence and JSON storage-domain backend. For custom backends, use their native consistent-snapshot and restore procedures while preserving the same logical units. Upgrade the plugin on Node.js 22 before changing an existing deployment to Node.js 24; treat the runtime change as a separate cold restart and never combine it with a Harness-cohort or state migration.
 
 ## Safety rules
 
@@ -35,7 +35,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.3.0`–`0.6.1` | No further plugin-owned durable format change; v0.6 changes process residency, not stored transcripts. | State format is compatible inside this range, while the v0.3 group-scope boundary still applies. |
 | `0.7.0` | Adds `lark_conversations` record schema v1 as the commit authority for the active generation and mutation-replay history. | `0.6.1` and older ignore the sidecar and choose the greatest persisted generation, which can be an uncommitted orphan. In-place rollback is not safe. |
 | `0.8.0` | Reads v1 or v2 bindings and writes strict v2 records with `modelSelection`. A v1 record is upgraded lazily on its next binding write, not at startup. | `0.7.0` accepts only strict v1. Any v2 record makes its full-table startup validation fail. Restore a pre-v0.8 cold snapshot. |
-| `0.8.1`–`0.8.4` | No plugin-owned durable schema change from v0.8.0. | These releases can share v2 state with v0.8.0, subject to the normal cold-backup rule. |
+| `0.8.1`–`0.8.5` | No plugin-owned durable schema change from v0.8.0. | These releases can share v2 state with v0.8.0, subject to the normal cold-backup rule. Plugin v0.8.1–v0.8.4 requires Node.js 22. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -52,7 +52,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.8.4'
+target_tag='v0.8.5'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -190,13 +190,13 @@ Every handled validation message advances the inbound receipt state. A later sna
 
 A host move is a cold migration, not a blue/green rollout. Stop the source first and keep it stopped; no source and destination Harness processes may share the state or connect the same Lark app at once. This stock procedure is limited to a cold same-Linux move into an empty root that preserves numeric ownership, modes, symlink targets, and the exact absolute `DSH_HOME`, checkout, launch, and Workspace paths. Other layouts and backends remain unverified and require their native procedure.
 
-Prepare the destination with the exact rc.6 cohort, Node.js 22.x, target and rollback plugin tags/commits, app ID, `defaultSessionId`, JSONL compression, launch workspace, and credential source. Transfer one completed three-directory snapshot plus the required immutable checkouts over an authenticated channel, then recompute and verify `SNAPSHOT_SHA256` before installation. Copy Workspace repositories separately so their canonical paths and commits match; they are not inside the state snapshot. Never merge destination JSONL/JSON with existing state. Validate the destination while the source remains stopped, and stop the destination before any source rollback or retry.
+Prepare the destination with the exact rc.6 cohort, one Node.js line supported by both the source and target plugin versions, target and rollback plugin tags/commits, app ID, `defaultSessionId`, JSONL compression, launch workspace, and credential source. Do not change the Node.js line during this state transfer. Transfer one completed three-directory snapshot plus the required immutable checkouts over an authenticated channel, then recompute and verify `SNAPSHOT_SHA256` before installation. Copy Workspace repositories separately so their canonical paths and commits match; they are not inside the state snapshot. Never merge destination JSONL/JSON with existing state. Validate the destination while the source remains stopped, and stop the destination before any source rollback or retry.
 
 ## Rollback decision table
 
-| Rollback target from v0.8.4 | State handling |
+| Rollback target from v0.8.5 | State handling |
 | --- | --- |
-| v0.8.3, v0.8.2, v0.8.1, or v0.8.0 | Same v2 binding schema. Stop cleanly and keep a snapshot; an in-place code rollback is schema-compatible on the exact rc.6 cohort. |
+| v0.8.4, v0.8.3, v0.8.2, v0.8.1, or v0.8.0 | Same v2 binding schema. Stop cleanly and keep a snapshot; an in-place code rollback is schema-compatible on the exact rc.6 cohort. This runbook supports only Node.js 22 for these targets: v0.8.1–v0.8.4 enforce it in `engines`, while v0.8.0's broader historical range did not establish Node.js 24 support. A deployment already on Node.js 24 must restore the runtime in a separate cold step before starting the older plugin. |
 | v0.7.0 | Do not start it on state that v0.8.x may have written. Restore the complete pre-v0.8 snapshot because v0.7 cannot read any v2 binding. |
 | v0.3.0–v0.6.1 | Restore a snapshot taken before v0.7. Those versions ignore commit-authority bindings and can select a newer orphan generation. |
 | v0.1.3–v0.2.2 | Also expect group sessions to revert to chat-wide identity; scoped group history is not down-migrated. |
