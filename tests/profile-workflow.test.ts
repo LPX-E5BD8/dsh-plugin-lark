@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.8.6'
-const BASELINE_COMMIT = 'b9cb76ef117ad9a412961b07b29c274e51780453'
-const BASELINE_DIGEST = 'sha256:8aa34995918c9b7f4c87014fd84b0622f47ffb9118469b81378edae857e02441'
+const BASELINE_TAG = 'v0.8.7'
+const BASELINE_COMMIT = '56f26c98d22d2f1d7fb5b0cd6f727429d8e61bfa'
+const BASELINE_DIGEST = 'sha256:3d17b458870c49bd404921ba8823c7cac05dbc4e160402689c4285d6c159798b'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 
@@ -148,7 +148,7 @@ test('profile lifecycle receives the pinned baseline and the dynamic tested cand
   const version = JSON.parse(readFileSync('package.json', 'utf8')).version as string
   assert.match(
     readFileSync('ROADMAP.md', 'utf8'),
-    new RegExp(`## ${version.replaceAll('.', '\\.')} — Node\\.js 24 package compatibility on macOS`, 'u'),
+    new RegExp(`## ${version.replaceAll('.', '\\.')} — Product roadmap`, 'u'),
   )
 })
 
