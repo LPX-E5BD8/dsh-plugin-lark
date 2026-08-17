@@ -60,6 +60,62 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 4. 为机器人授予 `im:message` 消息收发权限。
 5. 可选授予 `im:resource`，以启用内置动态加载图；缺少该权限时卡片会使用静态图标。
 
+## Release 来源证明
+
+从 v0.8.3 开始，每个 GitHub Release 都会包含通过 packed-consumer 冒烟测试的同一份 npm 格式 `.tgz`，以及 GitHub 托管、针对该文件生成的 SLSA build provenance attestation。本工作流不会发布到 npm registry；GitHub 自动生成的 **Source code** 压缩包也不是被证明的 package。
+
+可以使用 GitHub CLI 下载并验证 Release package：
+
+```sh
+set -eu
+
+version='0.8.3'
+repository='LPX-E5BD8/dsh-plugin-lark'
+archive="dsh-plugin-lark-${version}.tgz"
+tag="v${version}"
+
+tag_object="$(gh api "repos/${repository}/git/ref/tags/${tag}" --jq '.object.type + ":" + .object.sha')"
+object_type="${tag_object%%:*}"
+object_sha="${tag_object#*:}"
+if [ "$object_type" != 'tag' ]; then
+  printf 'remote %s is not an annotated tag\n' "$tag" >&2
+  exit 1
+fi
+
+peel_depth=0
+while [ "$object_type" = 'tag' ]; do
+  peel_depth=$((peel_depth + 1))
+  if [ "$peel_depth" -gt 8 ]; then
+    printf 'remote %s exceeds the tag peel limit\n' "$tag" >&2
+    exit 1
+  fi
+  tag_object="$(gh api "repos/${repository}/git/tags/${object_sha}" --jq '.object.type + ":" + .object.sha')"
+  object_type="${tag_object%%:*}"
+  object_sha="${tag_object#*:}"
+done
+if [ "$object_type" != 'commit' ]; then
+  printf 'remote %s resolves to %s, not a commit\n' "$tag" "$object_type" >&2
+  exit 1
+fi
+tag_commit="$object_sha"
+
+release_target="$(gh release view "$tag" --repo "$repository" --json targetCommitish --jq .targetCommitish)"
+if [ "$release_target" != "$tag_commit" ]; then
+  printf 'release target %s does not match tag commit %s\n' "$release_target" "$tag_commit" >&2
+  exit 1
+fi
+
+gh release download "$tag" --repo "$repository" --pattern "$archive"
+gh attestation verify "$archive" \
+  --repo "$repository" \
+  --signer-workflow "$repository/.github/workflows/ci.yml" \
+  --source-ref refs/heads/main \
+  --source-digest "$tag_commit" \
+  --deny-self-hosted-runners
+```
+
+该 attestation 会把压缩包 digest 绑定到本仓库、workflow、ref 与 Release commit。它证明来源和完整性，并不表示代码或依赖一定没有漏洞。
+
 ## 运行
 
 请从 Lark Agent 要操作的目标项目目录启动 DSH：

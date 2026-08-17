@@ -60,6 +60,62 @@ In the Feishu/Lark developer console:
 4. Grant the bot `im:message` send/receive access.
 5. Optionally grant `im:resource` to enable the bundled animated loading indicator; without it, the card uses a static icon.
 
+## Release provenance
+
+Starting with v0.8.3, each GitHub Release includes the exact npm-format `.tgz` that passed the packed-consumer smoke test, plus a GitHub-hosted SLSA build-provenance attestation for that file. This workflow does not publish to the npm registry, and the automatically generated **Source code** archives are not the attested package.
+
+Download and verify a release package with GitHub CLI:
+
+```sh
+set -eu
+
+version='0.8.3'
+repository='LPX-E5BD8/dsh-plugin-lark'
+archive="dsh-plugin-lark-${version}.tgz"
+tag="v${version}"
+
+tag_object="$(gh api "repos/${repository}/git/ref/tags/${tag}" --jq '.object.type + ":" + .object.sha')"
+object_type="${tag_object%%:*}"
+object_sha="${tag_object#*:}"
+if [ "$object_type" != 'tag' ]; then
+  printf 'remote %s is not an annotated tag\n' "$tag" >&2
+  exit 1
+fi
+
+peel_depth=0
+while [ "$object_type" = 'tag' ]; do
+  peel_depth=$((peel_depth + 1))
+  if [ "$peel_depth" -gt 8 ]; then
+    printf 'remote %s exceeds the tag peel limit\n' "$tag" >&2
+    exit 1
+  fi
+  tag_object="$(gh api "repos/${repository}/git/tags/${object_sha}" --jq '.object.type + ":" + .object.sha')"
+  object_type="${tag_object%%:*}"
+  object_sha="${tag_object#*:}"
+done
+if [ "$object_type" != 'commit' ]; then
+  printf 'remote %s resolves to %s, not a commit\n' "$tag" "$object_type" >&2
+  exit 1
+fi
+tag_commit="$object_sha"
+
+release_target="$(gh release view "$tag" --repo "$repository" --json targetCommitish --jq .targetCommitish)"
+if [ "$release_target" != "$tag_commit" ]; then
+  printf 'release target %s does not match tag commit %s\n' "$release_target" "$tag_commit" >&2
+  exit 1
+fi
+
+gh release download "$tag" --repo "$repository" --pattern "$archive"
+gh attestation verify "$archive" \
+  --repo "$repository" \
+  --signer-workflow "$repository/.github/workflows/ci.yml" \
+  --source-ref refs/heads/main \
+  --source-digest "$tag_commit" \
+  --deny-self-hosted-runners
+```
+
+The attestation binds the archive digest to this repository, workflow, ref, and release commit. It establishes origin and integrity, not that the code or its dependencies are vulnerability-free.
+
 ## Run
 
 Start DSH from the project that the Lark Agent should work on:

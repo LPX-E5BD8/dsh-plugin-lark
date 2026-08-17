@@ -28,17 +28,32 @@ jobs:
         run: npm run check:release-version
       - run: npm run check
       - run: npm audit --omit=dev
-      - run: npm run test:pack
+      - name: Pack and install the release archive
+        env:
+          DSH_PACK_ARTIFACT_DIR: ${{ runner.temp }}/release-package
+        run: npm run test:pack
+      - name: Upload the tested release archive
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-package-${{ github.sha }}
+          path: ${{ runner.temp }}/release-package
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
 
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     env:
       PREVIOUS_MAIN_SHA: ${{ github.event.before }}
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -52,7 +67,7 @@ jobs:
         run: |
           base_version="$(git show "${PREVIOUS_MAIN_SHA}:package.json" | node -e "let value=''; process.stdin.on('data', chunk => value += chunk); process.stdin.on('end', () => console.log(JSON.parse(value).version))")"
           base_tag="v${base_version}"
-          for attempt in $(seq 1 36); do
+          for attempt in $(seq 1 120); do
             git fetch --tags --force
             if git rev-parse --verify --quiet "refs/tags/${base_tag}" >/dev/null; then
               base_target="$(git rev-list -n 1 "$base_tag")"
@@ -60,7 +75,9 @@ jobs:
                 echo "::error::${base_tag} points to ${base_target}, not previous main ${PREVIOUS_MAIN_SHA}"
                 exit 1
               fi
-              if gh release view "$base_tag" >/dev/null 2>&1; then
+              if release_json="$(gh release view "$base_tag" --json isDraft,isPrerelease,targetCommitish 2>/dev/null)" \
+                && printf '%s' "$release_json" | jq -e --arg sha "$PREVIOUS_MAIN_SHA" \
+                  '.targetCommitish == $sha and .isDraft == false and .isPrerelease == false' >/dev/null; then
                 exit 0
               fi
             fi
@@ -68,13 +85,37 @@ jobs:
           done
           echo "::error::previous release ${base_tag} was not available"
           exit 1
-      - name: Tag the tested commit
-        id: version
+      - name: Download the tested release archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-package-${{ github.sha }}
+          path: ${{ runner.temp }}/release-package
+          digest-mismatch: error
+      - name: Validate the tested release archive
+        id: package
         env:
-          GH_TOKEN: ${{ github.token }}
+          PACKAGE_DIR: ${{ runner.temp }}/release-package
         run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           version="$(node -p "require('./package.json').version")"
           tag="v${version}"
+          expected_name="dsh-plugin-lark-${version}.tgz"
+          set -- "$PACKAGE_DIR"/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected exactly one tested package archive"
+            exit 1
+          fi
+          package_path="$1"
+          package_name="$(basename "$package_path")"
+          if [ "$package_name" != "$expected_name" ]; then
+            echo "::error::expected ${expected_name}, got ${package_name}"
+            exit 1
+          fi
+          packed_name="$(tar -xOf "$package_path" package/package.json | node -e "let value=''; process.stdin.on('data', chunk => value += chunk); process.stdin.on('end', () => console.log(JSON.parse(value).name))")"
+          packed_version="$(tar -xOf "$package_path" package/package.json | node -e "let value=''; process.stdin.on('data', chunk => value += chunk); process.stdin.on('end', () => console.log(JSON.parse(value).version))")"
+          test "$packed_name" = 'dsh-plugin-lark'
+          test "$packed_version" = "$version"
           if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
             target="$(git rev-list -n 1 "$tag")"
             if [ "$target" != "$GITHUB_SHA" ]; then
@@ -83,24 +124,282 @@ jobs:
             fi
           else
             RELEASE_BASE_SHA="$PREVIOUS_MAIN_SHA" node scripts/check-release-version.mjs
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git tag -a "$tag" -m "dsh-plugin-lark ${version}" "$GITHUB_SHA"
-            git push origin "refs/tags/${tag}"
           fi
+          package_sha="$(sha256sum -- "$package_path")"
+          package_sha="${package_sha%% *}"
+          test "${#package_sha}" -eq 64
+          case "$package_sha" in *[!0-9a-f]*) exit 1 ;; esac
+          package_digest="sha256:${package_sha}"
+          echo "path=${package_path}" >> "$GITHUB_OUTPUT"
+          echo "name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "digest=${package_digest}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-      - name: Create GitHub Release
+      - name: Check for existing package provenance
+        id: provenance
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          verification="$RUNNER_TEMP/existing-package-provenance.json"
+          if gh attestation verify "$PACKAGE_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners \
+            --format json > "$verification" 2>/dev/null \
+            && jq -e --arg name "$PACKAGE_NAME" --arg digest "${PACKAGE_DIGEST#sha256:}" \
+              'any(.[]; any(.verificationResult.statement.subject[]; .name == $name and .digest.sha256 == $digest))' \
+              "$verification" >/dev/null; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Attest the tested release archive
+        id: attestation
+        if: steps.provenance.outputs.exists != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.path }}
+          subject-name: ${{ steps.package.outputs.name }}
+      - name: Verify the generated provenance bundle
+        if: steps.provenance.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+          ATTESTATION_BUNDLE: ${{ steps.attestation.outputs.bundle-path }}
+          ATTESTATION_ID: ${{ steps.attestation.outputs.attestation-id }}
+        run: |
+          set -eu
+          test -s "$ATTESTATION_BUNDLE"
+          case "$ATTESTATION_ID" in ''|*[!0-9]*) exit 1 ;; esac
+          verification="$RUNNER_TEMP/generated-package-provenance.json"
+          gh attestation verify "$PACKAGE_PATH" \
+            --bundle "$ATTESTATION_BUNDLE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners \
+            --format json > "$verification"
+          jq -e --arg name "$PACKAGE_NAME" --arg digest "${PACKAGE_DIGEST#sha256:}" \
+            'any(.[]; any(.verificationResult.statement.subject[]; .name == $name and .digest.sha256 == $digest))' \
+            "$verification" >/dev/null
+      - name: Verify package provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          verification="$RUNNER_TEMP/package-provenance.json"
+          verified=0
+          for attempt in $(seq 1 12); do
+            if gh attestation verify "$PACKAGE_PATH" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners \
+              --format json > "$verification" 2>/dev/null \
+              && jq -e --arg name "$PACKAGE_NAME" --arg digest "${PACKAGE_DIGEST#sha256:}" \
+                'any(.[]; any(.verificationResult.statement.subject[]; .name == $name and .digest.sha256 == $digest))' \
+                "$verification" >/dev/null; then
+              verified=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$verified" -ne 1 ]; then
+            echo "::error::package provenance was not verifiable"
+            exit 1
+          fi
+      - name: Tag the tested commit
+        env:
+          TAG: ${{ steps.package.outputs.tag }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            test "$(git rev-list -n 1 "$TAG")" = "$GITHUB_SHA"
             exit 0
           fi
-          gh release create "$TAG" \
-            --verify-tag \
-            --target "$GITHUB_SHA" \
-            --title "dsh-plugin-lark ${VERSION}" \
-            --generate-notes
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" -m "dsh-plugin-lark ${VERSION}" "$GITHUB_SHA"
+          git push origin "refs/tags/${TAG}"
+      - name: Create or verify the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          VERSION: ${{ steps.package.outputs.version }}
+          PACKAGE_PATH: ${{ steps.package.outputs.path }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_DIGEST: ${{ steps.package.outputs.digest }}
+        run: |
+          set -eu
+          release_id="$(gh release view "$TAG" --json databaseId --jq .databaseId 2>/dev/null || true)"
+          case "$release_id" in ''|*[!0-9]*)
+            release_id=''
+            for attempt in 1 2 3; do
+              gh release create "$TAG" \
+                --verify-tag \
+                --target "$GITHUB_SHA" \
+                --title "dsh-plugin-lark ${VERSION}" \
+                --generate-notes \
+                --draft || true
+              candidate_id="$(gh release view "$TAG" --json databaseId --jq .databaseId 2>/dev/null || true)"
+              case "$candidate_id" in ''|*[!0-9]*) ;; *) release_id="$candidate_id" ;; esac
+              if [ -n "$release_id" ]; then
+                break
+              fi
+              sleep 5
+            done
+            if [ -z "$release_id" ]; then
+              echo "::error::could not create ${TAG} as a draft release"
+              exit 1
+            fi
+            ;;
+          esac
+          release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          release_json=''
+          for attempt in $(seq 1 12); do
+            if release_json="$(gh api "$release_endpoint" 2>/dev/null)"; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$release_json" ]; then
+            echo "::error::could not load ${TAG} release ${release_id}"
+            exit 1
+          fi
+          if ! printf '%s' "$release_json" | jq -e \
+            --arg tag "$TAG" --arg sha "$GITHUB_SHA" \
+            '.tag_name == $tag and .target_commitish == $sha and .prerelease == false' >/dev/null; then
+            echo "::error::${TAG} release metadata conflicts with ${GITHUB_SHA}"
+            exit 1
+          fi
+
+          asset_verified=0
+          upload_attempts=0
+          empty_observations=0
+          incomplete_asset_id=''
+          incomplete_observations=0
+          for attempt in $(seq 1 36); do
+            if ! release_json="$(gh api "$release_endpoint" 2>/dev/null)"; then
+              sleep 5
+              continue
+            fi
+            if ! printf '%s' "$release_json" | jq -e \
+              --arg tag "$TAG" --arg sha "$GITHUB_SHA" \
+              '.tag_name == $tag and .target_commitish == $sha and .prerelease == false' >/dev/null; then
+              echo "::error::${TAG} release metadata changed during reconciliation"
+              exit 1
+            fi
+            asset_count="$(printf '%s' "$release_json" | jq --arg name "$PACKAGE_NAME" '[.assets[] | select(.name == $name)] | length')"
+            if [ "$asset_count" -gt 1 ]; then
+              echo "::error::${TAG} has multiple ${PACKAGE_NAME} assets"
+              exit 1
+            fi
+            if [ "$asset_count" -eq 0 ]; then
+              incomplete_asset_id=''
+              incomplete_observations=0
+              empty_observations=$((empty_observations + 1))
+              if [ "$upload_attempts" -eq 0 ] || [ "$empty_observations" -ge 3 ]; then
+                upload_attempts=$((upload_attempts + 1))
+                empty_observations=0
+                if [ "$upload_attempts" -gt 3 ]; then
+                  echo "::error::could not upload ${PACKAGE_NAME} after three attempts"
+                  exit 1
+                fi
+                if ! gh release upload "$TAG" "$PACKAGE_PATH"; then
+                  echo "::warning::asset upload attempt ${upload_attempts} failed; checking for a recoverable placeholder"
+                fi
+              fi
+            else
+              empty_observations=0
+              asset_id="$(printf '%s' "$release_json" | jq -r --arg name "$PACKAGE_NAME" '.assets[] | select(.name == $name) | .id')"
+              asset_state="$(printf '%s' "$release_json" | jq -r --arg name "$PACKAGE_NAME" '.assets[] | select(.name == $name) | .state')"
+              asset_digest="$(printf '%s' "$release_json" | jq -r --arg name "$PACKAGE_NAME" '.assets[] | select(.name == $name) | .digest // empty')"
+              if [ -n "$asset_digest" ] && [ "$asset_digest" != "$PACKAGE_DIGEST" ]; then
+                echo "::error::${PACKAGE_NAME} digest conflict: ${asset_digest}"
+                exit 1
+              fi
+              if [ "$asset_state" = 'uploaded' ] && [ "$asset_digest" = "$PACKAGE_DIGEST" ]; then
+                asset_verified=1
+                break
+              fi
+              if { [ "$asset_state" = 'open' ] || [ "$asset_state" = 'starter' ]; } && [ -z "$asset_digest" ]; then
+                case "$asset_id" in ''|*[!0-9]*) exit 1 ;; esac
+                if [ "$incomplete_asset_id" = "$asset_id" ]; then
+                  incomplete_observations=$((incomplete_observations + 1))
+                else
+                  incomplete_asset_id="$asset_id"
+                  incomplete_observations=1
+                fi
+                if [ "$incomplete_observations" -ge 3 ]; then
+                  asset_endpoint="repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+                  if incomplete_json="$(gh api "$asset_endpoint" 2>/dev/null)" \
+                    && printf '%s' "$incomplete_json" | jq -e --arg name "$PACKAGE_NAME" \
+                      '.name == $name and (.state == "open" or .state == "starter") and (.digest // "") == ""' >/dev/null; then
+                    echo "::warning::removing confirmed incomplete ${PACKAGE_NAME} asset ${asset_id} before retry"
+                    if ! gh api --method DELETE "$asset_endpoint"; then
+                      echo "::warning::could not remove incomplete asset ${asset_id}; retrying observation"
+                    fi
+                  fi
+                  incomplete_asset_id=''
+                  incomplete_observations=0
+                fi
+              elif [ "$asset_state" != 'uploaded' ] || [ -n "$asset_digest" ]; then
+                echo "::error::${PACKAGE_NAME} has unexpected state ${asset_state}"
+                exit 1
+              else
+                incomplete_asset_id=''
+                incomplete_observations=0
+              fi
+            fi
+            sleep 5
+          done
+          if [ "$asset_verified" -ne 1 ]; then
+            echo "::error::${PACKAGE_NAME} was not published with the expected digest"
+            exit 1
+          fi
+
+          if [ "$(printf '%s' "$release_json" | jq -r '.draft')" = 'true' ]; then
+            release_published=0
+            for attempt in 1 2 3; do
+              if gh release edit "$TAG" --draft=false --prerelease=false; then
+                release_published=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "$release_published" -ne 1 ]; then
+              echo "::error::could not publish ${TAG} draft"
+              exit 1
+            fi
+          fi
+          release_verified=0
+          for attempt in $(seq 1 12); do
+            if ! release_json="$(gh api "$release_endpoint" 2>/dev/null)"; then
+              sleep 5
+              continue
+            fi
+            if printf '%s' "$release_json" | jq -e \
+              --arg tag "$TAG" --arg sha "$GITHUB_SHA" --arg name "$PACKAGE_NAME" --arg digest "$PACKAGE_DIGEST" \
+              '.tag_name == $tag and .target_commitish == $sha and .draft == false and .prerelease == false
+                and ([.assets[] | select(.name == $name and .state == "uploaded" and .digest == $digest)] | length) == 1
+                and ([.assets[] | select(.name == $name)] | length) == 1' >/dev/null; then
+              release_verified=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$release_verified" -ne 1 ]; then
+            echo "::error::${TAG} was not published as an exact final release"
+            exit 1
+          fi
