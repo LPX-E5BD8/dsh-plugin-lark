@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { LarkBridge } from './bridge.ts'
 import { DEFAULT_CONFIG, LARK_APP_ID_PATTERN } from './config.ts'
+import { DurableConversationBindingStore } from './conversation-binding.ts'
 import { installLarkHealthRoute } from './health.ts'
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { LarkSdkClient } from './lark.ts'
@@ -47,6 +48,7 @@ function firstNonEmpty(...values: Array<string | undefined>): string | undefined
 async function cleanupRuntime(
   bridge: LarkBridge | undefined,
   deduplicator: DurableInboundDeduplicator,
+  conversationBindings: DurableConversationBindingStore,
 ): Promise<unknown[]> {
   const failures: unknown[] = []
   if (bridge !== undefined) {
@@ -61,7 +63,33 @@ async function cleanupRuntime(
   } catch (error) {
     failures.push(error)
   }
+  try {
+    await conversationBindings.close()
+  } catch (error) {
+    failures.push(error)
+  }
   return failures
+}
+
+async function openRuntimeStorage(ctx: Context, appId: string): Promise<{
+  readonly deduplicator: DurableInboundDeduplicator
+  readonly conversationBindings: DurableConversationBindingStore
+}> {
+  const deduplicator = await DurableInboundDeduplicator.open(ctx.storageDomain, appId)
+  try {
+    const conversationBindings = await DurableConversationBindingStore.open(ctx.storageDomain, appId)
+    return { deduplicator, conversationBindings }
+  } catch (error) {
+    try {
+      await deduplicator.close()
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        'lark: runtime storage startup and cleanup failed',
+      )
+    }
+    throw error
+  }
 }
 
 export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<void>> {
@@ -77,7 +105,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
     throw new Error('lark: appId must match cli_<16 hexadecimal characters>')
   }
   return (async () => {
-    const deduplicator = await DurableInboundDeduplicator.open(ctx.storageDomain, appId)
+    const { deduplicator, conversationBindings } = await openRuntimeStorage(ctx, appId)
     let bridge: LarkBridge | undefined
     try {
       const client = new LarkSdkClient({
@@ -90,6 +118,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
       bridge = new LarkBridge(ctx, {
         client,
         inboundDeduplicator: deduplicator,
+        conversationBindings,
         locale: config.locale ?? DEFAULT_CONFIG.locale,
         allowFrom: config.allowFrom ?? [],
         allowAllUsers: config.allowAllUsers ?? DEFAULT_CONFIG.allowAllUsers,
@@ -101,7 +130,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
       })
       await bridge.start()
     } catch (error) {
-      const failures = await cleanupRuntime(bridge, deduplicator)
+      const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings)
       if (failures.length > 0) {
         throw new AggregateError([error, ...failures], 'lark: startup and cleanup failed')
       }
@@ -110,7 +139,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
     let teardown: Promise<void> | undefined
     return () => {
       teardown ??= (async () => {
-        const failures = await cleanupRuntime(bridge, deduplicator)
+        const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings)
         if (failures.length > 0) throw new AggregateError(failures, 'lark: plugin teardown failed')
       })()
       return teardown
@@ -135,3 +164,5 @@ export type {
 } from './lark.ts'
 export { LARK_LOCALES } from './locale.ts'
 export type { LarkLocale } from './locale.ts'
+export { DurableConversationBindingStore } from './conversation-binding.ts'
+export type { ConversationBinding, ConversationBindingStore } from './conversation-binding.ts'

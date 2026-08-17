@@ -8,6 +8,7 @@
 
 - **无需入站公网地址：** 通过官方 SDK 的 WebSocket 长连接接收飞书/Lark 事件。
 - **隔离且可恢复的会话：** 私聊、群聊回复树和原生话题分别使用独立的持久化 Harness 会话；需要时也可显式绑定到一个全局共享会话。
+- **按会话选择项目：** 仅列出 Web profile 已注册的 Workspace，在选中的项目中新建空白且可持久化的会话 generation，不接受聊天中提供的任意路径。
 - **实时执行卡片：** 将思考过程、待办、重试、上下文压缩、Hook、工作流、工具调用与结果、Token 用量和最终答案持续更新到一张有大小上限的 Card 2.0 卡片中。
 - **安全的工具审批与停止：** 审批和停止操作绑定到发起它们的会话、聊天和用户；过期或跨聊天操作默认拒绝。
 - **可靠的回复投递：** 卡片及降级文本始终回复触发消息或原生话题；长答案会完整续发，并通过持久化回执避免常规 WebSocket 重投造成重复执行。
@@ -55,7 +56,7 @@ export DSH_LARK_APP_SECRET='<app-secret>'
 dsh --profile web --host 127.0.0.1 --port 3080
 ```
 
-启动目录会成为每个新 Lark 会话的 workspace；持久化会话恢复时则沿用其已存储的 workspace。在支持按会话切换项目之前，如需更换某个会话的项目，应从新目录重启 DSH，然后在该会话中执行 `/new`。是否让 Web UI 监听非回环地址属于具体部署配置；飞书/Lark 事件本身通过出站长连接投递，不需要入站公网监听器。
+启动目录会成为每个新 Lark 会话的 workspace；持久化会话恢复时则沿用其已存储的 workspace。使用 `/project` 可以把单个会话切换到 Web profile 中已经注册的 Workspace。是否让 Web UI 监听非回环地址属于具体部署配置；飞书/Lark 事件本身通过出站长连接投递，不需要入站公网监听器。
 
 ## 凭据
 
@@ -109,7 +110,7 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 
 保持 `defaultSessionId` 为空即可隔离会话。私聊沿用兼容的 `lark:<chatId>` 会话；在群聊中，普通回复树按根消息划分可恢复范围，原生 Lark 话题则按聊天 ID 和话题 ID 划分。`parent_id` 不会用于选择会话。仅当所有已授权私聊、回复树和话题都应共享同一个 Harness 会话时，才设置 `defaultSessionId`。
 
-存在 Harness 会话持久化后端时，桥接器会在重启后恢复精确会话范围的最新 generation。`/new` 和 `/clear` 只重置当前私聊、回复树或话题；配置了 `defaultSessionId` 时，它们会有意重置全局共享会话。只有新 generation 完成持久化检查点后才会发送确认；存储或恢复失败时绝不会退回一个空会话。
+存在 Harness 会话持久化后端时，桥接器会在重启后恢复精确会话范围中已提交的 generation。`/new` 和 `/clear` 只重置当前私聊、回复树或话题；配置了 `defaultSessionId` 时，它们会有意重置全局共享会话。桥接器先分别确认当前 generation 和候选 generation 的检查点，再把精确的活跃绑定原子提交到持久化存储，然后才回复。创建或检查点工作被拒绝时，旧绑定仍保持当前状态；后端中可能已部分发布的候选只会成为 orphan，重启时会被忽略。绑定写入出现歧义错误时，只会 fail-stop 当前会话并持续重试同一个值，直到读回确认，而不会报告不确定结果。尚无已提交绑定的普通进程内聊天可以在没有 `sessionPersistence` 时运行；`/new`、`/clear` 和项目选择要求会话持久化与持久化会话绑定 sidecar 同时可用，已有提交绑定的会话在冷恢复时缺少会话持久化也会默认拒绝。
 
 `maxConversationHandles` 是单个插件实例中活跃会话句柄数量的稳态目标，并非硬并发上限。数量超出目标后，桥接器仅在会话没有活跃 turn、待处理 inbox 工作或桥接器操作，且 `sessions.flush()` 确认有持久化监听器参与后，才释放最近最少使用的句柄。它不会为了腾出空间取消或拒绝这些工作。缺少持久化或检查点失败时会保留句柄，因此活跃数量可以暂时高于目标。一旦终止清理开始，已退役句柄不会被重新使用；清理失败会记录日志，之后的访问会从持久化会话冷恢复。
 
@@ -117,13 +118,21 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 
 `0.3.0` 以前创建的群聊会话以整个聊天为范围，无法安全归属到某个回复根节点。这些数据仍保留用于回滚或导出，但 `0.3.0` 不会自动把它们绑定到新的回复树或话题。私聊会话和显式 `defaultSessionId` 的身份保持兼容。
 
-成功处理的入站消息会记录在一个持久化的 1,024 条回执窗口中，因此正常重启后的 WebSocket 重投不会重复执行 follow-up 或命令。回执介质（Web profile 中通常为 `$DSH_HOME/storages/lark_inbound.json`）只存储 SHA-256 摘要，不保存明文 app、chat 或 message ID。自定义 profile 必须先挂载 Harness storage hub、一个持久化 KV 后端以及 `storage-domain`。
+成功处理的入站消息会记录在一个持久化的 1,024 条回执窗口中，因此正常重启后的 WebSocket 重投不会重复执行 follow-up 或命令。回执介质（Web profile 中通常为 `$DSH_HOME/storages/lark_inbound.json`）只存储 SHA-256 摘要，不保存明文 app、chat 或 message ID。活跃 generation sidecar（`lark_conversations.json`）同样会哈希 app 与会话身份；其最小化版本值只包含 generation 编号、后缀以及最多 1,024 个 SHA-256 消息变更摘要的有界历史。当 generation 提交成功但入站回执丢失时，该历史可确保重放的 `/new`、`/clear` 或 `/project` 保持幂等。它不保存明文 app、会话、chat、message 或文件系统身份。自定义 profile 必须先挂载 Harness storage hub、一个持久化 KV 后端以及 `storage-domain`。
 
-投递仍属于至少一次：如果进程在外部副作用完成后、回执提交前硬退出，该副作用仍可能重复。回执窗口已满时若写入失败，较旧回执可能已被淘汰；回调仍会失败，但有效防重窗口可能暂时缩小。不要让多个 Harness 进程共享同一个 JSON 存储根目录，该后端没有跨进程写锁。即使使用不同存储根，多个进程同时连接同一个机器人也不构成精确一次配置。
+投递仍属于至少一次：如果进程在外部副作用完成后、回执提交前硬退出，该副作用仍可能重复。绑定变更还会受到每会话 1,024 条摘要历史的额外保护；早于该有界历史的重放仍可能再次执行。回执窗口已满时若写入失败，较旧回执可能已被淘汰；回调仍会失败，但有效防重窗口可能暂时缩小。不要让多个 Harness 进程共享同一个 JSON 存储根目录，该后端没有跨进程写锁。即使使用不同存储根，多个进程同时连接同一个机器人也不构成精确一次配置。
 
-桥接器命令包括 `/start`（`/help` 的别名）、`/help`、`/new`、`/clear`。挂载 DSH 命令运行时后，`/help` 还会发现该 Agent 实际可用的命令。标准 DSH Base profile 会提供 `/compact`、`/goal`、`/permission`、`/plan`；与当前通道不兼容的命令不会展示。
+桥接器命令包括 `/start`（`/help` 的别名）、`/help`、`/new`、`/clear` 和 `/project [Workspace 标题或 ID]`。直接发送 `/project` 会列出当前及可用的已注册 Workspace，但不会泄露文件系统路径。选中后会在该 Workspace 中启动空白会话 generation；旧 transcript 继续保留，但聊天历史不会跨项目带入。创建新 generation 前，桥接器必须先确认旧 transcript 的检查点，再重新校验 Workspace；任一检查失败都会保留旧的实时绑定。未知、歧义、目录缺失或未注册的 Workspace 都会被拒绝，当前会话保持不变。
 
-`provider` 和 `model` 目前来自插件配置；新会话使用调用目录作为 workspace，持久化会话则恢复已存储的 workspace。按会话切换项目/workspace 及 provider/model 已进入 roadmap，但 `0.6.x` 尚未提供。
+挂载 DSH 命令运行时后，`/help` 还会发现该 Agent 实际可用的命令。标准 DSH Base profile 会提供 `/compact`、`/goal`、`/permission`、`/plan`；与当前通道不兼容的命令不会展示。
+
+项目选择与聊天历史使用相同会话范围：私聊、群聊回复树和原生话题互不影响，一个缓慢的项目操作也不会阻塞无关会话。切换前，桥接器会先占有旧 Agent 真正的 idle 阶段；其他入口在提交前接受的新工作会让候选回滚，若工作恰好在最终原子绑定写入期间被接受，则旧 Handle 会保留到该工作恢复 idle。Lark 回复路由按实际领取的消息身份绑定，因此并发 Web turn 不会消耗 Lark 的回复目标。配置 `defaultSessionId` 后，会话和项目都会有意全局共享，因此一次切换会影响所有绑定聊天。每个已授权用户都能选择当前 DSH Web profile 注册的任意 Workspace，群聊中的 `/project` 也可能向群成员展示 Workspace 标题；请据此注册和命名 Workspace。缺少 `workspaceRegistry` 或会话持久化的自定义 profile 仍可列出已有 registry，但项目选择会默认拒绝。
+
+刚选中的 generation 只要仍为空白，就会有意保持在 Workspace 会话索引之外，避免 Web 的“新建会话”或启动初选复用这个由 Lark 独占的空白 generation。首个 Lark `turn/start` 追加完成，且该精确会话的检查点确认后，桥接器才把它加入 Workspace 索引。索引检查点失败时会继续保持未索引，并在后续 turn 重试；重启和空闲淘汰也遵守同一边界。
+
+新 generation 的检查点和原子绑定写入都确认成功后，桥接器才发送成功回复。创建、检查点或重新校验失败时，候选会被处置，旧的实时绑定与持久化绑定都保持不变。后端中即使残留已部分发布的候选 transcript，它也没有提交权限，重启时会被忽略。原子绑定确认出现歧义时，会在不释放当前会话的情况下持续重试相同绑定，直到可以读回确认；无关会话仍可继续使用。插件优雅关闭会先停止入站，再中断这项 fail-stop 重试，让受影响的平台回调失败且不提交其回执。此后同一个 Bridge 实例会拒绝重启；插件必须创建全新 Bridge 并重新挂载存储，使恢复结果遵循 sidecar 中实际存在的绑定。旧 transcript 的检查点失败同样会安全拒绝切换。
+
+`provider` 和 `model` 仍来自插件配置。按会话切换 provider/model 继续列在 roadmap 中。
 
 ## 卡片与审批
 

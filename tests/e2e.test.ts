@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { LarkBridge } from '../src/bridge.ts'
 import { CARD_LIMITS } from '../src/cards.ts'
+import type { ConversationBinding } from '../src/conversation-binding.ts'
 import type {
   LarkCardAction,
   LarkCardActionResult,
@@ -54,6 +55,7 @@ function createClient(): TestClient {
 
 interface TestPersistence {
   readonly sessions: Set<string>
+  bindings?: Map<string, ConversationBinding>
   contextWindow?: number
   resumeError?: Error
   flushError?: Error
@@ -62,6 +64,8 @@ interface TestPersistence {
 }
 
 function createHost(persistence?: TestPersistence) {
+  const runtimePersistence: TestPersistence = persistence ?? { sessions: new Set<string>() }
+  runtimePersistence.bindings ??= new Map<string, ConversationBinding>()
   let createCount = 0
   let resumeCount = 0
   let flushCount = 0
@@ -74,6 +78,29 @@ function createHost(persistence?: TestPersistence) {
   const followupSessionIds: string[] = []
   const warnings: unknown[][] = []
   const sessionListeners: Array<(session: { id: string }, event: never) => void> = []
+  const inboxClaimedListeners: Array<(payload: {
+    agent: { id: string }
+    message: unknown
+    turn: number
+  }) => void> = []
+  const pendingMessages = new Map<string, unknown[]>()
+  const agentStatuses = new Map<string, 'idle' | 'running'>()
+  const agentIdleWaiters = new Map<string, Set<() => void>>()
+  const setAgentStatus = (sessionId: string, status: 'idle' | 'running'): void => {
+    agentStatuses.set(sessionId, status)
+    if (status !== 'idle') return
+    const waiters = agentIdleWaiters.get(sessionId)
+    agentIdleWaiters.delete(sessionId)
+    for (const resolve of waiters ?? []) resolve()
+  }
+  const whenAgentIdle = (sessionId: string): Promise<void> => {
+    if (agentStatuses.get(sessionId) !== 'running') return Promise.resolve()
+    return new Promise((resolve) => {
+      const waiters = agentIdleWaiters.get(sessionId) ?? new Set<() => void>()
+      waiters.add(resolve)
+      agentIdleWaiters.set(sessionId, waiters)
+    })
+  }
   const approvalListeners: Array<(
     request: never,
     next: () => Promise<string>,
@@ -90,16 +117,32 @@ function createHost(persistence?: TestPersistence) {
           next: () => Promise<string>,
         ) => Promise<string>)
       }
+      if (name === 'agent/inbox/claimed') {
+        inboxClaimedListeners.push(listener as unknown as (payload: {
+          agent: { id: string }
+          message: unknown
+          turn: number
+        }) => void)
+      }
       return () => {}
     },
     get(name: string) {
       if (name === 'approval') return {}
-      if (name === 'sessionPersistence' && persistence !== undefined) {
+      if (name === 'sessionPersistence') {
         return {
           async list() {
             listCount += 1
-            return [...persistence.sessions].map((id) => ({ id }))
+            return [...runtimePersistence.sessions].map((id) => ({ id }))
           },
+        }
+      }
+      if (name === 'larkConversationBindings') {
+        return {
+          read: (baseId: string) => runtimePersistence.bindings?.get(baseId),
+          async put(baseId: string, binding: ConversationBinding) {
+            runtimePersistence.bindings?.set(baseId, { ...binding })
+          },
+          async close() {},
         }
       }
       return undefined
@@ -108,63 +151,89 @@ function createHost(persistence?: TestPersistence) {
       async create(opts: { sessionId: unknown }) {
         createCount += 1
         const sessionId = String(opts.sessionId)
+        setAgentStatus(sessionId, 'idle')
         createdSessionIds.push(sessionId)
         return {
           sessionId,
           async dispose() {
+            setAgentStatus(sessionId, 'idle')
             disposedSessionIds.push(sessionId)
-            if (persistence?.disposeErrorOnce !== undefined) {
-              const error = persistence.disposeErrorOnce
-              persistence.disposeErrorOnce = undefined
+            if (runtimePersistence.disposeErrorOnce !== undefined) {
+              const error = runtimePersistence.disposeErrorOnce
+              runtimePersistence.disposeErrorOnce = undefined
               throw error
             }
           },
           agent: {
             session: {
               id: sessionId,
-              requestContext: () => persistence?.contextWindow === undefined
+              events: [],
+              append() {},
+              requestContext: () => runtimePersistence.contextWindow === undefined
                 ? undefined
-                : { provider: 'provider', model: 'model', contextWindow: persistence.contextWindow },
+                : { provider: 'provider', model: 'model', contextWindow: runtimePersistence.contextWindow },
             },
-            status: 'running',
+            get status() { return agentStatuses.get(sessionId) ?? 'idle' },
+            inbox: { hasPending: false },
             cancel(_cause: unknown, options?: { keepInbox?: boolean }) {
               cancelCount += 1
               cancelKeepInbox.push(options?.keepInbox === true)
+              setAgentStatus(sessionId, 'idle')
             },
-            followup() {
+            followup(message: unknown) {
               followupSessionIds.push(sessionId)
-              persistence?.sessions.add(sessionId)
+              runtimePersistence.sessions.add(sessionId)
+              const pending = pendingMessages.get(sessionId) ?? []
+              pending.push(message)
+              pendingMessages.set(sessionId, pending)
             },
+            runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+              return task(new AbortController().signal)
+            },
+            whenIdle() { return whenAgentIdle(sessionId) },
           },
         }
       },
       async resume(opts: { resumeSessionId: unknown }) {
         resumeCount += 1
         const sessionId = String(opts.resumeSessionId)
+        setAgentStatus(sessionId, 'idle')
         resumedSessionIds.push(sessionId)
-        if (persistence?.resumeError !== undefined) throw persistence.resumeError
-        if (persistence?.sessions.has(sessionId) !== true) {
+        if (runtimePersistence.resumeError !== undefined) throw runtimePersistence.resumeError
+        if (!runtimePersistence.sessions.has(sessionId)) {
           throw new Error(`session "${sessionId}" not found`)
         }
         return {
           sessionId,
-          async dispose() { disposedSessionIds.push(sessionId) },
+          async dispose() {
+            setAgentStatus(sessionId, 'idle')
+            disposedSessionIds.push(sessionId)
+          },
           agent: {
             session: {
               id: sessionId,
-              requestContext: () => persistence.contextWindow === undefined
+              requestContext: () => runtimePersistence.contextWindow === undefined
                 ? undefined
-                : { provider: 'provider', model: 'model', contextWindow: persistence.contextWindow },
+                : { provider: 'provider', model: 'model', contextWindow: runtimePersistence.contextWindow },
             },
-            status: 'running',
+            get status() { return agentStatuses.get(sessionId) ?? 'idle' },
+            inbox: { hasPending: false },
             cancel(_cause: unknown, options?: { keepInbox?: boolean }) {
               cancelCount += 1
               cancelKeepInbox.push(options?.keepInbox === true)
+              setAgentStatus(sessionId, 'idle')
             },
-            followup() {
+            followup(message: unknown) {
               followupSessionIds.push(sessionId)
-              persistence.sessions.add(sessionId)
+              runtimePersistence.sessions.add(sessionId)
+              const pending = pendingMessages.get(sessionId) ?? []
+              pending.push(message)
+              pendingMessages.set(sessionId, pending)
             },
+            runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+              return task(new AbortController().signal)
+            },
+            whenIdle() { return whenAgentIdle(sessionId) },
           },
         }
       },
@@ -172,14 +241,30 @@ function createHost(persistence?: TestPersistence) {
     sessions: {
       async flush(session: { id: string }) {
         flushCount += 1
-        await persistence?.flushWait
-        if (persistence?.flushError !== undefined) throw persistence.flushError
-        persistence?.sessions.add(session.id)
-        return persistence !== undefined
+        await runtimePersistence.flushWait
+        if (runtimePersistence.flushError !== undefined) throw runtimePersistence.flushError
+        runtimePersistence.sessions.add(session.id)
+        return true
       },
     },
     emit(sessionId: string, event: unknown) {
+      const eventType = (event as { type?: unknown }).type
+      if (eventType === 'turn/start') setAgentStatus(sessionId, 'running')
       for (const listener of sessionListeners) listener({ id: sessionId }, event as never)
+      const turn = (event as { type?: unknown; data?: { turn?: unknown } }).type === 'turn/start'
+        ? (event as { data?: { turn?: unknown } }).data?.turn
+        : undefined
+      if (typeof turn !== 'number') {
+        if (eventType === 'turn/end') setAgentStatus(sessionId, 'idle')
+        return
+      }
+      const pending = pendingMessages.get(sessionId)
+      const message = pending?.shift()
+      if (pending?.length === 0) pendingMessages.delete(sessionId)
+      if (message === undefined) return
+      for (const listener of inboxClaimedListeners) {
+        listener({ agent: { id: sessionId }, message, turn })
+      }
     },
     requestApproval(request: unknown): Promise<string> {
       const listener = approvalListeners[0]
@@ -862,7 +947,7 @@ test('e2e: /new remains active across restart before the next message', async ()
   await firstClient.messageHandler?.(inbound('chat-a', 'owner', '/new'))
   const freshSessionId = firstHost.createdSessionIds().at(-1)
   assert.notEqual(freshSessionId, 'lark:chat-a')
-  assert.equal(firstHost.flushCount(), 1)
+  assert.equal(firstHost.flushCount(), 2)
   assert.equal(persistence.sessions.has(freshSessionId ?? ''), true)
   await firstBridge.stop()
 
@@ -898,7 +983,7 @@ test('e2e: a persisted-session resume failure never falls back to create', async
   await bridge.stop()
 })
 
-test('e2e: /new durability failure keeps the previous session active', async () => {
+test('e2e: /new old-checkpoint rejection keeps the old binding live', async () => {
   const persistence: TestPersistence = { sessions: new Set() }
   const client = createClient()
   const host = createHost(persistence)
@@ -907,25 +992,22 @@ test('e2e: /new durability failure keeps the previous session active', async () 
   await client.messageHandler?.(inbound('chat-a', 'owner', 'old context'))
   persistence.flushError = new Error('durability unavailable')
 
-  await assert.rejects(
-    client.messageHandler?.(inbound('chat-a', 'owner', '/new')),
-    /durability unavailable/,
-  )
-  const failedSessionId = host.createdSessionIds().at(-1)
-  assert.deepEqual(host.disposedSessionIds(), [failedSessionId])
-  assert.equal(persistence.sessions.has(failedSessionId ?? ''), false)
+  await client.messageHandler?.(inbound('chat-a', 'owner', '/new'))
+  assert.deepEqual(host.createdSessionIds(), ['lark:chat-a'])
+  assert.deepEqual(host.disposedSessionIds(), [])
+  assert.match(client.sent.at(-1)?.text ?? '', /当前会话保持不变/)
 
   persistence.flushError = undefined
-  await client.messageHandler?.(inbound('chat-a', 'owner', 'still old context'))
-  assert.equal(host.createdSessionIds().length, 2)
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'continue in old context'))
+  assert.equal(host.createdSessionIds().length, 1)
+  assert.equal(host.followupSessionIds().at(-1), 'lark:chat-a')
   await bridge.stop()
 })
 
-test('e2e: failed /new retains a fresh handle when cleanup also fails', async () => {
+test('e2e: a failed /new disposes the old handle only during later teardown', async () => {
   const persistence: TestPersistence = {
     sessions: new Set(),
     flushError: new Error('durability unavailable'),
-    disposeErrorOnce: new Error('dispose unavailable'),
   }
   const client = createClient()
   const host = createHost(persistence)
@@ -933,19 +1015,16 @@ test('e2e: failed /new retains a fresh handle when cleanup also fails', async ()
   await bridge.start()
   await client.messageHandler?.(inbound('chat-a', 'owner', 'old context'))
 
-  await assert.rejects(
-    client.messageHandler?.(inbound('chat-a', 'owner', '/new')),
-    /durability and cleanup failed/,
-  )
-  const failedSessionId = host.createdSessionIds().at(-1) ?? ''
-  assert.equal(host.disposedSessionIds().filter((id) => id === failedSessionId).length, 1)
+  await client.messageHandler?.(inbound('chat-a', 'owner', '/new'))
+  assert.match(client.sent.at(-1)?.text ?? '', /当前会话保持不变/)
+  assert.equal(host.disposedSessionIds().filter((id) => id === 'lark:chat-a').length, 0)
 
   persistence.flushError = undefined
   await bridge.stop()
-  assert.equal(host.disposedSessionIds().filter((id) => id === failedSessionId).length, 2)
+  assert.equal(host.disposedSessionIds().filter((id) => id === 'lark:chat-a').length, 1)
 })
 
-test('e2e: /new retains cleanup ownership when old-session disposal fails', async () => {
+test('e2e: /new never reuses a terminal old handle when its disposal fails', async () => {
   const persistence: TestPersistence = { sessions: new Set() }
   const client = createClient()
   const host = createHost(persistence)
@@ -959,7 +1038,7 @@ test('e2e: /new retains cleanup ownership when old-session disposal fails', asyn
   assert.deepEqual(host.disposedSessionIds(), ['lark:chat-a'])
 
   await bridge.stop()
-  assert.equal(host.disposedSessionIds().filter((id) => id === 'lark:chat-a').length, 2)
+  assert.equal(host.disposedSessionIds().filter((id) => id === 'lark:chat-a').length, 1)
 })
 
 test('e2e: approval waits for reset and expires with the old session', async () => {
