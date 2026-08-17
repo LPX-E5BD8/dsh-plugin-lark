@@ -196,15 +196,18 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
 
   const [major, minor] = manifest.version.split('.')
   const releaseLine = `${major}.${minor}.x`
-  const node24Floor = '0.8.5'
+  const macosFloor = '0.8.6'
   for (const path of ['README.md', 'README.zh-CN.md']) {
     const content = readFileSync(join(process.cwd(), path), 'utf8')
     const matrixRow = content.split('\n')
-      .find((line) => line.startsWith(`| \`${node24Floor}\`–\`${releaseLine}\` |`))
+      .find((line) => line.startsWith(`| \`${macosFloor}\`–\`${releaseLine}\` |`))
     assert.ok(matrixRow !== undefined, `${path} omits the current compatibility row`)
     for (const marker of [releaseLine, harnessVersion, cordisVersion, schemasteryVersion, '22.x', '24.x']) {
       assert.match(matrixRow, new RegExp(`\\x60${marker.replaceAll('.', '\\.')}\\x60`), `${path} omits ${marker}`)
     }
+    const node24Row = content.split('\n').find((line) => line.startsWith('| `0.8.5` |'))
+    assert.ok(node24Row !== undefined, `${path} omits the original Node.js 24 row`)
+    assert.match(node24Row, /`22\.x`[\s\S]*`24\.x`/u)
     const historicalRow = content.split('\n')
       .find((line) => line.startsWith('| `0.8.0`–`0.8.4` |'))
     assert.ok(historicalRow !== undefined, `${path} omits the historical Node.js 22 row`)
@@ -217,7 +220,7 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
   assert.ok(nodeVersions.length > 0)
   assert.ok(runners.length > 0)
   assert.deepEqual([...new Set(nodeVersions)], ['22', '24'])
-  assert.deepEqual([...new Set(runners)], ['ubuntu-latest'])
+  assert.deepEqual([...new Set(runners)], ['ubuntu-latest', 'macos-26'])
 })
 
 test('quality: upgrade guides track durable schemas and ship with the package', () => {

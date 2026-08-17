@@ -71,7 +71,7 @@ test('release workflow keeps provenance permissions narrow and every action SHA-
   assert.doesNotMatch(release, /group:\s*release-\$\{\{\s*github\.repository\s*\}\}/u)
   assert.doesNotMatch(release, /secrets\.|NPM_TOKEN|npm\s+publish|write-all|packages:\s*write/u)
 
-  assertNamedSteps(job('test'), [
+  assertNamedSteps(job('linux_release'), [
     'Download and verify the Web-profile upgrade baseline',
     'Pack and install the release archive',
     'Verify packed Web-profile install and upgrade',
@@ -101,19 +101,19 @@ test('release workflow keeps provenance permissions narrow and every action SHA-
 })
 
 test('release workflow carries the exact pack-smoke archive into the privileged job', () => {
-  const testJob = job('test')
+  const linuxJob = job('linux_release')
   const release = job('release')
-  const baseline = step(testJob, 'Download and verify the Web-profile upgrade baseline')
-  const pack = step(testJob, 'Pack and install the release archive')
-  const profile = step(testJob, 'Verify packed Web-profile install and upgrade')
-  const node24 = step(testJob, 'Verify Node.js 24 compatibility')
-  const upload = step(testJob, 'Upload the tested release archive')
+  const baseline = step(linuxJob, 'Download and verify the Web-profile upgrade baseline')
+  const pack = step(linuxJob, 'Pack and install the release archive')
+  const profile = step(linuxJob, 'Verify packed Web-profile install and upgrade')
+  const node24 = step(linuxJob, 'Verify Node.js 24 compatibility')
+  const upload = step(linuxJob, 'Upload the tested release archive')
   const download = step(release, 'Download the tested release archive')
   const validate = step(release, 'Validate the tested release archive')
 
   assert.match(pack, /DSH_PACK_ARTIFACT_DIR: \$\{\{ runner\.temp \}\}\/release-package/u)
   assert.match(pack, /run: npm run test:pack/u)
-  assert.match(upload, /if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/u)
+  assert.doesNotMatch(upload, /if:|continue-on-error/u)
   assert.match(upload, /name: release-package-\$\{\{ github\.sha \}\}/u)
   assert.match(upload, /path: \$\{\{ runner\.temp \}\}\/release-package/u)
   assert.match(upload, /if-no-files-found: error/u)
@@ -130,7 +130,7 @@ test('release workflow carries the exact pack-smoke archive into the privileged 
     'Upload the tested release archive',
   ]
   for (let index = 1; index < testOrder.length; index += 1) {
-    assert.ok(testJob.indexOf(testOrder[index - 1] ?? '') < testJob.indexOf(testOrder[index] ?? ''))
+    assert.ok(linuxJob.indexOf(testOrder[index - 1] ?? '') < linuxJob.indexOf(testOrder[index] ?? ''))
   }
   assert.match(baseline, /id: upgrade-baseline/u)
   assert.match(profile, /npm run test:profile/u)

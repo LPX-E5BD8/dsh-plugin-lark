@@ -37,13 +37,13 @@ if (cleanOnly) {
     undefined,
     'clean-only smoke must not receive an unsupported upgrade baseline',
   )
+}
+if (expectedNodeMajor !== undefined) {
   assert.equal(
     process.env.npm_config_engine_strict,
     'true',
-    'clean-only compatibility smoke must enforce package engines',
+    'compatibility smoke must enforce package engines',
   )
-}
-if (expectedNodeMajor !== undefined) {
   assert.match(expectedNodeMajor, /^(0|[1-9]\d*)$/u)
   assert.equal(process.versions.node.split('.')[0], expectedNodeMajor)
 }
