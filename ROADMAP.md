@@ -84,10 +84,15 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Record the receipt, group-session, binding-authority, and model-selection schema boundaries across prior releases.
 - Require one point-in-time backup unit for sessions, storage domains, and the Web profile; reject partial restore and unsupported down-migration guidance.
 
+## 0.8.3 — Release provenance
+
+- Carry the exact packed-consumer-tested npm archive into the corresponding GitHub Release without rebuilding it in a privileged job.
+- Generate and verify SLSA build provenance for that archive with a SHA-pinned GitHub action and narrowly scoped release permissions.
+- Reconcile tags, attestations, and Release assets idempotently while failing closed on commit or digest conflicts.
+
 ## 1.0 — Stable release
 
 - Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and real Web-profile upgrade paths pass their own evidence-backed gates.
-- Automate package provenance for tagged releases.
 
 ## Not planned
 

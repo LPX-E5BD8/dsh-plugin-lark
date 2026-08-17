@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { constants as fsConstants } from 'node:fs'
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
@@ -10,6 +12,10 @@ const run = promisify(execFile)
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const temporary = await mkdtemp(join(tmpdir(), 'dsh-plugin-lark-pack-'))
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
+assert.equal(manifest.name, 'dsh-plugin-lark')
+assert.match(manifest.version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
+const expectedArchiveName = `${manifest.name}-${manifest.version}.tgz`
 const env = {
   ...process.env,
   npm_config_cache: join(temporary, 'npm-cache'),
@@ -18,8 +24,10 @@ const env = {
 
 try {
   await run(npm, ['pack', '--pack-destination', temporary], { cwd: root, env })
-  const archiveName = (await readdir(temporary)).find((name) => name.endsWith('.tgz'))
-  assert.ok(archiveName !== undefined, 'npm pack did not produce an archive')
+  const archiveNames = (await readdir(temporary)).filter((name) => name.endsWith('.tgz'))
+  assert.deepEqual(archiveNames, [expectedArchiveName], 'npm pack produced an unexpected archive set')
+  const archiveName = archiveNames[0]
+  assert.ok(archiveName !== undefined)
   const consumer = join(temporary, 'consumer')
   await mkdir(consumer)
   await writeFile(join(consumer, 'package.json'), '{"private":true,"type":"module"}\n')
@@ -77,6 +85,38 @@ try {
     '',
   ].join('\n'))
   await run(process.execPath, [join(consumer, 'smoke.mjs')], { cwd: consumer, env })
+
+  const repeat = join(temporary, 'repeat')
+  await mkdir(repeat)
+  await run(npm, [
+    'pack',
+    '--ignore-scripts',
+    '--pack-destination',
+    repeat,
+  ], { cwd: root, env })
+  assert.deepEqual(
+    (await readdir(repeat)).filter((name) => name.endsWith('.tgz')),
+    [expectedArchiveName],
+    'repeat npm pack produced an unexpected archive set',
+  )
+  const digest = async (path) => createHash('sha256').update(await readFile(path)).digest('hex')
+  const archivePath = join(temporary, archiveName)
+  assert.equal(
+    await digest(archivePath),
+    await digest(join(repeat, expectedArchiveName)),
+    'npm pack is not reproducible within one clean build',
+  )
+
+  const artifactDirectory = process.env.DSH_PACK_ARTIFACT_DIR?.trim()
+  if (artifactDirectory) {
+    assert.ok(isAbsolute(artifactDirectory), 'DSH_PACK_ARTIFACT_DIR must be absolute')
+    await mkdir(artifactDirectory, { recursive: true })
+    assert.deepEqual(await readdir(artifactDirectory), [], 'DSH_PACK_ARTIFACT_DIR must be empty')
+    const artifactPath = join(artifactDirectory, expectedArchiveName)
+    await copyFile(archivePath, artifactPath, fsConstants.COPYFILE_EXCL)
+    assert.ok((await stat(artifactPath)).isFile())
+    assert.equal(await digest(artifactPath), await digest(archivePath))
+  }
 } finally {
   await rm(temporary, { recursive: true, force: true })
 }

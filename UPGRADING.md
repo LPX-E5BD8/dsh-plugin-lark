@@ -35,7 +35,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.3.0`–`0.6.1` | No further plugin-owned durable format change; v0.6 changes process residency, not stored transcripts. | State format is compatible inside this range, while the v0.3 group-scope boundary still applies. |
 | `0.7.0` | Adds `lark_conversations` record schema v1 as the commit authority for the active generation and mutation-replay history. | `0.6.1` and older ignore the sidecar and choose the greatest persisted generation, which can be an uncommitted orphan. In-place rollback is not safe. |
 | `0.8.0` | Reads v1 or v2 bindings and writes strict v2 records with `modelSelection`. A v1 record is upgraded lazily on its next binding write, not at startup. | `0.7.0` accepts only strict v1. Any v2 record makes its full-table startup validation fail. Restore a pre-v0.8 cold snapshot. |
-| `0.8.1`–`0.8.2` | No plugin-owned durable schema change from v0.8.0. | These releases can share v2 state with v0.8.0, subject to the normal cold-backup rule. |
+| `0.8.1`–`0.8.3` | No plugin-owned durable schema change from v0.8.0. | These releases can share v2 state with v0.8.0, subject to the normal cold-backup rule. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -52,7 +52,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.8.2'
+target_tag='v0.8.3'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -194,9 +194,9 @@ Prepare the destination with the exact rc.6 cohort, Node.js 22.x, target and rol
 
 ## Rollback decision table
 
-| Rollback target from v0.8.2 | State handling |
+| Rollback target from v0.8.3 | State handling |
 | --- | --- |
-| v0.8.1 or v0.8.0 | Same v2 binding schema. Stop cleanly and keep a snapshot; an in-place code rollback is schema-compatible on the exact rc.6 cohort. |
+| v0.8.2, v0.8.1, or v0.8.0 | Same v2 binding schema. Stop cleanly and keep a snapshot; an in-place code rollback is schema-compatible on the exact rc.6 cohort. |
 | v0.7.0 | Do not start it on state that v0.8.x may have written. Restore the complete pre-v0.8 snapshot because v0.7 cannot read any v2 binding. |
 | v0.3.0–v0.6.1 | Restore a snapshot taken before v0.7. Those versions ignore commit-authority bindings and can select a newer orphan generation. |
 | v0.1.3–v0.2.2 | Also expect group sessions to revert to chat-wide identity; scoped group history is not down-migrated. |
