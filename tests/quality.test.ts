@@ -196,15 +196,18 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
 
   const [major, minor] = manifest.version.split('.')
   const releaseLine = `${major}.${minor}.x`
-  const macosFloor = '0.8.6'
+  const macosNode24Floor = '0.8.7'
   for (const path of ['README.md', 'README.zh-CN.md']) {
     const content = readFileSync(join(process.cwd(), path), 'utf8')
     const matrixRow = content.split('\n')
-      .find((line) => line.startsWith(`| \`${macosFloor}\`–\`${releaseLine}\` |`))
+      .find((line) => line.startsWith(`| \`${macosNode24Floor}\`–\`${releaseLine}\` |`))
     assert.ok(matrixRow !== undefined, `${path} omits the current compatibility row`)
     for (const marker of [releaseLine, harnessVersion, cordisVersion, schemasteryVersion, '22.x', '24.x']) {
       assert.match(matrixRow, new RegExp(`\\x60${marker.replaceAll('.', '\\.')}\\x60`), `${path} omits ${marker}`)
     }
+    const macosNode22Row = content.split('\n').find((line) => line.startsWith('| `0.8.6` |'))
+    assert.ok(macosNode22Row !== undefined, `${path} omits the original macOS Node.js 22 row`)
+    assert.match(macosNode22Row, /`22\.x`[\s\S]*`24\.x`/u)
     const node24Row = content.split('\n').find((line) => line.startsWith('| `0.8.5` |'))
     assert.ok(node24Row !== undefined, `${path} omits the original Node.js 24 row`)
     assert.match(node24Row, /`22\.x`[\s\S]*`24\.x`/u)
@@ -215,11 +218,12 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
     assert.doesNotMatch(historicalRow, /`24\.x`/u)
   }
   const workflow = readFileSync(join(process.cwd(), '.github/workflows/ci.yml'), 'utf8')
-  const nodeVersions = [...workflow.matchAll(/node-version:\s*([^\s#]+)/gu)].map((match) => match[1])
+  const nodeVersions = [...workflow.matchAll(/^\s*node-version:\s*(.+?)(?:\s+#.*)?$/gmu)]
+    .map((match) => match[1])
   const runners = [...workflow.matchAll(/runs-on:\s*([^\s#]+)/gu)].map((match) => match[1])
   assert.ok(nodeVersions.length > 0)
   assert.ok(runners.length > 0)
-  assert.deepEqual([...new Set(nodeVersions)], ['22', '24'])
+  assert.deepEqual([...new Set(nodeVersions)], ['22', '24', '${{ matrix.node }}'])
   assert.deepEqual([...new Set(runners)], ['ubuntu-latest', 'macos-26'])
 })
 

@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.8.5'
-const BASELINE_COMMIT = '8568fc142fe266f001daf9bab880beb43d26698e'
-const BASELINE_DIGEST = 'sha256:04c01b84bdde79f2db8169e6ec8a1164ad831731bbbccbb7b29c7a1829573df2'
+const BASELINE_TAG = 'v0.8.6'
+const BASELINE_COMMIT = 'b9cb76ef117ad9a412961b07b29c274e51780453'
+const BASELINE_DIGEST = 'sha256:8aa34995918c9b7f4c87014fd84b0622f47ffb9118469b81378edae857e02441'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 
@@ -69,6 +69,14 @@ test('Web-profile baseline is one pinned, attested release artifact', () => {
   assert.doesNotMatch(verify, /--owner|--bundle|--source-digest "?\$GITHUB_SHA/u)
   assert.match(baseline, /\.name == \$name and \.digest\.sha256 == \$digest/u)
   assert.match(baseline, /echo "path=\$\{archive_path\}" >> "\$GITHUB_OUTPUT"/u)
+  assert.match(
+    readFileSync('README.md', 'utf8'),
+    new RegExp(`strictly verified ${BASELINE_TAG.replaceAll('.', '\\.')} Release package`, 'u'),
+  )
+  assert.match(
+    readFileSync('README.zh-CN.md', 'utf8'),
+    new RegExp(`严格验证的 ${BASELINE_TAG.replaceAll('.', '\\.')} Release package`, 'u'),
+  )
 })
 
 test('profile lifecycle receives the pinned baseline and the dynamic tested candidate', () => {
@@ -140,7 +148,7 @@ test('profile lifecycle receives the pinned baseline and the dynamic tested cand
   const version = JSON.parse(readFileSync('package.json', 'utf8')).version as string
   assert.match(
     readFileSync('ROADMAP.md', 'utf8'),
-    new RegExp(`## ${version.replaceAll('.', '\\.')} — macOS package compatibility`, 'u'),
+    new RegExp(`## ${version.replaceAll('.', '\\.')} — Node\\.js 24 package compatibility on macOS`, 'u'),
   )
 })
 

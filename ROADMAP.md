@@ -108,6 +108,12 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Transfer the exact Ubuntu-built canonical candidate through a digest-checked Actions artifact and install it as a separate macOS consumer without rebuilding or replacing the release archive.
 - Keep the protected `test` context fail-closed across both operating-system gates while leaving macOS Web-profile composition, app boot, credentials, network readiness, state migration, Node.js 24, and Intel hardware unverified.
 
+## 0.8.7 — Node.js 24 package compatibility on macOS
+
+- Expand the existing macOS 26 arm64 package/runtime gate into independent Node.js 22 and 24 matrix legs without changing the package engine or minimum type baseline.
+- Require both engine-strict runtimes to repeat the source/Harness, audit, independent packed-consumer, and exact Ubuntu-built canonical archive consumer checks.
+- Keep macOS Web-profile composition, app boot, credentials, network readiness, state migration, Intel hardware, and other macOS releases outside the verified boundary.
+
 ## 1.0 — Stable release
 
 - Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and credential-backed Web-profile startup plus persisted-state upgrade paths pass their own evidence-backed gates.

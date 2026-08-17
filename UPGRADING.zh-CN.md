@@ -2,7 +2,7 @@
 
 [English](./UPGRADING.md) | 简体中文
 
-本手册适用于受支持的 DeepSeek Harness `0.1.0-rc.6` 基线：Node.js 22.x，或从插件 v0.8.5 起使用 Node.js 24.x。默认使用标准 Web profile 的 JSONL 会话持久化与 JSON storage-domain 后端。自定义后端必须使用自身提供的一致性快照与恢复机制，但仍需把下文列出的逻辑单元作为同一个时间点处理。现有部署必须先在 Node.js 22 上升级插件，再通过单独的冷重启切换到 Node.js 24；绝不能把 runtime 变更与 Harness 版本组或状态迁移放进同一个窗口。下文所有流程仍只适用于 Linux：v0.8.6 的 macOS 门禁只验证 package/runtime 消费，不验证 Web profile 运行、升级、回滚或状态迁移。
+本手册适用于受支持的 DeepSeek Harness `0.1.0-rc.6` 基线：Node.js 22.x，或从插件 v0.8.5 起使用 Node.js 24.x。默认使用标准 Web profile 的 JSONL 会话持久化与 JSON storage-domain 后端。自定义后端必须使用自身提供的一致性快照与恢复机制，但仍需把下文列出的逻辑单元作为同一个时间点处理。现有部署必须先在 Node.js 22 上升级插件，再通过单独的冷重启切换到 Node.js 24；绝不能把 runtime 变更与 Harness 版本组或状态迁移放进同一个窗口。下文所有流程仍只适用于 Linux：macOS 门禁从 v0.8.6 起验证 Node.js 22 package/runtime 消费，从 v0.8.7 起验证 Node.js 22/24 消费，但不验证 Web profile 运行、升级、回滚或状态迁移。
 
 ## 安全规则
 
@@ -35,7 +35,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.3.0`–`0.6.1` | 没有进一步的插件自有持久化格式变化；v0.6 改变的是进程内驻留，而非已存 transcript。 | 该范围内状态格式兼容，但仍须遵守 v0.3 的群作用域边界。 |
 | `0.7.0` | 新增 `lark_conversations` record schema v1，作为活跃 generation 与 mutation replay 历史的提交权威。 | `0.6.1` 及更早版本会忽略 sidecar，改为选择已持久化的最大 generation，而它可能是未提交 orphan；原地回滚不安全。 |
 | `0.8.0` | 可读取 v1/v2 绑定，并写入包含 `modelSelection` 的严格 v2 record。v1 只会在下一次绑定写入时惰性升级，不会在启动时批量改写。 | `0.7.0` 只接受严格 v1；任意一条 v2 record 都会让它的全表启动校验失败。必须恢复 v0.8 前的冷备份。 |
-| `0.8.1`–`0.8.6` | 与 v0.8.0 相比没有插件自有持久化 schema 变化。 | 在精确 rc.6 版本组上可与 v0.8.0 共用 v2 状态，但仍应遵守冷备份规则。插件 v0.8.1–v0.8.4 要求 Node.js 22。 |
+| `0.8.1`–`0.8.7` | 与 v0.8.0 相比没有插件自有持久化 schema 变化。 | 在精确 rc.6 版本组上可与 v0.8.0 共用 v2 状态，但仍应遵守冷备份规则。插件 v0.8.1–v0.8.4 要求 Node.js 22。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -52,7 +52,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.8.6'
+target_tag='v0.8.7'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -194,9 +194,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 ## 回滚决策表
 
-| 从 v0.8.6 回滚到 | 状态处理方式 |
+| 从 v0.8.7 回滚到 | 状态处理方式 |
 | --- | --- |
-| v0.8.5 | 使用相同 v2 binding schema 和相同的 Node.js 22/24 engine contract。在精确 rc.6 版本组上，优雅停机并保留快照后可以原地回滚代码。 |
+| v0.8.6 或 v0.8.5 | 使用相同 v2 binding schema 和相同的 Node.js 22/24 engine contract。在精确 rc.6 版本组上，优雅停机并保留快照后可以原地回滚代码。 |
 | v0.8.4、v0.8.3、v0.8.2、v0.8.1 或 v0.8.0 | 使用相同 v2 binding schema。在精确 rc.6 版本组上，优雅停机并保留快照后可以原地回滚代码。本手册只支持这些目标运行在 Node.js 22 上：v0.8.1–v0.8.4 会通过 `engines` 强制该边界；v0.8.0 历史上的宽范围也没有建立 Node.js 24 支持。已经运行 Node.js 24 的部署必须先在单独的冷步骤中恢复 runtime，再启动旧插件。 |
 | v0.7.0 | 不能让它读取可能已被 v0.8.x 写过的状态。v0.7 无法读取任何 v2 binding，必须恢复完整的 v0.8 前快照。 |
 | v0.3.0–v0.6.1 | 必须恢复 v0.7 前的快照；这些版本会忽略提交权威 binding，并可能选择更新的 orphan generation。 |
