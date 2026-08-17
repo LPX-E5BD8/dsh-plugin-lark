@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.8.3'
-const BASELINE_COMMIT = '886fdb68e39de90e3e225b4d7738fef002a4c04a'
-const BASELINE_DIGEST = 'sha256:e2138bac969bad1afd628428b749313ef7431634bb1818c857b8422c08e1ee36'
+const BASELINE_TAG = 'v0.8.4'
+const BASELINE_COMMIT = 'cda5e08348a9568dfad19da372807e3658c183e2'
+const BASELINE_DIGEST = 'sha256:7aae3a70925717ab0995152d370cfcebc02bb97ed071c87fdeba3956a5aab9c0'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 
@@ -74,10 +74,12 @@ test('Web-profile baseline is one pinned, attested release artifact', () => {
 test('profile lifecycle receives the pinned baseline and the dynamic tested candidate', () => {
   const testJob = job('test')
   const profile = step(testJob, 'Verify packed Web-profile install and upgrade')
+  const node24 = step(testJob, 'Verify Node.js 24 compatibility')
   const ordered = [
     'Download and verify the Web-profile upgrade baseline',
     'Pack and install the release archive',
     'Verify packed Web-profile install and upgrade',
+    'Verify Node.js 24 compatibility',
     'Upload the tested release archive',
   ]
   for (let index = 1; index < ordered.length; index += 1) {
@@ -89,6 +91,36 @@ test('profile lifecycle receives the pinned baseline and the dynamic tested cand
   assert.match(profile, /version="\$\(node -p "require\('\.\/package\.json'\)\.version"\)"/u)
   assert.match(profile, /export DSH_PROFILE_CANDIDATE_PACKAGE="\$DSH_PROFILE_CANDIDATE_DIR\/dsh-plugin-lark-\$\{version\}\.tgz"/u)
   assert.match(profile, /npm run test:profile/u)
+
+  const node24Setup = testJob.lastIndexOf('node-version: 24')
+  assert.ok(node24Setup > testJob.indexOf('Verify packed Web-profile install and upgrade'))
+  assert.ok(node24Setup < testJob.indexOf('Verify Node.js 24 compatibility'))
+  assert.match(node24, /DSH_PROFILE_CANDIDATE_DIR: \$\{\{ runner\.temp \}\}\/release-package/u)
+  assert.match(node24, /DSH_PROFILE_CLEAN_ONLY: '1'/u)
+  assert.match(node24, /DSH_PROFILE_EXPECT_NODE_MAJOR: '24'/u)
+  assert.match(node24, /npm_config_cache: \$\{\{ runner\.temp \}\}\/node-24-npm-cache/u)
+  assert.match(node24, /npm_config_engine_strict: 'true'/u)
+  assert.match(node24, /process\.platform \+ ':' \+ process\.arch/u)
+  assert.match(node24, /= 'linux:x64'/u)
+  assert.match(node24, /process\.versions\.node\.split\('\.'\)\[0\]/u)
+  assert.match(node24, /= '24'/u)
+  const node24Commands = [
+    'npm ci --ignore-scripts',
+    'npm run check',
+    'npm audit --omit=dev',
+    'npm run test:pack',
+    'export DSH_PROFILE_CANDIDATE_PACKAGE=',
+    'test -f "$DSH_PROFILE_CANDIDATE_PACKAGE"',
+    'npm run test:profile',
+  ]
+  for (let index = 1; index < node24Commands.length; index += 1) {
+    assert.ok(node24.indexOf(node24Commands[index - 1] ?? '') < node24.indexOf(node24Commands[index] ?? ''))
+  }
+  assert.match(
+    node24,
+    /export DSH_PROFILE_CANDIDATE_PACKAGE="\$DSH_PROFILE_CANDIDATE_DIR\/dsh-plugin-lark-\$\{version\}\.tgz"/u,
+  )
+  assert.doesNotMatch(node24, /DSH_PROFILE_BASELINE_PACKAGE|upgrade-baseline/u)
 
   const manifest = JSON.parse(readFileSync('package.json', 'utf8')) as {
     scripts?: Record<string, string>
@@ -108,7 +140,7 @@ test('profile lifecycle receives the pinned baseline and the dynamic tested cand
   const version = JSON.parse(readFileSync('package.json', 'utf8')).version as string
   assert.match(
     readFileSync('ROADMAP.md', 'utf8'),
-    new RegExp(`## ${version.replaceAll('.', '\\.')} — Web-profile package lifecycle smoke`, 'u'),
+    new RegExp(`## ${version.replaceAll('.', '\\.')} — Node\\.js 24 on Linux`, 'u'),
   )
 })
 
@@ -143,6 +175,14 @@ test('profile smoke pins its tools and isolates every filesystem and credential 
   assert.match(profileSmoke, /await writeFile\(join\(stateRoot, 'empty-user-npmrc'\), ''\)/u)
   assert.match(profileSmoke, /assert\.deepEqual\(await readdir\(invocationDirectory\), \[\]\)/u)
   assert.match(profileSmoke, /assert\.equal\(process\.platform, 'linux'/u)
+  assert.match(profileSmoke, /const cleanOnlyValue = process\.env\.DSH_PROFILE_CLEAN_ONLY/u)
+  assert.match(profileSmoke, /cleanOnlyValue === undefined \|\| cleanOnlyValue === '1'/u)
+  assert.match(profileSmoke, /const cleanOnly = cleanOnlyValue === '1'/u)
+  assert.match(profileSmoke, /process\.env\.DSH_PROFILE_EXPECT_NODE_MAJOR\?\.trim\(\)/u)
+  assert.match(profileSmoke, /clean-only smoke must pin DSH_PROFILE_EXPECT_NODE_MAJOR/u)
+  assert.match(profileSmoke, /clean-only smoke must not receive an unsupported upgrade baseline/u)
+  assert.match(profileSmoke, /clean-only compatibility smoke must enforce package engines/u)
+  assert.match(profileSmoke, /process\.versions\.node\.split\('\.'\)\[0\], expectedNodeMajor/u)
 
   for (const name of ['DSH_PROFILE_BASELINE_PACKAGE', 'DSH_PROFILE_CANDIDATE_PACKAGE']) {
     assert.match(profileSmoke, new RegExp(`archivePathFromEnvironment\\('${name}'\\)`, 'u'))
@@ -154,6 +194,8 @@ test('profile smoke pins its tools and isolates every filesystem and credential 
   assert.match(profileSmoke, /canonical\.endsWith\('\.tgz'\)/u)
   assert.match(profileSmoke, /assert\.notEqual\(baselineArchive, candidateArchive/u)
   assert.match(profileSmoke, /assert\.notEqual\(baselineIntegrity, candidateIntegrity/u)
+  assert.match(profileSmoke, /const baselineArchive = cleanOnly[\s\S]*\? undefined[\s\S]*archivePathFromEnvironment\('DSH_PROFILE_BASELINE_PACKAGE'\)/u)
+  assert.match(profileSmoke, /if \(baselineArchive !== undefined && baselineIntegrity !== undefined\)/u)
   assert.match(profileSmoke, /await rm\(temporary, \{ recursive: true, force: true \}\)/u)
 })
 

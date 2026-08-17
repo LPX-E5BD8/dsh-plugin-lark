@@ -23,6 +23,30 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const expectedDshVersion = '0.1.0-rc.6'
 const expectedPnpmVersion = '10.15.0'
 const packageName = 'dsh-plugin-lark'
+const cleanOnlyValue = process.env.DSH_PROFILE_CLEAN_ONLY
+assert.ok(
+  cleanOnlyValue === undefined || cleanOnlyValue === '1',
+  'DSH_PROFILE_CLEAN_ONLY must be absent or exactly 1',
+)
+const cleanOnly = cleanOnlyValue === '1'
+const expectedNodeMajor = process.env.DSH_PROFILE_EXPECT_NODE_MAJOR?.trim()
+if (cleanOnly) {
+  assert.ok(expectedNodeMajor, 'clean-only smoke must pin DSH_PROFILE_EXPECT_NODE_MAJOR')
+  assert.equal(
+    process.env.DSH_PROFILE_BASELINE_PACKAGE,
+    undefined,
+    'clean-only smoke must not receive an unsupported upgrade baseline',
+  )
+  assert.equal(
+    process.env.npm_config_engine_strict,
+    'true',
+    'clean-only compatibility smoke must enforce package engines',
+  )
+}
+if (expectedNodeMajor !== undefined) {
+  assert.match(expectedNodeMajor, /^(0|[1-9]\d*)$/u)
+  assert.equal(process.versions.node.split('.')[0], expectedNodeMajor)
+}
 const profileBundles = [
   '@deepseek-ai/dsh-base',
   '@deepseek-ai/dsh-web-app',
@@ -350,12 +374,18 @@ const temporary = await mkdtemp(join(tmpdir(), 'dsh-lark-profile-smoke-'))
 try {
   assert.equal(process.platform, 'linux', 'the Web-profile smoke is supported on Linux')
 
-  const baselineArchive = await archivePathFromEnvironment('DSH_PROFILE_BASELINE_PACKAGE')
   const candidateArchive = await archivePathFromEnvironment('DSH_PROFILE_CANDIDATE_PACKAGE')
-  assert.notEqual(baselineArchive, candidateArchive, 'baseline and candidate archives must differ')
-  const baselineIntegrity = await archiveIntegrity(baselineArchive)
   const candidateIntegrity = await archiveIntegrity(candidateArchive)
-  assert.notEqual(baselineIntegrity, candidateIntegrity, 'baseline and candidate bytes must differ')
+  const baselineArchive = cleanOnly
+    ? undefined
+    : await archivePathFromEnvironment('DSH_PROFILE_BASELINE_PACKAGE')
+  const baselineIntegrity = baselineArchive === undefined
+    ? undefined
+    : await archiveIntegrity(baselineArchive)
+  if (baselineArchive !== undefined && baselineIntegrity !== undefined) {
+    assert.notEqual(baselineArchive, candidateArchive, 'baseline and candidate archives must differ')
+    assert.notEqual(baselineIntegrity, candidateIntegrity, 'baseline and candidate bytes must differ')
+  }
 
   const rootManifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
   assert.equal(rootManifest.name, packageName)
@@ -417,72 +447,74 @@ try {
   )
   await assertHomeContainsOnlyProfiles(cleanHome)
 
-  const upgradeContext = {
-    cwd: invocationDirectory,
-    env: childEnvironment(upgradeHome, pnpmStore, stateRoot),
-  }
-  await addPackage(upgradeContext, baselineArchive, 'baseline profile installation')
-  const upgradePaths = profilePaths(upgradeHome)
-  await writeFile(upgradePaths.patch, userPatchSentinel)
-  const baselineState = await assertProfileState(
-    upgradeHome,
-    baselineArchive,
-    baselineIntegrity,
-  )
-  assert.equal(
-    compareVersions(baselineState.installed.version, rootManifest.version),
-    -1,
-    `candidate ${rootManifest.version} must advance baseline ${baselineState.installed.version}`,
-  )
-  await dumpProfile(upgradeContext, 'baseline profile dump')
-  await assertHarnessFallback(upgradeHome)
-  await assertPatchUnchanged(upgradePaths.patch)
-  await assertProfileImport(
-    upgradeContext,
-    baselineState.paths.dir,
-    baselineState.installed.version,
-    'baseline profile import',
-  )
-
-  await addPackage(upgradeContext, candidateArchive, 'candidate profile upgrade')
-  await assertPatchUnchanged(upgradePaths.patch)
-  const upgradedState = await assertProfileState(
-    upgradeHome,
-    candidateArchive,
-    candidateIntegrity,
-    rootManifest.version,
-  )
-  const baselineRelativeSpec = `file:${portableRelative(upgradedState.paths.dir, baselineArchive)}`
-  for (const marker of [baselineArchive, baselineRelativeSpec, baselineIntegrity]) {
-    assert.equal(
-      upgradedState.manifestRaw.includes(marker),
-      false,
-      `upgraded manifest retained baseline marker ${JSON.stringify(marker)}`,
+  if (baselineArchive !== undefined && baselineIntegrity !== undefined) {
+    const upgradeContext = {
+      cwd: invocationDirectory,
+      env: childEnvironment(upgradeHome, pnpmStore, stateRoot),
+    }
+    await addPackage(upgradeContext, baselineArchive, 'baseline profile installation')
+    const upgradePaths = profilePaths(upgradeHome)
+    await writeFile(upgradePaths.patch, userPatchSentinel)
+    const baselineState = await assertProfileState(
+      upgradeHome,
+      baselineArchive,
+      baselineIntegrity,
     )
     assert.equal(
-      upgradedState.lockRaw.includes(marker),
-      false,
-      `upgraded lock retained baseline marker ${JSON.stringify(marker)}`,
+      compareVersions(baselineState.installed.version, rootManifest.version),
+      -1,
+      `candidate ${rootManifest.version} must advance baseline ${baselineState.installed.version}`,
     )
-  }
-  await dumpProfile(upgradeContext, 'upgraded candidate profile dump')
-  await assertHarnessFallback(upgradeHome)
-  await assertPatchUnchanged(upgradePaths.patch)
-  await assertProfileImport(
-    upgradeContext,
-    upgradedState.paths.dir,
-    rootManifest.version,
-    'upgraded candidate profile import',
-  )
+    await dumpProfile(upgradeContext, 'baseline profile dump')
+    await assertHarnessFallback(upgradeHome)
+    await assertPatchUnchanged(upgradePaths.patch)
+    await assertProfileImport(
+      upgradeContext,
+      baselineState.paths.dir,
+      baselineState.installed.version,
+      'baseline profile import',
+    )
 
-  const discovered = await discoverLarkPackageVersions(upgradeHome)
-  assert.ok(discovered.length > 0, 'the upgraded profile must contain a discoverable lark package')
-  assert.deepEqual(
-    [...new Set(discovered.map(({ version }) => version))],
-    [rootManifest.version],
-    `the upgraded profile retained another lark package: ${JSON.stringify(discovered)}`,
-  )
-  await assertHomeContainsOnlyProfiles(upgradeHome)
+    await addPackage(upgradeContext, candidateArchive, 'candidate profile upgrade')
+    await assertPatchUnchanged(upgradePaths.patch)
+    const upgradedState = await assertProfileState(
+      upgradeHome,
+      candidateArchive,
+      candidateIntegrity,
+      rootManifest.version,
+    )
+    const baselineRelativeSpec = `file:${portableRelative(upgradedState.paths.dir, baselineArchive)}`
+    for (const marker of [baselineArchive, baselineRelativeSpec, baselineIntegrity]) {
+      assert.equal(
+        upgradedState.manifestRaw.includes(marker),
+        false,
+        `upgraded manifest retained baseline marker ${JSON.stringify(marker)}`,
+      )
+      assert.equal(
+        upgradedState.lockRaw.includes(marker),
+        false,
+        `upgraded lock retained baseline marker ${JSON.stringify(marker)}`,
+      )
+    }
+    await dumpProfile(upgradeContext, 'upgraded candidate profile dump')
+    await assertHarnessFallback(upgradeHome)
+    await assertPatchUnchanged(upgradePaths.patch)
+    await assertProfileImport(
+      upgradeContext,
+      upgradedState.paths.dir,
+      rootManifest.version,
+      'upgraded candidate profile import',
+    )
+
+    const discovered = await discoverLarkPackageVersions(upgradeHome)
+    assert.ok(discovered.length > 0, 'the upgraded profile must contain a discoverable lark package')
+    assert.deepEqual(
+      [...new Set(discovered.map(({ version }) => version))],
+      [rootManifest.version],
+      `the upgraded profile retained another lark package: ${JSON.stringify(discovered)}`,
+    )
+    await assertHomeContainsOnlyProfiles(upgradeHome)
+  }
   assert.deepEqual(await readdir(invocationDirectory), [])
 } finally {
   await rm(temporary, { recursive: true, force: true })

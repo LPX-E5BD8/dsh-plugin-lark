@@ -75,6 +75,7 @@ test('release workflow keeps provenance permissions narrow and every action SHA-
     'Download and verify the Web-profile upgrade baseline',
     'Pack and install the release archive',
     'Verify packed Web-profile install and upgrade',
+    'Verify Node.js 24 compatibility',
     'Upload the tested release archive',
   ])
   assertNamedSteps(release, [
@@ -105,6 +106,7 @@ test('release workflow carries the exact pack-smoke archive into the privileged 
   const baseline = step(testJob, 'Download and verify the Web-profile upgrade baseline')
   const pack = step(testJob, 'Pack and install the release archive')
   const profile = step(testJob, 'Verify packed Web-profile install and upgrade')
+  const node24 = step(testJob, 'Verify Node.js 24 compatibility')
   const upload = step(testJob, 'Upload the tested release archive')
   const download = step(release, 'Download the tested release archive')
   const validate = step(release, 'Validate the tested release archive')
@@ -124,6 +126,7 @@ test('release workflow carries the exact pack-smoke archive into the privileged 
     'Download and verify the Web-profile upgrade baseline',
     'Pack and install the release archive',
     'Verify packed Web-profile install and upgrade',
+    'Verify Node.js 24 compatibility',
     'Upload the tested release archive',
   ]
   for (let index = 1; index < testOrder.length; index += 1) {
@@ -131,6 +134,14 @@ test('release workflow carries the exact pack-smoke archive into the privileged 
   }
   assert.match(baseline, /id: upgrade-baseline/u)
   assert.match(profile, /npm run test:profile/u)
+  assert.match(node24, /DSH_PROFILE_CANDIDATE_DIR: \$\{\{ runner\.temp \}\}\/release-package/u)
+  assert.match(
+    node24,
+    /export DSH_PROFILE_CANDIDATE_PACKAGE="\$DSH_PROFILE_CANDIDATE_DIR\/dsh-plugin-lark-\$\{version\}\.tgz"/u,
+  )
+  assert.match(node24, /test -f "\$DSH_PROFILE_CANDIDATE_PACKAGE"/u)
+  assert.match(node24, /npm run test:profile/u)
+  assert.doesNotMatch(node24, /DSH_PACK_ARTIFACT_DIR/u)
   assert.ok(release.indexOf('Download the tested release archive') < release.indexOf('Validate the tested release archive'))
 
   assert.match(validate, /id: package/u)

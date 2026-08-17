@@ -96,6 +96,12 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Upgrade a second isolated stock profile from the verified v0.8.3 Release package to the same candidate archive while preserving its user patch and resolving only the candidate package version.
 - Require exactly one Lark bundle and one composed Lark configuration layer after each transition, while keeping app startup, credentials, WebSocket readiness, and persisted-state migration outside this boot-free gate.
 
+## 0.8.5 — Node.js 24 on Linux
+
+- Expand the package engine contract to the tested even-numbered Node.js 22 and 24 lines without admitting the unverified Node.js 23 or 25 lines.
+- Keep Node.js 22 as the canonical archive producer and adjacent-release upgrade gate, then recreate dependencies under engine-strict Node.js 24 and repeat the assembled Harness and packed-consumer checks.
+- Clean-install the exact canonical candidate archive into an isolated stock rc.6 Web profile under Node.js 24 before upload, without claiming a cross-runtime upgrade, real app boot, credentials, network readiness, or persisted-state migration.
+
 ## 1.0 — Stable release
 
 - Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and credential-backed Web-profile startup plus persisted-state upgrade paths pass their own evidence-backed gates.
