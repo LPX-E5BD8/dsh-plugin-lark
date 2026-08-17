@@ -42,6 +42,17 @@ function inbound(chatId: string, text: string, messageId?: string): LarkInbound 
   }
 }
 
+function groupInbound(
+  partial: Partial<LarkInbound> & Pick<LarkInbound, 'chatId' | 'text' | 'messageId'>,
+): LarkInbound {
+  return {
+    chatType: 'group',
+    openId: 'owner',
+    mentioned: true,
+    ...partial,
+  }
+}
+
 async function deliver(client: ModelClient, message: LarkInbound): Promise<void> {
   assert.ok(client.handler !== undefined)
   await client.handler(message)
@@ -523,6 +534,30 @@ test('private conversations isolate model state while defaultSessionId intention
   assertModel(currentBinding(shared.host, 'shared-model-session').modelSelection, 'route', 'shared-model')
   assert.equal(shared.host.opens.length, 1)
   assert.equal(shared.host.opens[0]?.sessionId, 'shared-model-session')
+})
+
+test('group reply trees and native threads isolate their model selections', async (t) => {
+  const { host, client } = await mount(t)
+  const replyTreeId = 'lark:group-v1:group-chat:root:root-a'
+  const threadId = 'lark:group-v1:group-chat:thread:thread-a'
+
+  await deliver(client, groupInbound({
+    chatId: 'group-chat',
+    text: '/model route reply-tree-model',
+    messageId: 'reply-tree-switch',
+    rootId: 'root-a',
+  }))
+  await deliver(client, groupInbound({
+    chatId: 'group-chat',
+    text: '/model route thread-model',
+    messageId: 'thread-switch',
+    rootId: 'root-a',
+    threadId: 'thread-a',
+  }))
+
+  assertModel(currentBinding(host, replyTreeId).modelSelection, 'route', 'reply-tree-model')
+  assertModel(currentBinding(host, threadId).modelSelection, 'route', 'thread-model')
+  assert.notEqual(host.liveAgents.get(replyTreeId), host.liveAgents.get(threadId))
 })
 
 test('/new inherits the conversation model into its fresh generation', async (t) => {
