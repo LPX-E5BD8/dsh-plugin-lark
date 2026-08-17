@@ -30,9 +30,11 @@ The supported row is an exact release-tested baseline. A version accepted by a b
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
-| `0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported; lock-based Linux CI, assembled Harness end-to-end tests, and isolated packed-consumer installation |
+| `0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported; lock-based Linux CI, assembled Harness end-to-end tests, and isolated packed-consumer installation; starting with `0.8.4`, stock rc.6 Web-profile package lifecycle composition |
 
-The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. The bundled patch targets the stock rc.6 Web profile, but a real `dsh --profile web` installation, credentials, and Feishu/Lark network path remain deployment smoke checks rather than CI claims.
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. Starting with `0.8.4`, CI also takes the exact packed candidate archive through a clean install into an isolated stock rc.6 Web profile, then upgrades a second isolated profile from the verified v0.8.3 release package to that candidate. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer; the upgrade path also preserves the profile's user patch.
+
+That Web-profile gate is deliberately boot-free: it validates package installation, upgrade, bundle resolution, and configuration composition, but does not start the Web app or exercise credentials, the SDK WebSocket connection, `/api/lark/health`, the Feishu/Lark network path, or persisted-state migration. Those remain deployment and credential-backed smoke checks.
 
 Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23 or newer, later Cordis or Schemastery releases, other Harness cohorts, non-Linux hosts, alternative persistence stacks, and a host with the optional Approval service completely absent are unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents` or durable `storageDomain` support is unsupported.
 
@@ -69,7 +71,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.8.3'
+version='0.8.4'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"

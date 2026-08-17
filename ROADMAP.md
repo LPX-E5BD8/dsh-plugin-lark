@@ -90,9 +90,15 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Generate and verify SLSA build provenance for that archive with a SHA-pinned GitHub action and narrowly scoped release permissions.
 - Reconcile tags, attestations, and Release assets idempotently while failing closed on commit or digest conflicts.
 
+## 0.8.4 — Web-profile package lifecycle smoke
+
+- Install the exact packed candidate archive into an isolated, newly initialized stock rc.6 Web profile before that archive can be uploaded for release.
+- Upgrade a second isolated stock profile from the verified v0.8.3 Release package to the same candidate archive while preserving its user patch and resolving only the candidate package version.
+- Require exactly one Lark bundle and one composed Lark configuration layer after each transition, while keeping app startup, credentials, WebSocket readiness, and persisted-state migration outside this boot-free gate.
+
 ## 1.0 — Stable release
 
-- Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and real Web-profile upgrade paths pass their own evidence-backed gates.
+- Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and credential-backed Web-profile startup plus persisted-state upgrade paths pass their own evidence-backed gates.
 
 ## Not planned
 

@@ -55,7 +55,10 @@ function countMatches(source: string, expression: RegExp): number {
 
 test('release workflow keeps provenance permissions narrow and every action SHA-pinned', () => {
   const release = job('release')
-  assert.deepEqual(permissions(workflow, ''), { contents: 'read' })
+  assert.deepEqual(permissions(workflow, ''), {
+    contents: 'read',
+    attestations: 'read',
+  })
   assert.deepEqual(permissions(release, '    '), {
     contents: 'write',
     'id-token': 'write',
@@ -69,7 +72,9 @@ test('release workflow keeps provenance permissions narrow and every action SHA-
   assert.doesNotMatch(release, /secrets\.|NPM_TOKEN|npm\s+publish|write-all|packages:\s*write/u)
 
   assertNamedSteps(job('test'), [
+    'Download and verify the Web-profile upgrade baseline',
     'Pack and install the release archive',
+    'Verify packed Web-profile install and upgrade',
     'Upload the tested release archive',
   ])
   assertNamedSteps(release, [
@@ -97,7 +102,9 @@ test('release workflow keeps provenance permissions narrow and every action SHA-
 test('release workflow carries the exact pack-smoke archive into the privileged job', () => {
   const testJob = job('test')
   const release = job('release')
+  const baseline = step(testJob, 'Download and verify the Web-profile upgrade baseline')
   const pack = step(testJob, 'Pack and install the release archive')
+  const profile = step(testJob, 'Verify packed Web-profile install and upgrade')
   const upload = step(testJob, 'Upload the tested release archive')
   const download = step(release, 'Download the tested release archive')
   const validate = step(release, 'Validate the tested release archive')
@@ -113,7 +120,17 @@ test('release workflow carries the exact pack-smoke archive into the privileged 
   assert.match(download, /name: release-package-\$\{\{ github\.sha \}\}/u)
   assert.match(download, /path: \$\{\{ runner\.temp \}\}\/release-package/u)
   assert.match(download, /^          digest-mismatch: error$/mu)
-  assert.ok(testJob.indexOf('Pack and install the release archive') < testJob.indexOf('Upload the tested release archive'))
+  const testOrder = [
+    'Download and verify the Web-profile upgrade baseline',
+    'Pack and install the release archive',
+    'Verify packed Web-profile install and upgrade',
+    'Upload the tested release archive',
+  ]
+  for (let index = 1; index < testOrder.length; index += 1) {
+    assert.ok(testJob.indexOf(testOrder[index - 1] ?? '') < testJob.indexOf(testOrder[index] ?? ''))
+  }
+  assert.match(baseline, /id: upgrade-baseline/u)
+  assert.match(profile, /npm run test:profile/u)
   assert.ok(release.indexOf('Download the tested release archive') < release.indexOf('Validate the tested release archive'))
 
   assert.match(validate, /id: package/u)
@@ -263,5 +280,5 @@ test('release workflow reconciles one exact asset and fails closed on digest con
     assert.match(readme, /--source-digest "\$tag_commit"/u)
     assert.match(readme, /--deny-self-hosted-runners/u)
   }
-  assert.match(readFileSync('ROADMAP.md', 'utf8'), new RegExp(`## ${version.replaceAll('.', '\\.')} — Release provenance`, 'u'))
+  assert.match(readFileSync('ROADMAP.md', 'utf8'), /## 0\.8\.3 — Release provenance/u)
 })
