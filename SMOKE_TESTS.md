@@ -21,6 +21,8 @@ npm run test:pack
 dsh plugin --profile web add .
 ```
 
+When this smoke run follows an upgrade or rollback, complete the cold snapshot and state-compatibility decision in [UPGRADING.md](./UPGRADING.md) before changing the installed checkout. Do not use the smoke run itself as a backup boundary.
+
 Export credentials only in the launch shell. Do not paste secrets into a patch, commit, issue, chat message, or smoke-test record.
 
 ```sh

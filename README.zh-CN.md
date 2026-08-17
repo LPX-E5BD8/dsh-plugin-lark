@@ -50,6 +50,8 @@ dsh plugin --profile web add .
 
 profile 使用该插件期间请保留检出目录，无需等待 npm registry 发布。
 
+替换该检出目录或回滚带持久化状态的版本前，请遵循 [UPGRADING.zh-CN.md](./UPGRADING.zh-CN.md) 中的冷备份流程和 schema 边界。插件代码降级并不等于持久化状态可以自动降级。
+
 在飞书/Lark 开发者后台中：
 
 1. 选择以**长连接**接收事件。

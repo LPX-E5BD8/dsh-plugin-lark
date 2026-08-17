@@ -213,6 +213,103 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
   assert.deepEqual([...new Set(runners)], ['ubuntu-latest'])
 })
 
+test('quality: upgrade guides track durable schemas and ship with the package', () => {
+  const manifest = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
+    version: string
+    files?: string[]
+  }
+  assert.ok(manifest.files?.includes('UPGRADING.md'))
+  assert.ok(manifest.files?.includes('UPGRADING.zh-CN.md'))
+
+  const inboundSource = readFileSync(join(process.cwd(), 'src/inbound-dedup.ts'), 'utf8')
+  const bindingSource = readFileSync(join(process.cwd(), 'src/conversation-binding.ts'), 'utf8')
+  assert.match(inboundSource, /name:\s*'lark_inbound',[\s\S]*?version:\s*0,/u)
+  assert.match(bindingSource, /LEGACY_CONVERSATION_BINDING_SCHEMA_VERSION\s*=\s*1/u)
+  assert.match(bindingSource, /CONVERSATION_BINDING_SCHEMA_VERSION\s*=\s*2/u)
+  assert.match(bindingSource, /name:\s*'lark_conversations',[\s\S]*?version:\s*0,/u)
+
+  const guidePaths = ['UPGRADING.md', 'UPGRADING.zh-CN.md']
+  const guides = guidePaths.map((path) => readFileSync(join(process.cwd(), path), 'utf8'))
+  const requiredMarkers = [
+    '$DSH_HOME/sessions',
+    '$DSH_HOME/storages',
+    '$DSH_HOME/profiles/web',
+    'lark_inbound',
+    'lark_conversations',
+    'workspace.json',
+    'domain version 0',
+    'record schema v1',
+    'v2 record',
+    'modelSelection',
+    '`0.1.3`',
+    '`0.3.0`',
+    '`0.7.0`',
+    '`0.8.0`',
+    `target_tag='v${manifest.version}'`,
+    'SNAPSHOT_SHA256',
+    'SNAPSHOT_COMPLETE',
+    'storage-domain',
+    '[ws] ws client ready',
+    'SIGKILL',
+  ]
+  for (const [index, guide] of guides.entries()) {
+    for (const marker of requiredMarkers) {
+      assert.ok(guide.includes(marker), `${guidePaths[index]} omits ${marker}`)
+    }
+    assert.doesNotMatch(guide, /\brm\s+-rf\b/u)
+    assert.doesNotMatch(guide, /^\s*mv\s+--/gmu)
+  }
+  const bashBlocks = guides.map((guide) => (
+    [...guide.matchAll(/^```bash\n([\s\S]*?)\n```$/gmu)].map((match) => match[1] ?? '')
+  ))
+  assert.equal(bashBlocks[0]?.length, 4)
+  assert.deepEqual(bashBlocks[0], bashBlocks[1])
+  for (const block of bashBlocks[0] ?? []) {
+    assert.match(block, /^\(\nset -Eeuo pipefail\n/u)
+    assert.match(block, /\n\)$/u)
+    execFileSync('bash', ['-n'], { input: block, stdio: ['pipe', 'pipe', 'pipe'] })
+  }
+  const restoreBlock = bashBlocks[0]?.at(-1) ?? ''
+  for (const marker of [
+    'mv -nT',
+    'dir_id()',
+    "stat -c '%d:%i'",
+    "trap 'on_exit \"$?\"' EXIT",
+    "trap 'exit 129' HUP",
+    "trap 'exit 130' INT",
+    "trap 'exit 131' QUIT",
+    "trap 'exit 143' TERM",
+    'rename_committed=1',
+    'tree_digest "$restore_stage"',
+  ]) {
+    assert.ok(restoreBlock.includes(marker), `restore template omits ${marker}`)
+  }
+  assert.ok((restoreBlock.match(/rename_empty_target /gu) ?? []).length >= 8)
+  const profileBlock = bashBlocks[0]?.[2] ?? ''
+  assert.match(profileBlock, /DSH_HOME="\$dsh_state_root" dsh --profile web --dump-config/u)
+  assert.match(profileBlock, /DSH_HOME="\$dsh_state_root" dsh plugin --profile web add/u)
+  assert.equal((profileBlock.match(/dsh --profile web --dump-config/gu) ?? []).length, 2)
+  const structure = guides.map((guide) => ({
+    headings: guide.split('\n').filter((line) => line.startsWith('## ')).length,
+    tables: guide.split('\n').filter((line) => /^\| ---/u.test(line)).length,
+    fences: guide.split('\n').filter((line) => line === '```').length,
+  }))
+  assert.deepEqual(structure[0], structure[1])
+
+  const packSmoke = readFileSync(join(process.cwd(), 'scripts/pack-smoke.mjs'), 'utf8')
+  assert.match(packSmoke, /\['UPGRADING\.md', 'UPGRADING\.zh-CN\.md'\]/u)
+  assert.match(packSmoke, /packed package did not include/u)
+
+  const readme = readFileSync(join(process.cwd(), 'README.md'), 'utf8')
+  const readmeZh = readFileSync(join(process.cwd(), 'README.zh-CN.md'), 'utf8')
+  const smoke = readFileSync(join(process.cwd(), 'SMOKE_TESTS.md'), 'utf8')
+  const roadmap = readFileSync(join(process.cwd(), 'ROADMAP.md'), 'utf8')
+  assert.match(readme, /\[UPGRADING\.md\]\(\.\/UPGRADING\.md\)/u)
+  assert.match(readmeZh, /\[UPGRADING\.zh-CN\.md\]\(\.\/UPGRADING\.zh-CN\.md\)/u)
+  assert.match(smoke, /\[UPGRADING\.md\]\(\.\/UPGRADING\.md\)/u)
+  assert.match(roadmap, /## 0\.8\.2 — Upgrade and rollback/u)
+})
+
 test('quality: rendered cards stay within the Lark byte limit', () => {
   const payload = renderTurnCard({
     status: 'completed',

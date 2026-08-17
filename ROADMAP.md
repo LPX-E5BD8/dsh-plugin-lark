@@ -78,10 +78,15 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Distinguish supported combinations from installable or unverified ones, and fail closed around mixed Harness release cohorts.
 - Keep the manifest, lockfile, packed-consumer resolution, documentation, and CI runtime aligned through automated checks.
 
+## 0.8.2 — Upgrade and rollback
+
+- Publish equivalent English and Simplified Chinese cold-upgrade, rollback, and durable-state migration procedures.
+- Record the receipt, group-session, binding-authority, and model-selection schema boundaries across prior releases.
+- Require one point-in-time backup unit for sessions, storage domains, and the Web profile; reject partial restore and unsupported down-migration guidance.
+
 ## 1.0 — Stable release
 
 - Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and real Web-profile upgrade paths pass their own evidence-backed gates.
-- Document upgrade, rollback, and session-state migration procedures.
 - Automate package provenance for tagged releases.
 
 ## Not planned
