@@ -72,9 +72,15 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Keep model choices isolated between direct chats, reply trees, and native threads while preserving the intentional global sharing of `defaultSessionId`.
 - Protect model mutations against receipt-loss replay without changing the Harness-wide default model for unrelated conversations.
 
+## 0.8.1 — Harness compatibility
+
+- Publish an equivalent English and Simplified Chinese matrix for the exact Harness, host-library, and Node.js baseline exercised by the release gate.
+- Distinguish supported combinations from installable or unverified ones, and fail closed around mixed Harness release cohorts.
+- Keep the manifest, lockfile, packed-consumer resolution, documentation, and CI runtime aligned through automated checks.
+
 ## 1.0 — Stable release
 
-- Publish a supported DeepSeek Harness compatibility matrix.
+- Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and real Web-profile upgrade paths pass their own evidence-backed gates.
 - Document upgrade, rollback, and session-state migration procedures.
 - Automate package provenance for tagged releases.
 

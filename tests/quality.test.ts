@@ -108,6 +108,111 @@ test('quality: publishing targets the public npm registry', () => {
   assert.equal(manifest.publishConfig?.registry, 'https://registry.npmjs.org/')
 })
 
+test('quality: compatibility contract matches the manifest, lockfile, docs, and CI', () => {
+  const harnessVersion = '0.1.0-rc.6'
+  const cordisVersion = '4.0.1'
+  const schemasteryVersion = '3.18.1'
+  const nodeRange = '>=22 <23'
+  const manifest = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
+    version: string
+    engines?: { node?: string }
+    peerDependencies?: Record<string, string>
+    peerDependenciesMeta?: Record<string, { optional?: boolean }>
+    devDependencies?: Record<string, string>
+  }
+  const lockfile = JSON.parse(readFileSync(join(process.cwd(), 'package-lock.json'), 'utf8')) as {
+    packages?: Record<string, {
+      version?: string
+      engines?: { node?: string }
+      peerDependencies?: Record<string, string>
+      peerDependenciesMeta?: Record<string, { optional?: boolean }>
+      devDependencies?: Record<string, string>
+    }>
+  }
+  const root = lockfile.packages?.['']
+  const expectedPeers = {
+    '@deepseek-ai/cordis': cordisVersion,
+    '@deepseek-ai/dsh-agent': harnessVersion,
+    '@deepseek-ai/dsh-llm': harnessVersion,
+    '@deepseek-ai/dsh-session': harnessVersion,
+    '@deepseek-ai/dsh-storage-domain': harnessVersion,
+    '@deepseek-ai/dsh-user-approval': harnessVersion,
+    '@deepseek-ai/schemastery': schemasteryVersion,
+  }
+  const expectedHarnessDevDependencies = {
+    '@deepseek-ai/dsh-agent-loop': harnessVersion,
+    '@deepseek-ai/dsh-session-persistence': harnessVersion,
+    '@deepseek-ai/dsh-session-persistence-jsonl': harnessVersion,
+    '@deepseek-ai/dsh-storage': harnessVersion,
+    '@deepseek-ai/dsh-storage-domain': harnessVersion,
+    '@deepseek-ai/dsh-storage-json': harnessVersion,
+    '@deepseek-ai/dsh-tools': harnessVersion,
+    '@deepseek-ai/dsh-user-approval': harnessVersion,
+  }
+  assert.ok(root !== undefined)
+  assert.equal(manifest.engines?.node, nodeRange)
+  assert.equal(root.engines?.node, nodeRange)
+  assert.deepEqual(manifest.peerDependencies, expectedPeers)
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(manifest.devDependencies ?? {})
+      .filter(([name]) => name.startsWith('@deepseek-ai/dsh-'))),
+    expectedHarnessDevDependencies,
+  )
+  assert.deepEqual(manifest.peerDependenciesMeta, {
+    '@deepseek-ai/dsh-user-approval': { optional: true },
+  })
+  assert.deepEqual(root.peerDependencies, manifest.peerDependencies)
+  assert.deepEqual(root.peerDependenciesMeta, manifest.peerDependenciesMeta)
+  assert.deepEqual(root.devDependencies, manifest.devDependencies)
+
+  const directHarnessDependencies = [
+    ...Object.entries(manifest.peerDependencies ?? {}),
+    ...Object.entries(manifest.devDependencies ?? {}),
+  ].filter(([name]) => name.startsWith('@deepseek-ai/dsh-'))
+  assert.ok(directHarnessDependencies.length > 0)
+  for (const [name, version] of directHarnessDependencies) {
+    assert.equal(version, harnessVersion, `${name} is outside the supported Harness cohort`)
+  }
+
+  const lockedPackages = Object.entries(lockfile.packages ?? {})
+  const lockedHarnessPackages = lockedPackages
+    .filter(([path]) => /(?:^|\/)node_modules\/@deepseek-ai\/dsh-[^/]+$/u.test(path))
+  assert.ok(lockedHarnessPackages.length > 0)
+  for (const [path, entry] of lockedHarnessPackages) {
+    assert.equal(entry.version, harnessVersion, `${path} is outside the supported Harness cohort`)
+  }
+  for (const [name, version] of [
+    ['@deepseek-ai/cordis', cordisVersion],
+    ['@deepseek-ai/schemastery', schemasteryVersion],
+  ]) {
+    const resolved = lockedPackages.filter(([path]) => (
+      path === `node_modules/${name}` || path.endsWith(`/node_modules/${name}`)
+    ))
+    assert.ok(resolved.length > 0, `${name} is absent from the lockfile`)
+    for (const [path, entry] of resolved) {
+      assert.equal(entry.version, version, `${path} is outside the supported host baseline`)
+    }
+  }
+
+  const [major, minor] = manifest.version.split('.')
+  const releaseLine = `${major}.${minor}.x`
+  for (const path of ['README.md', 'README.zh-CN.md']) {
+    const content = readFileSync(join(process.cwd(), path), 'utf8')
+    const matrixRow = content.split('\n').find((line) => line.startsWith(`| \`${releaseLine}\` |`))
+    assert.ok(matrixRow !== undefined, `${path} omits the current compatibility row`)
+    for (const marker of [releaseLine, harnessVersion, cordisVersion, schemasteryVersion, '22.x']) {
+      assert.match(matrixRow, new RegExp(`\\x60${marker.replaceAll('.', '\\.')}\\x60`), `${path} omits ${marker}`)
+    }
+  }
+  const workflow = readFileSync(join(process.cwd(), '.github/workflows/ci.yml'), 'utf8')
+  const nodeVersions = [...workflow.matchAll(/node-version:\s*([^\s#]+)/gu)].map((match) => match[1])
+  const runners = [...workflow.matchAll(/runs-on:\s*([^\s#]+)/gu)].map((match) => match[1])
+  assert.ok(nodeVersions.length > 0)
+  assert.ok(runners.length > 0)
+  assert.deepEqual([...new Set(nodeVersions)], ['22'])
+  assert.deepEqual([...new Set(runners)], ['ubuntu-latest'])
+})
+
 test('quality: rendered cards stay within the Lark byte limit', () => {
   const payload = renderTurnCard({
     status: 'completed',

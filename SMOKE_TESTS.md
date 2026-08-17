@@ -102,7 +102,8 @@ Repeat these group-chat checks:
 Record only sanitized facts:
 
 - plugin version and commit;
-- Harness, Node.js, and SDK versions;
+- the exact compatibility-matrix row (Harness cohort, Cordis, Schemastery, and Node.js), plus the SDK version;
+- whether every resolved DSH package matched the recorded cohort;
 - `feishu` or `lark` domain;
 - UTC timestamp;
 - pass/fail for startup, direct chat, group chat, cards, commands, approvals, long reply, restart, project switching, model switching, and bounded-cache cold resume;
