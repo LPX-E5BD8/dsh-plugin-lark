@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
-import AgentRegistry from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { installModelSelection } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import LlmRuntime, { CallId, createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -369,6 +369,102 @@ test('harness e2e: /new materializes and resumes its session across restart', as
   assert.equal(second.ctx.agents.list()[0]?.id, freshSessionId)
   assert.equal(second.ctx.agents.list()[0]?.session.firstLiveSeq, 1)
   await second.dispose()
+})
+
+test('harness e2e: /model snapshots the same durable session and survives reset and restart', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-model-switch-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const firstAdapter = new ScriptedAdapter([
+    textResponse('dynamic answer'),
+    textResponse('reset answer'),
+  ])
+  const first = await mount(root, firstAdapter)
+  await first.client.messageHandler?.(command('/model mock dynamic-v2'))
+  assert.match(first.client.sent.at(-1) ?? '', /dynamic-v2/u)
+  assert.equal(first.ctx.agents.list().length, 1)
+  const selectedAgent = first.ctx.agents.list()[0]
+  assert.equal(selectedAgent?.options.model, 'mock')
+
+  await first.client.messageHandler?.(conversationCommand('chat-a', 'first dynamic prompt'))
+  await waitFor(() => firstAdapter.requests.length === 1)
+  assert.equal(firstAdapter.requests[0]?.provider, 'mock')
+  assert.equal(firstAdapter.requests[0]?.model, 'dynamic-v2')
+  assert.equal(first.ctx.agents.list()[0], selectedAgent)
+  const originalSessionId = first.ctx.agents.list()[0]?.id
+  assert.equal(String(originalSessionId), 'lark:chat-a')
+  assert.equal(first.ctx.agents.list()[0]?.session.requestHeader()?.config.model, 'dynamic-v2')
+  await first.ctx.agents.list()[0]?.whenIdle()
+
+  await first.client.messageHandler?.(conversationCommand('chat-a', '/new'))
+  const resetSessionId = first.ctx.agents.list()[0]?.id
+  assert.ok(resetSessionId !== undefined)
+  assert.notEqual(resetSessionId, originalSessionId)
+  await first.client.messageHandler?.(conversationCommand('chat-a', 'reset dynamic prompt'))
+  await waitFor(() => firstAdapter.requests.length === 2)
+  assert.equal(firstAdapter.requests[1]?.model, 'dynamic-v2')
+  await first.ctx.agents.list()[0]?.whenIdle()
+  await first.dispose()
+
+  const secondAdapter = new ScriptedAdapter([textResponse('resumed answer')])
+  const second = await mount(root, secondAdapter)
+  await second.client.messageHandler?.(conversationCommand('chat-a', 'resumed dynamic prompt'))
+  await waitFor(() => secondAdapter.requests.length === 1)
+  assert.equal(secondAdapter.requests[0]?.provider, 'mock')
+  assert.equal(secondAdapter.requests[0]?.model, 'dynamic-v2')
+  assert.equal(second.ctx.agents.list()[0]?.id, resetSessionId)
+  await second.dispose()
+})
+
+test('harness e2e: the durable Lark selector stays authoritative over a later surface selector', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-model-authority-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([textResponse('selected answer')])
+  const harness = await mount(root, adapter)
+
+  await harness.client.messageHandler?.(command('/model mock lark-selected'))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  const laterSurface = {
+    current: { provider: 'mock', model: 'web-selected' },
+    assembled: undefined,
+  }
+  installModelSelection(agent.ctx, laterSurface)
+
+  await harness.client.messageHandler?.(conversationCommand('chat-a', 'use durable selection'))
+  await waitFor(() => adapter.requests.length === 1)
+  assert.equal(adapter.requests[0]?.model, 'lark-selected')
+  await harness.dispose()
+})
+
+test('harness e2e: an evicted conversation cold-resumes its selected model', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-model-eviction-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    textResponse('first selected answer'),
+    textResponse('other answer'),
+    textResponse('resumed selected answer'),
+  ])
+  const harness = await mount(root, adapter, undefined, undefined, 1)
+
+  await harness.client.messageHandler?.(conversationCommand('chat-selected', '/model mock selected-v2'))
+  await harness.client.messageHandler?.(conversationCommand('chat-selected', 'first selected prompt'))
+  await waitFor(() => adapter.requests.length === 1)
+  await harness.ctx.agents.get(SessionId('lark:chat-selected'))?.whenIdle()
+
+  await harness.client.messageHandler?.(conversationCommand('chat-other', 'other prompt'))
+  await waitFor(() => adapter.requests.length === 2)
+  await harness.ctx.agents.get(SessionId('lark:chat-other'))?.whenIdle()
+  await waitFor(() => harness.ctx.agents.get(SessionId('lark:chat-selected')) === undefined)
+
+  await harness.client.messageHandler?.(conversationCommand('chat-selected', 'cold resumed prompt'))
+  await waitFor(() => adapter.requests.length === 3)
+  assert.deepEqual(adapter.requests.map((request) => request.model), [
+    'selected-v2',
+    'mock',
+    'selected-v2',
+  ])
+  await harness.dispose()
 })
 
 test('harness e2e: a persisted /new receipt suppresses replay after restart', async (t) => {
@@ -1000,7 +1096,14 @@ test('harness e2e: a blank project generation stays unindexed across restart unt
     path: canonicalProjectPath,
   }]
 
-  const first = await mount(root, undefined, undefined, undefined, undefined, workspaceSpecs)
+  const first = await mount(
+    root,
+    new ScriptedAdapter([]),
+    undefined,
+    undefined,
+    undefined,
+    workspaceSpecs,
+  )
   t.after(() => first.dispose())
   await first.client.messageHandler?.(conversationCommand('chat-blank-project', '/project Restart Project'))
   const blankAgent = first.ctx.agents.list().find((agent) => (

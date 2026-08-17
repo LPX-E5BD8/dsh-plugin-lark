@@ -165,4 +165,8 @@ export type {
 export { LARK_LOCALES } from './locale.ts'
 export type { LarkLocale } from './locale.ts'
 export { DurableConversationBindingStore } from './conversation-binding.ts'
-export type { ConversationBinding, ConversationBindingStore } from './conversation-binding.ts'
+export type {
+  ConversationBinding,
+  ConversationBindingStore,
+  ConversationModelSelection,
+} from './conversation-binding.ts'

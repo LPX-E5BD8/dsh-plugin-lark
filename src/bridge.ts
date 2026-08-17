@@ -2,17 +2,22 @@ import { createHash, randomUUID } from 'node:crypto'
 import { isAbsolute } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, LlmCallConfig, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { foldRequestHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import { CARD_ACTIONS, CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCardWithMeta } from './cards.ts'
 import type { ToolCardItem, TurnCard, TurnCardStatus, TurnCardTodo, TurnCardUsage } from './cards.ts'
 import { DEFAULT_CONFIG, MIN_STREAM_UPDATE_INTERVAL_MS } from './config.ts'
 import { CONVERSATION_MUTATION_HISTORY_LIMIT } from './conversation-binding.ts'
-import type { ConversationBinding, ConversationBindingStore } from './conversation-binding.ts'
+import type {
+  ConversationBinding,
+  ConversationBindingStore,
+  ConversationModelSelection,
+} from './conversation-binding.ts'
 import { projectActivity, sessionEventPolicy } from './events.ts'
 import type { ActivityProjection, CatalogSessionEvent } from './events.ts'
 import type { InboundDeduplicator } from './inbound-dedup.ts'
@@ -45,6 +50,8 @@ interface ConversationSession {
   readonly baseId: string
   handle: AgentHandle
   sessionId: string
+  modelSelection: ConversationModelSelection
+  modelSelectionRef: ModelSelectionRef
   lastAccess: number
   workspaceId?: string
 }
@@ -57,6 +64,7 @@ interface SessionBinding {
   readonly persisted: boolean
   readonly generation: number
   readonly agentPreset?: string
+  readonly modelSelection: ConversationModelSelection | null
 }
 
 interface SessionPersistenceLike {
@@ -78,6 +86,44 @@ interface AgentPresetsLike {
 interface AgentComposition {
   readonly agentPreset?: string
   readonly setup?: (agentCtx: Context) => Promise<void>
+}
+
+interface LlmProviderInfoLike {
+  readonly id: string
+  readonly name: string
+}
+
+interface LlmModelInfoLike {
+  readonly provider: string
+  readonly id: string
+  readonly name: string
+}
+
+interface LlmRuntimeLike {
+  listProviders(): LlmProviderInfoLike[]
+  listModels(provider: string): Promise<LlmModelInfoLike[]>
+  resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<LlmCallConfig>
+}
+
+interface ListedModel {
+  readonly provider: string
+  readonly id: string
+  readonly displayId: string
+  readonly name: string
+}
+
+interface ListedModelGroup {
+  readonly id: string
+  readonly displayId: string
+  readonly name: string
+  readonly models: readonly ListedModel[]
+}
+
+interface ModelCatalog {
+  readonly groups: readonly ListedModelGroup[]
+  readonly providerIds: ReadonlySet<string>
+  readonly partial: boolean
+  readonly truncated: boolean
 }
 
 interface RegisteredWorkspace {
@@ -116,6 +162,8 @@ type ProjectSwitchMaintenanceResult = {
 }
 
 type CurrentProjectMutationResult = 'recorded' | 'busy' | 'failed'
+
+type ModelSwitchMaintenanceResult = 'committed' | 'already-current' | 'busy' | 'unavailable' | 'failed'
 
 type ResetMaintenanceResult = {
   readonly kind: 'committed'
@@ -199,8 +247,15 @@ const GROUP_SESSION_SCOPE_VERSION = 'group-v1'
 const RECENT_INBOUND_LIMIT = 1024
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const INBOUND_MUTATION_HASH_DOMAIN = 'dsh-plugin-lark/conversation-mutation/v1'
-const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear', 'project'])
+const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear', 'project', 'model'])
 const UNSUPPORTED_RUNTIME_COMMANDS = new Set(['feedback', 'export'])
+const MODEL_CATALOG_PROVIDER_LIMIT = 32
+const MODEL_CATALOG_ENTRY_LIMIT = 128
+const MODEL_DISPLAY_FIELD_LIMIT = 120
+const MODEL_PROVIDER_ID_LIMIT = 256
+const MODEL_ID_LIMIT = 512
+const MODEL_CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu
+const MODEL_CONTROL_CHARACTER_TEST_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 
 const APPROVAL_DECISION = {
   allowOnce: 'allowed-once',
@@ -334,6 +389,12 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function modelFailureTag(error: unknown): string {
+  if (error instanceof TypeError) return 'invalid-metadata'
+  if (error instanceof DOMException && error.name === 'AbortError') return 'aborted'
+  return 'adapter-error'
+}
+
 async function collectSettled<T>(
   promises: Iterable<PromiseLike<T>>,
   failures: unknown[],
@@ -390,6 +451,7 @@ function sessionGeneration(baseId: string, sessionId: string): number | undefine
 function conversationBinding(
   baseId: string,
   sessionId: string,
+  modelSelection: ConversationModelSelection | null = null,
   mutationHashes: readonly string[] = [],
 ): ConversationBinding {
   const generation = sessionGeneration(baseId, sessionId)
@@ -401,6 +463,9 @@ function conversationBinding(
     suffix: generation === 0
       ? null
       : sessionId.slice(baseId.length + SESSION_RESET_SEPARATOR.length),
+    modelSelection: modelSelection === null
+      ? null
+      : Object.freeze({ provider: modelSelection.provider, model: modelSelection.model }),
     mutationHashes: Object.freeze([...mutationHashes]),
   }
 }
@@ -442,8 +507,51 @@ function boundSessionId(baseId: string, binding: ConversationBinding): ReturnTyp
 function sameConversationBinding(left: ConversationBinding | undefined, right: ConversationBinding): boolean {
   return left?.generation === right.generation
     && left.suffix === right.suffix
+    && left.modelSelection?.provider === right.modelSelection?.provider
+    && left.modelSelection?.model === right.modelSelection?.model
     && left.mutationHashes.length === right.mutationHashes.length
     && left.mutationHashes.every((hash, index) => hash === right.mutationHashes[index])
+}
+
+function sameModelSelection(
+  left: ConversationModelSelection | null | undefined,
+  right: ConversationModelSelection | null | undefined,
+): boolean {
+  return left?.provider === right?.provider && left?.model === right?.model
+}
+
+function validModelIdentifier(value: string, maxLength: number): boolean {
+  return value !== ''
+    && value.length <= maxLength
+    && value.trim() === value
+    && value.isWellFormed()
+    && !MODEL_CONTROL_CHARACTER_TEST_PATTERN.test(value)
+}
+
+function modelSelectionFromConfig(
+  config: Pick<LlmCallConfig, 'provider' | 'model'> | undefined,
+): ConversationModelSelection | undefined {
+  if (config === undefined
+    || !validModelIdentifier(config.provider, MODEL_PROVIDER_ID_LIMIT)
+    || !validModelIdentifier(config.model, MODEL_ID_LIMIT)) return undefined
+  return Object.freeze({ provider: config.provider, model: config.model })
+}
+
+function safeModelDisplay(value: string, fallback: string): { readonly text: string; readonly truncated: boolean } {
+  const normalized = value.replace(MODEL_CONTROL_CHARACTER_PATTERN, ' ').replace(/\s+/gu, ' ').trim()
+  const source = normalized === '' ? fallback : normalized
+  const runes = [...source]
+  if (runes.length <= MODEL_DISPLAY_FIELD_LIMIT) return { text: source, truncated: false }
+  return { text: `${runes.slice(0, MODEL_DISPLAY_FIELD_LIMIT - 1).join('')}…`, truncated: true }
+}
+
+function modelTarget(input: string): ConversationModelSelection | undefined {
+  const match = /^(\S+)\s+(.+)$/u.exec(input.trim())
+  if (match === null) return undefined
+  const provider = match[1]
+  const model = match[2]?.trim()
+  if (provider === undefined || model === undefined || model === '') return undefined
+  return { provider, model }
 }
 
 function bindingReadBackAfterError(
@@ -557,6 +665,46 @@ function conversationBindingsOf(ctx: Context): ConversationBindingStore | undefi
   return candidate as ConversationBindingStore
 }
 
+function llmRuntimeOf(ctx: Context): LlmRuntimeLike | undefined {
+  const service = ctx.get('llm') as unknown
+  if (service === undefined) return undefined
+  if (service === null || typeof service !== 'object') {
+    throw new TypeError('lark: llm service is invalid')
+  }
+  const candidate = service as Partial<LlmRuntimeLike>
+  if (typeof candidate.listProviders !== 'function'
+    || typeof candidate.listModels !== 'function'
+    || typeof candidate.resolveCallConfig !== 'function') {
+    throw new TypeError('lark: llm service is invalid')
+  }
+  return candidate as LlmRuntimeLike
+}
+
+function listedProvider(value: unknown): LlmProviderInfoLike {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('lark: llm provider catalog is invalid')
+  }
+  const candidate = value as Partial<LlmProviderInfoLike>
+  if (typeof candidate.id !== 'string' || candidate.id === '' || !candidate.id.isWellFormed()
+    || typeof candidate.name !== 'string' || !candidate.name.isWellFormed()) {
+    throw new TypeError('lark: llm provider catalog is invalid')
+  }
+  return candidate as LlmProviderInfoLike
+}
+
+function listedModel(value: unknown, provider: string): LlmModelInfoLike {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('lark: llm model catalog is invalid')
+  }
+  const candidate = value as Partial<LlmModelInfoLike>
+  if (candidate.provider !== provider
+    || typeof candidate.id !== 'string' || candidate.id === '' || !candidate.id.isWellFormed()
+    || typeof candidate.name !== 'string' || !candidate.name.isWellFormed()) {
+    throw new TypeError('lark: llm model catalog is invalid')
+  }
+  return candidate as LlmModelInfoLike
+}
+
 function registeredWorkspace(value: unknown): RegisteredWorkspace {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('lark: workspaceRegistry returned an invalid workspace')
@@ -626,6 +774,7 @@ function latestSessionBinding(
       sessionId: SessionId(sessionId),
       persisted: true,
       generation,
+      modelSelection: null,
       ...(agentPreset === undefined ? {} : { agentPreset }),
     }
   }
@@ -652,6 +801,7 @@ export class LarkBridge {
   private readonly conversationEvictions = new Map<string, Promise<void>>()
   private readonly conversationIdleWatchers = new Map<string, Promise<void>>()
   private readonly handles = new Map<string, Promise<AgentHandle>>()
+  private readonly modelSelections = new WeakMap<Agent, ModelSelectionRef>()
   private readonly handleRetirements = new Set<Promise<void>>()
   private readonly messageRoutes = new Map<string, PendingMessageRoute>()
   private readonly turnStarts = new Map<string, Map<number, number>>()
@@ -701,6 +851,12 @@ export class LarkBridge {
     this.sharedSessionBaseId = defaultSessionId === '' ? undefined : defaultSessionId
     this.provider = options.provider ?? DEFAULT_CONFIG.provider
     this.model = options.model ?? DEFAULT_CONFIG.model
+    if (!validModelIdentifier(this.provider, MODEL_PROVIDER_ID_LIMIT)) {
+      throw new TypeError('lark: provider must be a bounded, trimmed model route id')
+    }
+    if (!validModelIdentifier(this.model, MODEL_ID_LIMIT)) {
+      throw new TypeError('lark: model must be a bounded, trimmed model route id')
+    }
     this.streamUpdateIntervalMs = options.streamUpdateIntervalMs ?? DEFAULT_CONFIG.streamUpdateIntervalMs
     if (!Number.isSafeInteger(this.streamUpdateIntervalMs)
       || this.streamUpdateIntervalMs < MIN_STREAM_UPDATE_INTERVAL_MS) {
@@ -1145,6 +1301,12 @@ export class LarkBridge {
         else await this.scheduleProjectSwitch(route, target)
         break
       }
+      case '/model': {
+        const target = text.slice(command.length).trim()
+        if (target === '') await this.showModels(route)
+        else await this.scheduleModelSwitch(route, target)
+        break
+      }
       default:
         await this.executeRuntimeCommand(route, text, command)
     }
@@ -1353,7 +1515,7 @@ export class LarkBridge {
           if (durable !== true) throw new Error('no durability listener participated')
           await this.putConversationBinding(
             baseId,
-            this.currentConversationBinding(baseId, previousSessionId),
+            this.currentConversationBinding(baseId, previousSessionId, conversation.modelSelection),
           )
         } catch (error) {
           if (error instanceof BindingConfirmationInterruptedError) throw error
@@ -1380,12 +1542,21 @@ export class LarkBridge {
 
         let sessionId: ReturnType<typeof SessionId>
         let handle: AgentHandle
+        let modelSelectionRef: ModelSelectionRef
         try {
           const { agentPreset } = activeSessionComposition(previousHandle.agent.session)
           const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
           this.lastSessionGenerations.set(baseId, generation)
           sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
-          handle = await this.ensureHandle(sessionId, false, false, agentPreset, selected.path)
+          handle = await this.ensureHandle(
+            sessionId,
+            false,
+            false,
+            agentPreset,
+            selected.path,
+            conversation.modelSelection,
+          )
+          modelSelectionRef = this.modelSelectionFor(handle)
         } catch (error) {
           this.ctx.logger.error('[lark] project session creation failed: %s', messageOf(error))
           return { kind: 'failed' }
@@ -1411,7 +1582,12 @@ export class LarkBridge {
         try {
           await this.putConversationBinding(
             baseId,
-            this.mutatedConversationBinding(baseId, String(sessionId), route.mutationHash),
+            this.mutatedConversationBinding(
+              baseId,
+              String(sessionId),
+              conversation.modelSelection,
+              route.mutationHash,
+            ),
           )
         } catch (error) {
           this.ctx.logger.error('[lark] project binding commit failed: %s', messageOf(error))
@@ -1422,6 +1598,7 @@ export class LarkBridge {
 
         conversation.handle = handle
         conversation.sessionId = String(sessionId)
+        conversation.modelSelectionRef = modelSelectionRef
         conversation.workspaceId = workspace.id
         this.deferWorkspaceAttachment(String(sessionId), workspace.id, workspace.path)
         this.clearSessionState(previousSessionId)
@@ -1490,6 +1667,7 @@ export class LarkBridge {
           this.mutatedConversationBinding(
             conversation.baseId,
             conversation.sessionId,
+            conversation.modelSelection,
             route.mutationHash,
           ),
         )
@@ -1515,6 +1693,7 @@ export class LarkBridge {
             this.mutatedConversationBinding(
               conversation.baseId,
               conversation.sessionId,
+              conversation.modelSelection,
               route.mutationHash,
             ),
           )
@@ -1535,6 +1714,241 @@ export class LarkBridge {
       this.ctx.logger.error('[lark] current project mutation maintenance failed: %s', messageOf(error))
       return 'failed'
     }
+  }
+
+  private showModels(route: MessageRoute): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, () => (
+      this.withConversation(route.sessionBaseId, async (conversation) => {
+        const deliveryOptions = routeDeliveryOptions(route)
+        try {
+          const llm = llmRuntimeOf(this.ctx)
+          if (llm === undefined) {
+            await this.safeSend(route.chatId, this.text.modelUnavailable, deliveryOptions)
+            return
+          }
+          const catalog = await this.modelCatalog(llm)
+          await this.safeSend(
+            route.chatId,
+            this.text.modelList(
+              conversation.modelSelection,
+              catalog.groups,
+              catalog.providerIds.has(conversation.modelSelection.provider),
+              catalog.partial,
+              catalog.truncated,
+            ),
+            deliveryOptions,
+          )
+        } catch (error) {
+          this.ctx.logger.warn('[lark] model catalog failed (%s)', modelFailureTag(error))
+          await this.safeSend(route.chatId, this.text.modelUnavailable, deliveryOptions)
+        }
+      })
+    ))
+  }
+
+  private async modelCatalog(llm: LlmRuntimeLike): Promise<ModelCatalog> {
+    const rawProviders = llm.listProviders()
+    if (!Array.isArray(rawProviders)) throw new TypeError('lark: llm provider catalog is invalid')
+    const providers = rawProviders.map(listedProvider)
+    const providerIds = new Set<string>()
+    for (const provider of providers) {
+      if (providerIds.has(provider.id)) throw new TypeError('lark: llm provider catalog contains duplicate ids')
+      providerIds.add(provider.id)
+    }
+
+    let truncated = providers.length > MODEL_CATALOG_PROVIDER_LIMIT
+    const visibleProviders = providers.slice(0, MODEL_CATALOG_PROVIDER_LIMIT)
+    const loaded = await Promise.all(visibleProviders.map(async (provider) => {
+      try {
+        const rawModels = await llm.listModels(provider.id)
+        if (!Array.isArray(rawModels)) throw new TypeError('lark: llm model catalog is invalid')
+        const models = rawModels.slice(0, MODEL_CATALOG_ENTRY_LIMIT)
+          .map((model) => listedModel(model, provider.id))
+        return { provider, models, truncated: models.length < rawModels.length }
+      } catch (error) {
+        this.ctx.logger.warn(
+          '[lark] model catalog provider "%s" failed (%s)',
+          safeModelDisplay(provider.id, 'provider').text,
+          modelFailureTag(error),
+        )
+        return { provider, failure: true as const }
+      }
+    }))
+
+    let remaining = MODEL_CATALOG_ENTRY_LIMIT
+    let partial = false
+    const groups: ListedModelGroup[] = []
+    for (const entry of loaded) {
+      if ('failure' in entry) {
+        partial = true
+        continue
+      }
+      truncated ||= entry.truncated
+      if (entry.models.length === 0) continue
+      if (remaining === 0) {
+        truncated = true
+        continue
+      }
+      const providerId = safeModelDisplay(entry.provider.id, 'provider')
+      const providerName = safeModelDisplay(entry.provider.name, providerId.text)
+      truncated ||= providerId.truncated || providerName.truncated
+      const visibleModels = entry.models.slice(0, remaining).map((model) => {
+        const modelId = safeModelDisplay(model.id, 'model')
+        const modelName = safeModelDisplay(model.name, modelId.text)
+        truncated ||= modelId.truncated || modelName.truncated
+        return {
+          provider: model.provider,
+          id: model.id,
+          displayId: modelId.text,
+          name: modelName.text,
+        }
+      })
+      if (visibleModels.length < entry.models.length) truncated = true
+      remaining -= visibleModels.length
+      groups.push({
+        id: entry.provider.id,
+        displayId: providerId.text,
+        name: providerName.text,
+        models: visibleModels,
+      })
+    }
+    return {
+      groups: Object.freeze(groups),
+      providerIds,
+      partial,
+      truncated,
+    }
+  }
+
+  private scheduleModelSwitch(route: MessageRoute, input: string): Promise<void> {
+    return this.enqueueConversationBarrier(route.sessionBaseId, async () => {
+      const deliveryOptions = routeDeliveryOptions(route)
+      const requested = modelTarget(input)
+      if (requested === undefined) {
+        await this.safeSend(route.chatId, this.text.modelUnknown, deliveryOptions)
+        return
+      }
+      const store = this.conversationBindings
+      if (store === undefined || sessionPersistenceOf(this.ctx) === undefined) {
+        await this.safeSend(route.chatId, this.text.modelSwitchFailed, deliveryOptions)
+        return
+      }
+      if (route.mutationHash !== undefined
+        && store.read(route.sessionBaseId)?.mutationHashes.includes(route.mutationHash)) {
+        await this.safeSend(route.chatId, this.text.modelMutationReplayed, deliveryOptions)
+        return
+      }
+
+      let llm: LlmRuntimeLike
+      let selected: ConversationModelSelection
+      try {
+        const runtime = llmRuntimeOf(this.ctx)
+        if (runtime === undefined) {
+          await this.safeSend(route.chatId, this.text.modelUnavailable, deliveryOptions)
+          return
+        }
+        llm = runtime
+        selected = await this.resolveModelSelection(runtime, requested, this.commandAbort.signal)
+      } catch (error) {
+        this.ctx.logger.warn('[lark] model selection validation failed (%s)', modelFailureTag(error))
+        await this.safeSend(route.chatId, this.text.modelUnknown, deliveryOptions)
+        return
+      }
+
+      await this.withConversation(route.sessionBaseId, async (conversation) => {
+        await this.sessionOperations.get(conversation.baseId)
+        await this.switchModel(route, conversation, llm, selected)
+      })
+    })
+  }
+
+  private async resolveModelSelection(
+    llm: LlmRuntimeLike,
+    requested: ConversationModelSelection,
+    signal: AbortSignal,
+  ): Promise<ConversationModelSelection> {
+    const resolved = await llm.resolveCallConfig({
+      provider: requested.provider,
+      model: requested.model,
+    }, signal)
+    const selection = modelSelectionFromConfig(resolved)
+    if (selection === undefined) throw new TypeError('lark: resolved model selection is invalid')
+    return selection
+  }
+
+  private async switchModel(
+    route: MessageRoute,
+    conversation: ConversationSession,
+    llm: LlmRuntimeLike,
+    selected: ConversationModelSelection,
+  ): Promise<void> {
+    const deliveryOptions = routeDeliveryOptions(route)
+    const previousHandle = conversation.handle
+    const previousSessionId = conversation.sessionId
+    const alreadyCurrent = sameModelSelection(conversation.modelSelection, selected)
+    let maintenance: Promise<ModelSwitchMaintenanceResult>
+    try {
+      maintenance = previousHandle.agent.runMaintenance(async (signal) => {
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return 'busy'
+        try {
+          this.materializeFreshHandle(previousHandle)
+          const durable = await this.ctx.sessions.flush(previousHandle.agent.session)
+          if (durable !== true) return 'failed'
+          const revalidated = await this.resolveModelSelection(llm, selected, signal)
+          if (!sameModelSelection(revalidated, selected)) return 'unavailable'
+          if (signal.aborted || previousHandle.agent.inbox.hasPending) return 'busy'
+          await this.putConversationBinding(
+            conversation.baseId,
+            this.modelConversationBinding(
+              conversation.baseId,
+              previousSessionId,
+              selected,
+              route.mutationHash,
+            ),
+          )
+          conversation.modelSelection = selected
+          conversation.modelSelectionRef.current = {
+            provider: selected.provider,
+            model: selected.model,
+          }
+          return alreadyCurrent ? 'already-current' : 'committed'
+        } catch (error) {
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          this.ctx.logger.warn('[lark] model switch checkpoint failed (%s)', modelFailureTag(error))
+          return 'failed'
+        }
+      })
+    } catch {
+      await this.safeSend(route.chatId, this.text.modelBusy, deliveryOptions)
+      return
+    }
+
+    let result: ModelSwitchMaintenanceResult
+    try {
+      result = await maintenance
+    } catch (error) {
+      if (error instanceof BindingConfirmationInterruptedError) throw error
+      this.ctx.logger.warn('[lark] model switch maintenance failed (%s)', modelFailureTag(error))
+      await this.safeSend(route.chatId, this.text.modelSwitchFailed, deliveryOptions)
+      return
+    }
+    if (result === 'busy') {
+      await this.safeSend(route.chatId, this.text.modelBusy, deliveryOptions)
+      return
+    }
+    if (result === 'unavailable') {
+      await this.safeSend(route.chatId, this.text.modelUnknown, deliveryOptions)
+      return
+    }
+    if (result === 'failed') {
+      await this.safeSend(route.chatId, this.text.modelSwitchFailed, deliveryOptions)
+      return
+    }
+    if (result === 'already-current') {
+      await this.safeSend(route.chatId, this.text.modelAlreadyCurrent(selected), deliveryOptions)
+      return
+    }
+    await this.safeSend(route.chatId, this.text.modelSwitched(selected), deliveryOptions)
   }
 
   private commandRuntime(): CommandRuntimeLike | undefined {
@@ -1687,7 +2101,7 @@ export class LarkBridge {
           if (durable !== true) throw new Error('no durability listener participated')
           await this.putConversationBinding(
             baseId,
-            this.currentConversationBinding(baseId, previousSessionId),
+            this.currentConversationBinding(baseId, previousSessionId, conversation.modelSelection),
           )
         } catch (error) {
           if (error instanceof BindingConfirmationInterruptedError) throw error
@@ -1698,6 +2112,7 @@ export class LarkBridge {
 
         let sessionId: ReturnType<typeof SessionId>
         let handle: AgentHandle
+        let modelSelectionRef: ModelSelectionRef
         try {
           const composition = activeSessionComposition(previousHandle.agent.session)
           const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
@@ -1709,7 +2124,9 @@ export class LarkBridge {
             false,
             composition.agentPreset,
             composition.cwd ?? this.cwd,
+            conversation.modelSelection,
           )
+          modelSelectionRef = this.modelSelectionFor(handle)
         } catch (error) {
           this.ctx.logger.error('[lark] fresh session creation failed: %s', messageOf(error))
           return { kind: 'failed' }
@@ -1734,7 +2151,12 @@ export class LarkBridge {
         try {
           await this.putConversationBinding(
             baseId,
-            this.mutatedConversationBinding(baseId, String(sessionId), route.mutationHash),
+            this.mutatedConversationBinding(
+              baseId,
+              String(sessionId),
+              conversation.modelSelection,
+              route.mutationHash,
+            ),
           )
         } catch (error) {
           this.ctx.logger.error('[lark] fresh session binding commit failed: %s', messageOf(error))
@@ -1745,6 +2167,7 @@ export class LarkBridge {
 
         conversation.handle = handle
         conversation.sessionId = String(sessionId)
+        conversation.modelSelectionRef = modelSelectionRef
         this.clearSessionState(previousSessionId)
         return {
           kind: 'committed',
@@ -2131,18 +2554,29 @@ export class LarkBridge {
 
   private async openConversation(baseId: string): Promise<ConversationSession> {
     const binding = await this.resolveSessionBinding(baseId)
+    const modelSelection = binding.modelSelection ?? this.defaultModelSelection()
     const handle = await this.ensureHandle(
       binding.sessionId,
       binding.persisted,
       false,
       binding.agentPreset,
+      this.cwd,
+      modelSelection,
     )
     const sessionId = binding.sessionId
+    const modelSelectionRef = this.modelSelectionFor(handle)
     this.lastSessionGenerations.set(
       baseId,
       Math.max(this.lastSessionGenerations.get(baseId) ?? 0, binding.generation),
     )
-    const entry: ConversationSession = { baseId, handle, sessionId: String(sessionId), lastAccess: 0 }
+    const entry: ConversationSession = {
+      baseId,
+      handle,
+      sessionId: String(sessionId),
+      modelSelection,
+      modelSelectionRef,
+      lastAccess: 0,
+    }
     this.conversations.set(baseId, entry)
     this.touchConversation(entry)
     return entry
@@ -2177,21 +2611,40 @@ export class LarkBridge {
         throw new Error(`lark: committed session "${String(sessionId)}" is not uniquely persisted`)
       }
       const agentPreset = optionalAgentPreset(matches[0]?.agentPreset)
+      const modelSelection = committed.modelSelection
+        ?? await this.persistedModelSelection(persistence, sessionId)
       return {
         sessionId,
         persisted: true,
         generation: committed.generation,
+        modelSelection,
         ...(agentPreset === undefined ? {} : { agentPreset }),
       }
     }
     if (persistence === undefined) {
-      return { sessionId: SessionId(baseId), persisted: false, generation: 0 }
+      return { sessionId: SessionId(baseId), persisted: false, generation: 0, modelSelection: null }
     }
     if (typeof persistence.list !== 'function') {
       throw new TypeError('lark: sessionPersistence.list is unavailable')
     }
-    return latestSessionBinding(baseId, await persistence.list())
-      ?? { sessionId: SessionId(baseId), persisted: false, generation: 0 }
+    const latest = latestSessionBinding(baseId, await persistence.list())
+    if (latest === undefined) {
+      return { sessionId: SessionId(baseId), persisted: false, generation: 0, modelSelection: null }
+    }
+    return {
+      ...latest,
+      modelSelection: await this.persistedModelSelection(persistence, latest.sessionId),
+    }
+  }
+
+  private async persistedModelSelection(
+    persistence: SessionPersistenceLike,
+    sessionId: ReturnType<typeof SessionId>,
+  ): Promise<ConversationModelSelection | null> {
+    if (persistence.inspect === undefined) return null
+    const inspected = await persistence.inspect(sessionId)
+    const header = foldRequestHeader(inspected.events as readonly SessionEvent[])
+    return modelSelectionFromConfig(header?.config) ?? null
   }
 
   private async putConversationBinding(
@@ -2246,9 +2699,13 @@ export class LarkBridge {
     }
   }
 
-  private currentConversationBinding(baseId: string, sessionId: string): ConversationBinding {
-    const binding = conversationBinding(baseId, sessionId)
+  private currentConversationBinding(
+    baseId: string,
+    sessionId: string,
+    modelSelection: ConversationModelSelection,
+  ): ConversationBinding {
     const current = this.conversationBindings?.read(baseId)
+    const binding = conversationBinding(baseId, sessionId, modelSelection)
     if (current?.generation === binding.generation && current.suffix === binding.suffix) {
       return { ...binding, mutationHashes: current.mutationHashes }
     }
@@ -2258,13 +2715,37 @@ export class LarkBridge {
   private mutatedConversationBinding(
     baseId: string,
     sessionId: string,
+    modelSelection: ConversationModelSelection,
     mutationHash: string | undefined,
   ): ConversationBinding {
     const mutationHashes = appendMutationHash(
       this.conversationBindings?.read(baseId)?.mutationHashes ?? [],
       mutationHash,
     )
-    return conversationBinding(baseId, sessionId, mutationHashes)
+    return conversationBinding(baseId, sessionId, modelSelection, mutationHashes)
+  }
+
+  private modelConversationBinding(
+    baseId: string,
+    sessionId: string,
+    modelSelection: ConversationModelSelection,
+    mutationHash: string | undefined,
+  ): ConversationBinding {
+    const mutationHashes = appendMutationHash(
+      this.conversationBindings?.read(baseId)?.mutationHashes ?? [],
+      mutationHash,
+    )
+    return conversationBinding(baseId, sessionId, modelSelection, mutationHashes)
+  }
+
+  private defaultModelSelection(): ConversationModelSelection {
+    return Object.freeze({ provider: this.provider, model: this.model })
+  }
+
+  private modelSelectionFor(handle: AgentHandle): ModelSelectionRef {
+    const selection = this.modelSelections.get(handle.agent)
+    if (selection === undefined) throw new Error('lark: conversation model selection was not installed')
+    return selection
   }
 
   private async ensureHandle(
@@ -2273,11 +2754,19 @@ export class LarkBridge {
     materialize = false,
     persistedAgentPreset?: string,
     cwd = this.cwd,
+    modelSelection: ConversationModelSelection | null = null,
   ): Promise<AgentHandle> {
     const key = String(sessionId)
     const existing = this.handles.get(key)
     if (existing !== undefined) return existing
-    const opened = this.openHandle(sessionId, persisted, materialize, persistedAgentPreset, cwd)
+    const opened = this.openHandle(
+      sessionId,
+      persisted,
+      materialize,
+      persistedAgentPreset,
+      cwd,
+      modelSelection,
+    )
     this.handles.set(key, opened)
     try {
       const handle = await opened
@@ -2297,8 +2786,13 @@ export class LarkBridge {
     materialize: boolean,
     persistedAgentPreset?: string,
     cwd = this.cwd,
+    modelSelection: ConversationModelSelection | null = null,
   ): Promise<AgentHandle> {
-    const agentOptions = { provider: this.provider, model: this.model }
+    const agentOptions = modelSelection ?? this.defaultModelSelection()
+    const modelSelectionRef: ModelSelectionRef = {
+      current: { provider: agentOptions.provider, model: agentOptions.model },
+      assembled: undefined,
+    }
     const presets = agentPresetsOf(this.ctx)
     const requestedPreset = persisted
       ? (presets === undefined
@@ -2306,22 +2800,26 @@ export class LarkBridge {
           : await this.persistedAgentPreset(sessionId, persistedAgentPreset))
       : optionalAgentPreset(persistedAgentPreset)
     const composition = await this.agentComposition(presets, requestedPreset)
-    if (persisted) {
-      return this.ctx.agents.resume({
+    const setup = async (agentCtx: Context): Promise<void> => {
+      installModelSelection(agentCtx, modelSelectionRef)
+      await composition.setup?.(agentCtx)
+    }
+    const handle = persisted
+      ? await this.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions,
-        ...(composition.setup === undefined ? {} : { setup: composition.setup }),
+        setup,
       })
-    }
-    const handle = await this.ctx.agents.create({
-      sessionId,
-      meta: {
-        cwd,
-        ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
-      },
-      agentOptions,
-      ...(composition.setup === undefined ? {} : { setup: composition.setup }),
-    })
+      : await this.ctx.agents.create({
+        sessionId,
+        meta: {
+          cwd,
+          ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
+        },
+        agentOptions,
+        setup,
+      })
+    this.modelSelections.set(handle.agent, modelSelectionRef)
     if (!materialize) return handle
     try {
       this.materializeFreshHandle(handle)

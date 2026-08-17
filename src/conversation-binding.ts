@@ -3,9 +3,15 @@ import type { Domain, DomainFacility, KvTable } from '@deepseek-ai/dsh-storage-d
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 
+export interface ConversationModelSelection {
+  readonly provider: string
+  readonly model: string
+}
+
 export interface ConversationBinding {
   readonly generation: number
   readonly suffix: string | null
+  readonly modelSelection: ConversationModelSelection | null
   readonly mutationHashes: readonly string[]
 }
 
@@ -17,12 +23,16 @@ export interface ConversationBindingStore {
 
 type ConversationKey = string & { readonly __conversationKey: unique symbol }
 
-const CONVERSATION_BINDING_SCHEMA_VERSION = 1
+const LEGACY_CONVERSATION_BINDING_SCHEMA_VERSION = 1
+const CONVERSATION_BINDING_SCHEMA_VERSION = 2
 export const CONVERSATION_MUTATION_HISTORY_LIMIT = 1_024
 const CONVERSATION_KEY_PATTERN = /^[0-9a-f]{64}$/u
 const CONVERSATION_KEY_HASH_DOMAIN = 'dsh-plugin-lark/conversation-binding/v1'
 const SESSION_SUFFIX_PATTERN = /^([1-9]\d{0,15})-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
 const MUTATION_HASH_PATTERN = /^[0-9a-f]{64}$/u
+const CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const MAX_PROVIDER_ID_LENGTH = 256
+const MAX_MODEL_ID_LENGTH = 512
 
 const generationSchema = z.number()
   .int()
@@ -37,20 +47,53 @@ const mutationHashesSchema = z.array(z.string().regex(MUTATION_HASH_PATTERN))
   })
   .readonly()
 
+function modelIdentifierSchema(name: 'provider' | 'model', maxLength: number) {
+  return z.string()
+    .max(maxLength, `conversation model ${name} exceeds ${maxLength} characters`)
+    .refine((value) => value !== '' && value.trim() === value, {
+      message: `conversation model ${name} must be a non-blank trimmed string`,
+    })
+    .refine((value) => value.isWellFormed(), {
+      message: `conversation model ${name} must be well-formed Unicode`,
+    })
+    .refine((value) => !CONTROL_CHARACTER_PATTERN.test(value), {
+      message: `conversation model ${name} must not contain control characters`,
+    })
+}
+
+const conversationModelSelectionSchema = z.object({
+  provider: modelIdentifierSchema('provider', MAX_PROVIDER_ID_LENGTH),
+  model: modelIdentifierSchema('model', MAX_MODEL_ID_LENGTH),
+}).strict()
+
 const conversationBindingSchema = z.object({
   generation: generationSchema,
   suffix: z.string().regex(SESSION_SUFFIX_PATTERN).nullable(),
+  modelSelection: conversationModelSelectionSchema.nullable(),
   mutationHashes: mutationHashesSchema,
 }).strict().refine(bindingMatchesGeneration, {
   message: 'conversation binding suffix does not match its generation',
 })
 
-const storedConversationBindingSchema = z.object({
-  schemaVersion: z.literal(CONVERSATION_BINDING_SCHEMA_VERSION),
+const storedConversationBindingV1Schema = z.object({
+  schemaVersion: z.literal(LEGACY_CONVERSATION_BINDING_SCHEMA_VERSION),
   generation: generationSchema,
   suffix: z.string().regex(SESSION_SUFFIX_PATTERN).nullable(),
   mutationHashes: mutationHashesSchema,
-}).strict().refine(bindingMatchesGeneration, {
+}).strict()
+
+const storedConversationBindingV2Schema = z.object({
+  schemaVersion: z.literal(CONVERSATION_BINDING_SCHEMA_VERSION),
+  generation: generationSchema,
+  suffix: z.string().regex(SESSION_SUFFIX_PATTERN).nullable(),
+  modelSelection: conversationModelSelectionSchema.nullable(),
+  mutationHashes: mutationHashesSchema,
+}).strict()
+
+const storedConversationBindingSchema = z.discriminatedUnion('schemaVersion', [
+  storedConversationBindingV1Schema,
+  storedConversationBindingV2Schema,
+]).refine(bindingMatchesGeneration, {
   message: 'persisted conversation binding suffix does not match its generation',
 })
 
@@ -69,7 +112,10 @@ export const larkConversationsDomainSpec = defineDomain({
 type ConversationsDomain = Domain<typeof larkConversationsDomainSpec>
 type ConversationTable = KvTable<ConversationKey, StoredConversationBinding>
 
-function bindingMatchesGeneration(binding: ConversationBinding): boolean {
+function bindingMatchesGeneration(binding: {
+  readonly generation: number
+  readonly suffix: string | null
+}): boolean {
   if (binding.generation === 0) return binding.suffix === null
   if (binding.suffix === null) return false
   const match = SESSION_SUFFIX_PATTERN.exec(binding.suffix)
@@ -98,9 +144,17 @@ function conversationKey(appId: string, baseId: string): ConversationKey {
 }
 
 function publicBinding(binding: StoredConversationBinding): ConversationBinding {
+  const modelSelection = binding.schemaVersion === LEGACY_CONVERSATION_BINDING_SCHEMA_VERSION
+    || binding.modelSelection === null
+    ? null
+    : Object.freeze({
+        provider: binding.modelSelection.provider,
+        model: binding.modelSelection.model,
+      })
   return Object.freeze({
     generation: binding.generation,
     suffix: binding.suffix,
+    modelSelection,
     mutationHashes: Object.freeze([...binding.mutationHashes]),
   })
 }
@@ -154,10 +208,17 @@ export class DurableConversationBindingStore implements ConversationBindingStore
     }
     const key = conversationKey(this.appId, baseId)
     const parsed = conversationBindingSchema.parse(binding)
+    const modelSelection = parsed.modelSelection === null
+      ? null
+      : Object.freeze({
+          provider: parsed.modelSelection.provider,
+          model: parsed.modelSelection.model,
+        })
     const stored = Object.freeze({
       schemaVersion: CONVERSATION_BINDING_SCHEMA_VERSION,
       generation: parsed.generation,
       suffix: parsed.suffix,
+      modelSelection,
       mutationHashes: Object.freeze([...parsed.mutationHashes]),
     })
     const operation = this.operationTail.then(() => this.table.put(key, stored))

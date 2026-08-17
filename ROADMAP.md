@@ -63,9 +63,14 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Serialize project changes against true Agent maintenance and bind replies to claimed message IDs across concurrent Lark and Web input.
 - Reject an interrupted ambiguous mutation callback without a receipt, and require a fresh Bridge/storage remount before recovery.
 
-## Later 0.x — Usability
+## 0.8.0 — Conversation models
 
-- Let each conversation select and persist an available provider/model without cross-session leakage.
+- Let an authorized conversation list live providers and their advertised models, then select an exact provider/model route, including dynamic model IDs resolved by the serving adapter.
+- Treat model catalogs as advisory discovery rather than routing allowlists or credential-health probes.
+- Persist the selected route within the exact conversation scope, restore it after restart or idle-handle eviction, and carry it into fresh generations created by `/new`, `/clear`, or `/project`.
+- Switch only from true-idle maintenance, fail closed around existing running or pending work, retain input admitted during the atomic commit, and update one Agent-scoped step-snapshot selector without replacing the live Handle.
+- Keep model choices isolated between direct chats, reply trees, and native threads while preserving the intentional global sharing of `defaultSessionId`.
+- Protect model mutations against receipt-loss replay without changing the Harness-wide default model for unrelated conversations.
 
 ## 1.0 — Stable release
 
