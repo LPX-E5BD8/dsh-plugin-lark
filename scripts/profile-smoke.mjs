@@ -22,7 +22,13 @@ const run = promisify(execFile)
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const expectedDshVersion = '0.1.0-rc.6'
 const expectedPnpmVersion = '10.15.0'
+const expectedNpmBefore = '2026-08-14T00:00:00.000Z'
 const packageName = 'dsh-plugin-lark'
+assert.equal(
+  process.env.npm_config_before,
+  expectedNpmBefore,
+  'profile smoke must resolve the rc.6 tool graph from its pinned registry snapshot',
+)
 const cleanOnlyValue = process.env.DSH_PROFILE_CLEAN_ONLY
 assert.ok(
   cleanOnlyValue === undefined || cleanOnlyValue === '1',
