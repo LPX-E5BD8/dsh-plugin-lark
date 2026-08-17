@@ -8,11 +8,12 @@ on:
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -28,10 +29,83 @@ jobs:
         run: npm run check:release-version
       - run: npm run check
       - run: npm audit --omit=dev
+      - name: Download and verify the Web-profile upgrade baseline
+        id: upgrade-baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_DIR: ${{ runner.temp }}/upgrade-baseline
+          BASELINE_TAG: v0.8.3
+          BASELINE_COMMIT: 886fdb68e39de90e3e225b4d7738fef002a4c04a
+          BASELINE_DIGEST: sha256:e2138bac969bad1afd628428b749313ef7431634bb1818c857b8422c08e1ee36
+        run: |
+          set -eu
+          test ! -e "$BASELINE_DIR"
+          mkdir "$BASELINE_DIR"
+          chmod 700 "$BASELINE_DIR"
+          version="${BASELINE_TAG#v}"
+          archive_name="dsh-plugin-lark-${version}.tgz"
+          archive_path="$BASELINE_DIR/$archive_name"
+          gh release download "$BASELINE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$archive_name" \
+            --dir "$BASELINE_DIR"
+          test -f "$archive_path"
+          test "$(find "$BASELINE_DIR" -maxdepth 1 -type f -name '*.tgz' | wc -l)" -eq 1
+          archive_sha="$(sha256sum -- "$archive_path")"
+          archive_sha="${archive_sha%% *}"
+          test "sha256:${archive_sha}" = "$BASELINE_DIGEST"
+
+          tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${BASELINE_TAG}" --jq '.object.type + ":" + .object.sha')"
+          object_type="${tag_object%%:*}"
+          object_sha="${tag_object#*:}"
+          test "$object_type" = 'tag'
+          peel_depth=0
+          while [ "$object_type" = 'tag' ]; do
+            peel_depth=$((peel_depth + 1))
+            test "$peel_depth" -le 8
+            tag_object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" --jq '.object.type + ":" + .object.sha')"
+            object_type="${tag_object%%:*}"
+            object_sha="${tag_object#*:}"
+          done
+          test "$object_type" = 'commit'
+          test "$object_sha" = "$BASELINE_COMMIT"
+
+          release_json="$(gh release view "$BASELINE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,isDraft,isPrerelease,targetCommitish)"
+          printf '%s' "$release_json" | jq -e \
+            --arg commit "$BASELINE_COMMIT" --arg name "$archive_name" --arg digest "$BASELINE_DIGEST" \
+            '.targetCommitish == $commit and .isDraft == false and .isPrerelease == false
+              and ([.assets[] | select(.name == $name and .state == "uploaded" and .digest == $digest)] | length) == 1
+              and ([.assets[] | select(.name == $name)] | length) == 1' >/dev/null
+          packed_version="$(tar -xOf "$archive_path" package/package.json | node -e "let value=''; process.stdin.on('data', chunk => value += chunk); process.stdin.on('end', () => console.log(JSON.parse(value).version))")"
+          test "$packed_version" = "$version"
+
+          verification="$RUNNER_TEMP/upgrade-baseline-provenance.json"
+          gh attestation verify "$archive_path" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+            --source-ref refs/heads/main \
+            --source-digest "$BASELINE_COMMIT" \
+            --deny-self-hosted-runners \
+            --format json > "$verification"
+          jq -e --arg name "$archive_name" --arg digest "$archive_sha" \
+            'any(.[]; any(.verificationResult.statement.subject[]; .name == $name and .digest.sha256 == $digest))' \
+            "$verification" >/dev/null
+          echo "path=${archive_path}" >> "$GITHUB_OUTPUT"
       - name: Pack and install the release archive
         env:
           DSH_PACK_ARTIFACT_DIR: ${{ runner.temp }}/release-package
         run: npm run test:pack
+      - name: Verify packed Web-profile install and upgrade
+        env:
+          DSH_PROFILE_BASELINE_PACKAGE: ${{ steps.upgrade-baseline.outputs.path }}
+          DSH_PROFILE_CANDIDATE_DIR: ${{ runner.temp }}/release-package
+        run: |
+          set -eu
+          version="$(node -p "require('./package.json').version")"
+          export DSH_PROFILE_CANDIDATE_PACKAGE="$DSH_PROFILE_CANDIDATE_DIR/dsh-plugin-lark-${version}.tgz"
+          npm run test:profile
       - name: Upload the tested release archive
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -30,9 +30,11 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持；已通过基于 lockfile 的 Linux CI、真实组装 Harness 端到端测试和隔离的打包消费安装 |
+| `0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持；已通过基于 lockfile 的 Linux CI、真实组装 Harness 端到端测试和隔离的打包消费安装；从 `0.8.4` 起还覆盖标准 rc.6 Web profile 的 package lifecycle 组合 |
 
-必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、JSONL 持久化、JSON storage-domain、Tools 与 Approval 服务；平台连接、模型 provider、Workspace registry 和浏览器入口则使用受控替身。内置 patch 面向标准 rc.6 Web profile，但真实的 `dsh --profile web` 安装、凭据和飞书/Lark 网络链路仍属于部署冒烟检查，不是 CI 已覆盖范围。
+必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、JSONL 持久化、JSON storage-domain、Tools 与 Approval 服务；平台连接、模型 provider、Workspace registry 和浏览器入口则使用受控替身。从 `0.8.4` 起，CI 还会把打包得到的同一份候选 archive 全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从已验证的 v0.8.3 Release package 升级到该候选版本。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层；升级路径还会确认 profile 用户 patch 保持不变。
+
+该 Web profile 门禁刻意不启动应用：它验证 package 安装、升级、bundle 解析与配置组合，但不会启动 Web app，也不覆盖凭据、SDK WebSocket 连接、`/api/lark/health`、飞书/Lark 网络链路或持久化状态迁移；这些仍属于部署和真实凭据冒烟检查。
 
 插件会把直接宿主 peer 固定在这组基线上，解析图中的所有 DSH 软件包也必须来自同一个 rc.6 版本组。混用 DSH 版本、Node.js 23 或更高版本、更高版本的 Cordis 或 Schemastery、其他 Harness 版本组、非 Linux 宿主、替代持久化栈，以及完全缺少可选 Approval 服务的宿主都尚未验证。自定义 profile 只有在提供[配置](#配置)章节所述服务时才受支持；缺少 `agents` 或持久化 `storageDomain` 明确不受支持。
 
@@ -69,7 +71,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.8.3'
+version='0.8.4'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
