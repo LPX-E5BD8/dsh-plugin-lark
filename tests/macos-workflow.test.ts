@@ -22,15 +22,16 @@ function step(jobSource: string, name: string): string {
   return nextStep === -1 ? remainder : remainder.slice(0, nextStep)
 }
 
-test('macOS gate verifies one exact arm64 and Node.js 22 package runtime', () => {
+test('macOS gate verifies exact arm64 Node.js 22 and 24 package runtimes', () => {
   const macos = job('macos')
   const download = step(macos, 'Download the canonical release archive')
   const verify = step(macos, 'Verify macOS 26 arm64 package compatibility')
 
-  assert.match(macos, /^    name: macOS package compatibility$/mu)
+  assert.match(macos, /^    name: macOS package compatibility \(Node\.js \$\{\{ matrix\.node \}\}\)$/mu)
   assert.match(macos, /^    needs: linux_release$/mu)
   assert.match(macos, /^    runs-on: macos-26$/mu)
   assert.match(macos, /^    timeout-minutes: 15$/mu)
+  assert.match(macos, /^    strategy:\n      fail-fast: false\n      matrix:\n        node: \[22, 24\]$/mu)
   assert.match(macos, /^    permissions:\n      contents: read$/mu)
   assert.doesNotMatch(macos, /continue-on-error|if:\s+false|attestations:|id-token:|contents: write/u)
 
@@ -39,12 +40,14 @@ test('macOS gate verifies one exact arm64 and Node.js 22 package runtime', () =>
   assert.match(download, /path: \$\{\{ runner\.temp \}\}\/release-package/u)
   assert.match(download, /^          digest-mismatch: error$/mu)
 
+  assert.match(macos, /node-version: \$\{\{ matrix\.node \}\}/u)
   assert.match(verify, /PACKAGE_DIR: \$\{\{ runner\.temp \}\}\/release-package/u)
+  assert.match(verify, /EXPECTED_NODE_MAJOR: \$\{\{ matrix\.node \}\}/u)
   assert.match(verify, /npm_config_engine_strict: 'true'/u)
   assert.match(verify, /process\.platform \+ ':' \+ process\.arch/u)
   assert.match(verify, /= 'darwin:arm64'/u)
   assert.match(verify, /process\.versions\.node\.split\('\.'\)\[0\]/u)
-  assert.match(verify, /= '22'/u)
+  assert.match(verify, /= "\$EXPECTED_NODE_MAJOR"/u)
   assert.match(verify, /sw_vers -productVersion/u)
   assert.match(verify, /in 26\.\*\)/u)
   const commands = [
