@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-lark",
   "description": "Feishu/Lark bridge for DeepSeek Harness with turn, tool, and approval cards",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "author": "LPX-E5BD8",
   "type": "module",
   "repository": {
@@ -29,7 +29,9 @@
     "README.zh-CN.md",
     "ROADMAP.md",
     "SMOKE_TESTS.md",
-    "SECURITY.md"
+    "SECURITY.md",
+    "UPGRADING.md",
+    "UPGRADING.zh-CN.md"
   ],
   "license": "Apache-2.0",
   "keywords": [

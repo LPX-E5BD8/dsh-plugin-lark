@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
@@ -29,6 +29,11 @@ try {
     '--no-package-lock',
     join(temporary, archiveName),
   ], { cwd: consumer, env })
+  const installedPackage = join(consumer, 'node_modules', 'dsh-plugin-lark')
+  for (const document of ['UPGRADING.md', 'UPGRADING.zh-CN.md']) {
+    const metadata = await stat(join(installedPackage, document))
+    assert.ok(metadata.isFile(), `packed package did not include ${document}`)
+  }
   const installed = JSON.parse((await run(
     npm,
     ['ls', '--all', '--json'],

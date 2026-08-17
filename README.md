@@ -50,6 +50,8 @@ dsh plugin --profile web add .
 
 Keep the checkout in place while the profile uses it. An npm registry release is not required.
 
+Before replacing that checkout or rolling back a state-bearing release, follow the cold-snapshot and schema boundaries in [UPGRADING.md](./UPGRADING.md). A plugin downgrade is not automatically a durable-state downgrade.
+
 In the Feishu/Lark developer console:
 
 1. Select **long connection** for event delivery.
