@@ -8,6 +8,7 @@
 
 - **无需入站公网地址：** 通过官方 SDK 的 WebSocket 长连接接收飞书/Lark 事件。
 - **隔离且可恢复的会话：** 私聊、群聊回复树和原生话题分别使用独立的持久化 Harness 会话；需要时也可显式绑定到一个全局共享会话。
+- **有界会话导航：** 在精确会话范围内用已存标题、时间、项目标签和不透明引用列出合格历史，并原子恢复所选 transcript；不接受原始 Session ID 或路径。
 - **项目注册与按会话选择：** 项目管理员可在私聊中注册当前 Session 目录或移除注册；所有已授权会话都能列出和选择已注册 Workspace，聊天参数不能指定任意路径。
 - **按会话选择模型：** 列出已挂载 provider 及其公布的模型，接受 adapter 可解析的精确 provider/model 路由，并在新 generation 与恢复过程中保留每个会话的选择。
 - **实时执行卡片：** 将思考过程、待办、重试、上下文压缩、Hook、工作流、工具调用与结果、Token 用量和最终答案持续更新到一张有大小上限的 Card 2.0 卡片中。
@@ -23,6 +24,7 @@
 - 一组版本一致的 DeepSeek Harness `0.1.0-rc.6` 软件包
 - Harness `agents` 与 `sessions` 服务；标准 Web profile 已挂载两者
 - 持久化的 `storageDomain` 服务；标准 Web profile 已提供基于 JSON 的完整存储栈
+- 会话导航还要求 `sessionPersistence`、`sessionQuery` 与 `workspaceRegistry`；标准 rc.6 Web profile 已提供这些服务
 - 一个带机器人的飞书或 Lark 自建应用
 
 ### 支持的 Harness 兼容矩阵
@@ -31,13 +33,13 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性、脱敏分类 SDK 失败、绝不通过另一写接口重试已拒绝的 Card patch，并让审批投递保持默认拒绝。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加真实 rc.6 Session Query、Session Title fallback、JSONL 持久化和 Workspace 生命周期覆盖，验证有界精确范围列表与按精确引用原子恢复。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
 | `0.8.0`–`0.8.4` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持原有 Node 22/Linux 基线；v0.8.4 新增不启动应用的 Web profile package lifecycle 门禁。 |
 
-必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、JSONL 持久化、JSON storage-domain、Tools、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.1 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
+必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、Tools、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.2 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
 
 Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
 
@@ -84,7 +86,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.2'
+version='0.9.3'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -191,7 +193,7 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
     maxConversationHandles: 32  # 进程内活跃会话句柄的稳态目标
 ```
 
-这组基线要求宿主提供 `agents`、`sessions` 和持久化 `storageDomain` 服务。需要持久化的重置、项目/模型选择与冷恢复还要求 `sessionPersistence`；`/project` 依赖 `workspaceRegistry`，`/model` 依赖 Harness `llm` 服务。审批卡片和 readiness 路由分别依赖可选的 `approval` 与 `webServer` 服务。已验证矩阵使用标准 JSON/JSONL 实现，替代实现仍未验证。
+这组基线要求宿主提供 `agents`、`sessions` 和持久化 `storageDomain` 服务。需要持久化的重置、项目/会话/模型选择与冷恢复还要求 `sessionPersistence`；`/project` 依赖 `workspaceRegistry`，`/session` 还依赖 `sessionQuery` 与持久化会话绑定，`/model` 依赖 Harness `llm` 服务。缺少 Session Query 或 Workspace 能力时，会话导航会返回不可用；单独执行 `/session` 列表不会创建 Agent。审批卡片和 readiness 路由分别依赖可选的 `approval` 与 `webServer` 服务。已验证矩阵使用标准 JSON/JSONL 和 SQLite 精确读取实现，替代实现仍未验证。
 
 `allowFrom` 默认拒绝：当列表为空且 `allowAllUsers: false` 时，所有用户都无权访问。仅当机器人明确需要公开使用时才设置 `allowAllUsers: true`。托管在 `open.larksuite.com` 的应用应使用 `domain: lark`。
 
@@ -199,9 +201,9 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 
 `0.1.0` 已使用真实飞书凭据完成冒烟测试。Lark 域名路径通过官方 SDK 的域名切换和自动化测试覆盖；在宣称 Lark 已完成真实凭据测试前，仍需按发布手册记录一次 Lark 实测。
 
-保持 `defaultSessionId` 为空即可隔离会话。私聊沿用兼容的 `lark:<chatId>` 会话；在群聊中，普通回复树按根消息划分可恢复范围，原生 Lark 话题则按聊天 ID 和话题 ID 划分。`parent_id` 不会用于选择会话。仅当所有已授权私聊、回复树和话题都应共享同一个 Harness 会话、项目和模型选择时，才设置 `defaultSessionId`。
+保持 `defaultSessionId` 为空即可隔离会话。私聊沿用兼容的 `lark:<chatId>` 会话；在群聊中，普通回复树按根消息划分可恢复范围，原生 Lark 话题则按聊天 ID 和话题 ID 划分。`parent_id` 不会用于选择会话。仅当所有已授权私聊、回复树和话题都应共享同一个 Harness 会话、项目、模型选择、会话目录和恢复权限时，才设置 `defaultSessionId`。在这种显式共享模式下，所有已授权用户都能看到同一组有界的会话标题、时间、项目和引用元数据，并能恢复其中合格的条目。
 
-存在 Harness 会话持久化后端时，桥接器会在重启后恢复精确会话范围中已提交的 generation。`/new` 和 `/clear` 只重置当前私聊、回复树或话题；配置了 `defaultSessionId` 时，它们会有意重置全局共享会话。桥接器先分别确认当前 generation 和候选 generation 的检查点，再把精确的活跃绑定原子提交到持久化存储，然后才回复。创建或检查点工作被拒绝时，旧绑定仍保持当前状态；后端中可能已部分发布的候选只会成为 orphan，重启时会被忽略。绑定写入出现歧义错误时，只会 fail-stop 当前会话并持续重试同一个值，直到读回确认，而不会报告不确定结果。尚无已提交绑定的普通进程内聊天可以在没有 `sessionPersistence` 时运行；`/new`、`/clear`、项目选择和模型选择都要求会话持久化与持久化会话绑定 sidecar 同时可用，已有提交绑定的会话在冷恢复时缺少会话持久化也会默认拒绝。
+存在 Harness 会话持久化后端时，桥接器会在重启后恢复精确会话范围中已提交的 generation。`/new` 和 `/clear` 只重置当前私聊、回复树或话题；配置了 `defaultSessionId` 时，它们会有意重置全局共享会话。新 generation 与 `/session resume` 会先分别确认当前和候选 Session 的检查点，再把精确的活跃绑定原子提交到持久化存储，然后才回复。创建、恢复或检查点工作被拒绝时，旧绑定仍保持当前状态；后端中可能已部分发布的候选只会成为 orphan，重启时会被忽略。绑定写入出现歧义错误时，只会 fail-stop 当前会话并持续重试同一个值，直到读回确认，而不会报告不确定结果。尚无已提交绑定的普通进程内聊天可以在没有 `sessionPersistence` 时运行；`/new`、`/clear`、项目、会话和模型选择都要求会话持久化与持久化会话绑定 sidecar 同时可用，已有提交绑定的会话在冷恢复时缺少会话持久化也会默认拒绝。
 
 `maxConversationHandles` 是单个插件实例中活跃会话句柄数量的稳态目标，并非硬并发上限。数量超出目标后，桥接器仅在会话没有活跃 turn、待处理 inbox 工作或桥接器操作，且 `sessions.flush()` 确认有持久化监听器参与后，才释放最近最少使用的句柄。它不会为了腾出空间取消或拒绝这些工作。缺少持久化或检查点失败时会保留句柄，因此活跃数量可以暂时高于目标。一旦终止清理开始，已退役句柄不会被重新使用；清理失败会记录日志，之后的访问会从持久化会话冷恢复。
 
@@ -209,11 +211,17 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 
 `0.3.0` 以前创建的群聊会话以整个聊天为范围，无法安全归属到某个回复根节点。这些数据仍保留用于回滚或导出，但 `0.3.0` 不会自动把它们绑定到新的回复树或话题。私聊会话和显式 `defaultSessionId` 的身份保持兼容。
 
-成功处理的入站消息会记录在一个持久化的 1,024 条回执窗口中，因此正常重启后的 WebSocket 重投不会重复执行 follow-up 或命令。回执介质（Web profile 中通常为 `$DSH_HOME/storages/lark_inbound.json`）只存储 SHA-256 摘要，不保存明文 app、chat 或 message ID。活跃 generation sidecar（`lark_conversations.json`）同样会哈希 app 与会话身份；其最小化版本值只包含 generation 编号、后缀、可选的已选 provider/model ID，以及最多 1,024 个 SHA-256 消息变更摘要的有界历史。当变更已提交但入站回执丢失时，该历史可确保重放的 `/new`、`/clear`、`/project` 或 `/model` 变更保持幂等。它不保存明文 app、会话、chat、message、文件系统身份、单独配置的 provider endpoint 或凭据；已选路由 ID 会按原值存储，因此不要把秘密编码进 ID。自定义 profile 必须先挂载 Harness storage hub、一个持久化 KV 后端以及 `storage-domain`。
+成功处理的入站消息会记录在一个持久化的 1,024 条回执窗口中，因此正常重启后的 WebSocket 重投不会重复执行 follow-up 或命令。回执介质（Web profile 中通常为 `$DSH_HOME/storages/lark_inbound.json`）只存储 SHA-256 摘要，不保存明文 app、chat 或 message ID。活跃 generation sidecar（`lark_conversations.json`）同样会哈希 app 与会话身份；其最小化版本值只包含 generation 编号、后缀、可选的已选 provider/model ID，以及最多 1,024 个 SHA-256 消息变更摘要的有界历史。当变更已提交但入站回执丢失时，该历史可确保重放的 `/new`、`/clear`、`/project`、`/session resume` 或 `/model` 变更保持幂等。它不保存明文 app、会话、chat、message、文件系统身份、单独配置的 provider endpoint 或凭据；已选路由 ID 会按原值存储，因此不要把秘密编码进 ID。自定义 profile 必须先挂载 Harness storage hub、一个持久化 KV 后端以及 `storage-domain`。
 
 投递仍属于至少一次：如果进程在外部副作用完成后、回执提交前硬退出，该副作用仍可能重复。绑定变更还会受到每会话 1,024 条摘要历史的额外保护；早于该有界历史的重放仍可能再次执行。项目注册/移除会先在 binding 中提交该摘要，再修改独立的宿主 Workspace domain，从而阻止旧注册消息在之后已移除项目后重建注册。两个存储之间采用明确的 at-most-once 边界：若摘要提交后、Registry 调用前崩溃，Registry 不产生效果，相同平台消息会被抑制；应先查看 `/project`，再发送一条新命令。Registry 调用或后置条件存在歧义时，所有 Lark 侧 Workspace 变更与附件索引写入默认拒绝，直到重新挂载 Workspace 服务；其他宿主消费者遵循各自的恢复策略。回执窗口已满时若写入失败，较旧回执可能已被淘汰；回调仍会失败，但有效防重窗口可能暂时缩小。不要让多个 Harness 进程共享同一个 JSON 存储根目录，该后端没有跨进程写锁。即使使用不同存储根，多个进程同时连接同一个机器人也不构成精确一次配置。
 
-桥接器命令包括 `/start`（`/help` 的别名）、`/help`、`/new`、`/clear`、`/project`、`/project [Workspace 标题或完整 ID]`、`/project register <名称>`、`/project remove <完整 ID>`、`/model` 和 `/model <provider-id> <model-id>`。直接发送 `/project` 会列出当前及可用注册，但不会泄露文件系统路径。注册路径只能取自当前 Session header，经 canonical 化且必须是现存目录；名称会归一化并限制长度，注册不会重置 Session，也不会立即把它加入 Workspace 索引。同一路径重复注册保持幂等且不会重命名。移除只接受精确完整 ID，也只删除 Registry 元数据：目录、文件、Agent、Session、binding 和 transcript 都保留，仍在运行的 Session 只会变成未分组。选中 Workspace 后会启动空白会话 generation；旧 transcript 继续保留，但聊天历史不会跨项目带入。创建新 generation 前，桥接器必须先确认旧 transcript 的检查点，再重新校验 Workspace；任一检查失败都会保留旧的实时绑定。未知、歧义、目录缺失或未注册的 Workspace 都会被拒绝，当前会话保持不变。
+桥接器命令包括 `/start`（`/help` 的别名）、`/help`、`/new`、`/clear`、`/project`、`/project [Workspace 标题或完整 ID]`、`/project register <名称>`、`/project remove <完整 ID>`、`/session`、`/session list [页码]`、`/session resume <完整引用>`、`/model` 和 `/model <provider-id> <model-id>`。会话恢复不接受标题、原始 Session ID 或文件系统路径。直接发送 `/project` 会列出当前及可用注册，但不会泄露文件系统路径。注册路径只能取自当前 Session header，经 canonical 化且必须是现存目录；名称会归一化并限制长度，注册不会重置 Session，也不会立即把它加入 Workspace 索引。同一路径重复注册保持幂等且不会重命名。移除只接受精确完整 ID，也只删除 Registry 元数据：目录、文件、Agent、Session、binding 和 transcript 都保留，仍在运行的 Session 只会变成未分组。选中 Workspace 后会启动空白会话 generation；旧 transcript 继续保留，但聊天历史不会跨项目带入。创建新 generation 前，桥接器必须先确认旧 transcript 的检查点，再重新校验 Workspace；任一检查失败都会保留旧的实时绑定。未知、歧义、目录缺失或未注册的 Workspace 都会被拒绝，当前会话保持不变。
+
+`/session` 与 `/session list [页码]` 最多展示 200 个合格候选，每页 10 个。每行包含不透明完整引用、最多显示 80 个 Unicode 码点的已存标题、最多 120 个码点的项目标签，以及在 Session 时间戳可表示时生成的 ISO 创建时间。已存 Session Title 可能是由首条人类 prompt 生成的确定性 fallback；清洗和截断只能防止平台标记注入，并不等于内容脱敏。同一精确范围内的所有已授权用户都能看到该标题。列表不会包含原始 Session ID、文件系统路径、完整消息、助手答案或工具正文。
+
+历史候选必须已持久化、属于顶层、未归档、当前不处于 live 状态、被唯一索引到一个当前可用的已注册 Workspace，且其工作目录仍能 canonical 化到该 Workspace。orphan、空白或其他未索引历史、已移除 Workspace 的历史、subagent、有父级或 delegation 的 Session、外部或桥接器保留的 live 历史，以及其他会话范围都会被隐藏。当前已持久化 Session 是唯一允许未索引的例外，也可能显示为未注册项目；仅存在于内存中的新当前 Session 在持久化前可能不会出现在列表。目录最多扫描当前可用 Workspace 索引中的 1,000 个条目；如果无法完整建立这份权限索引，历史导航会默认拒绝，列表最多只保留其他条件合格的当前 Session。
+
+`s_…` 引用是由应用、精确会话 base 和 Session 生成的确定性 SHA-256 标签。只有这些输入保持不变时，它才会跨重启稳定；更换应用、`defaultSessionId` 或回复树/话题范围后不能移植。它不是授权凭据；引用过期时应重新执行 `/session`。恢复会先检查点旧 transcript，重新验证目标与 Workspace，按持久化状态恢复目标的项目、模型、Agent preset、作用域工具和 transcript，确认目标持久化后，再带重放保护原子移动现有 version-2 binding。它不会复制、归档、删除或改写任何 transcript。最终提交前进入的工作会让 Lark 选择回滚；若其他入口已经向恢复目标接纳工作，该 Handle 会保留到工作空闲且持久化，而不会被丢弃。在最终 binding 写入期间进入的工作会向前提交。所选 binding 会在重启和空闲淘汰后保留。当前不提供 archive、unarchive、delete 或 search 命令。
 
 挂载 DSH 命令运行时后，`/help` 还会发现该 Agent 实际可用的命令。标准 DSH Base profile 会提供 `/compact`、`/goal`、`/permission`、`/plan`；与当前通道不兼容的命令不会展示。
 

@@ -10,6 +10,8 @@ import LlmRuntime, { CallId, createUserMessage, LlmAdapter } from '@deepseek-ai/
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
+import SessionTitleService from '@deepseek-ai/dsh-session-title'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
@@ -272,11 +274,17 @@ async function mount(
     await ctx.plugin(StorageDomain, { backend: 'json' })
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
+    await ctx.plugin(SessionTitleService, {
+      fallbackMaxWords: 6,
+      fallbackMaxBytes: 120,
+      maxTitleBytes: 120,
+    })
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(JsonlSessionPersistence, { root, compression: sessionCompression })
+    await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
     await ctx.plugin(ApprovalService)
     if (realWorkspaceCwd !== undefined) await ctx.plugin(WorkspaceRegistry)
     if (preset !== undefined) {
@@ -1435,4 +1443,138 @@ test('harness e2e: first-command registry mutations survive cold owner-context r
   assert.equal(third.ctx.agents.list().length, 1)
   assert.equal(third.ctx.agents.list()[0]?.id, removalSession.id)
   await third.dispose()
+})
+
+test('harness e2e: scoped session navigation resumes committed history and preserves the lineage high-water mark', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-session-navigation-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const projectPath = join(root, 'project')
+  await mkdir(projectPath)
+  const canonicalPath = await realpath(projectPath)
+  const preset: HarnessPreset = { defaultId: 'coding', mounted: [], withEchoTool: true }
+  const adapter = new ScriptedAdapter([
+    textResponse('first generation answer'),
+    textResponse('second generation answer'),
+  ])
+  const first = await mount(
+    root,
+    adapter,
+    undefined,
+    preset,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => first.dispose())
+
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-session-navigation',
+    '/project register Navigation Project',
+  ))
+  const firstAgent = first.ctx.agents.list()[0]
+  assert.ok(firstAgent !== undefined)
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-session-navigation',
+    'first generation marker',
+  ))
+  await waitFor(() => adapter.requests.length === 1)
+  await firstAgent.whenIdle()
+  await waitFor(() => firstAgent.session.events.some((event) => (
+    event.type === 'session/title' && event.data.title === 'first generation marker'
+  )))
+  const workspace = first.ctx.workspaceRegistry.list()[0]
+  assert.ok(workspace !== undefined)
+  await waitFor(() => workspace.sessionIds.some((id) => id === firstAgent.id))
+
+  await first.client.messageHandler?.(conversationCommand('chat-session-navigation', '/new'))
+  const secondAgent = first.ctx.agents.list().find(({ id }) => id !== firstAgent.id)
+  assert.ok(secondAgent !== undefined)
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-session-navigation',
+    'second generation marker',
+  ))
+  await waitFor(() => adapter.requests.length === 2)
+  await secondAgent.whenIdle()
+  await waitFor(() => secondAgent.session.events.some((event) => (
+    event.type === 'session/title' && event.data.title === 'second generation marker'
+  )))
+  await waitFor(() => workspace.sessionIds.some((id) => id === secondAgent.id))
+
+  await first.client.messageHandler?.(conversationCommand('chat-session-navigation', '/session'))
+  const catalog = first.client.sent.at(-1) ?? ''
+  const references = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)].map(([reference]) => reference)
+  assert.equal(references.length, 2)
+  assert.equal(new Set(references).size, 2)
+  assert.doesNotMatch(catalog, new RegExp(String(firstAgent.id), 'u'))
+  assert.doesNotMatch(catalog, new RegExp(String(secondAgent.id), 'u'))
+  assert.equal(catalog.includes(canonicalPath), false)
+  assert.match(catalog, /first generation marker/u)
+  assert.match(catalog, /second generation marker/u)
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  assert.ok(currentLine !== undefined)
+  const currentReference = references.find((reference) => currentLine.includes(reference))
+  assert.ok(currentReference !== undefined)
+  const historicalReference = references.find((reference) => reference !== currentReference)
+  assert.ok(historicalReference !== undefined)
+
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-session-navigation-other',
+    `/session resume ${historicalReference}`,
+  ))
+  assert.match(first.client.sent.at(-1) ?? '', /没有该可恢复会话引用/u)
+
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-session-navigation',
+    `/session resume ${historicalReference}`,
+  ))
+  assert.match(first.client.sent.at(-1) ?? '', /已恢复所选会话/u)
+  assert.equal(first.ctx.agents.list().some(({ id }) => id === firstAgent.id), true)
+
+  const secondGeneration = Number(/^.+:(\d+)-/u.exec(String(secondAgent.id))?.[1])
+  assert.ok(Number.isSafeInteger(secondGeneration))
+  const orphanGeneration = secondGeneration + 10_000
+  const orphanId = SessionId(
+    `lark:chat-session-navigation:${orphanGeneration}-00000000-0000-4000-8000-000000000001`,
+  )
+  const orphan = await first.ctx.agents.create({
+    sessionId: orphanId,
+    meta: { cwd: canonicalPath },
+    agentOptions: { provider: 'mock', model: 'mock' },
+  })
+  orphan.agent.session.append('todo/write', { todos: [] })
+  assert.equal(await first.ctx.sessions.flush(orphan.agent.session), true)
+  await orphan.dispose()
+
+  await first.client.messageHandler?.(conversationCommand('chat-session-navigation', '/session list'))
+  assert.equal(([...(first.client.sent.at(-1) ?? '').matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 2)
+  await first.ctx.workspaceRegistry.archiveSession(secondAgent.id)
+  await first.client.messageHandler?.(conversationCommand('chat-session-navigation', '/session list 1'))
+  assert.equal(([...(first.client.sent.at(-1) ?? '').matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 1)
+  await first.dispose()
+
+  const second = await mount(
+    root,
+    new ScriptedAdapter([]),
+    undefined,
+    preset,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => second.dispose())
+  await second.client.messageHandler?.(conversationCommand('chat-session-navigation', '/help'))
+  assert.equal(second.ctx.agents.list()[0]?.id, firstAgent.id)
+
+  t.mock.method(Date, 'now', () => 1)
+  await second.client.messageHandler?.(conversationCommand('chat-session-navigation', '/clear'))
+  const resetAgent = second.ctx.agents.list().find(({ id }) => id !== firstAgent.id)
+  assert.ok(resetAgent !== undefined)
+  const resetGeneration = Number(/^.+:(\d+)-/u.exec(String(resetAgent.id))?.[1])
+  assert.ok(
+    resetGeneration > orphanGeneration,
+    `reset generation ${resetGeneration} did not exceed persisted high-water ${orphanGeneration}`,
+  )
+  await second.dispose()
 })

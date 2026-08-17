@@ -327,10 +327,18 @@ async function assertHarnessFallback(home) {
     .map((entry) => entry.name)
     .sort()
   assert.ok(packageDirectories.length > 0, 'the profile fallback must contain DSH packages')
-  assert.ok(
-    packageDirectories.includes('dsh-workspace'),
-    'the stock profile fallback must contain dsh-workspace',
-  )
+  for (const required of [
+    'dsh-session-projection',
+    'dsh-session-query',
+    'dsh-session-query-sqlite',
+    'dsh-session-title',
+    'dsh-workspace',
+  ]) {
+    assert.ok(
+      packageDirectories.includes(required),
+      `the stock profile fallback must contain ${required}`,
+    )
+  }
   for (const directory of packageDirectories) {
     const manifest = JSON.parse(await readFile(join(deepseekScope, directory, 'package.json'), 'utf8'))
     assert.equal(manifest.name, `@deepseek-ai/${directory}`)

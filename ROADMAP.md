@@ -141,9 +141,11 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 
 ## 0.9.3 — Session navigation
 
-- List resumable sessions visible to the exact conversation scope using bounded titles, timestamps, project labels, and opaque IDs without exposing prompts, filesystem paths, or another chat's sessions.
-- Resume a selected committed session through the same checkpoint, binding-authority, replay-protection, and idle-maintenance rules used by project switching.
-- Defer archive management until the Harness Workspace service exposes symmetric archive and unarchive operations; never bypass that service or add transcript deletion to chat.
+- Add `/session`, `/session list [page]`, and `/session resume <reference>` with ten entries per page, at most 200 candidates, a bounded 1,000-entry Workspace-index scan, and app-plus-conversation-scoped opaque references that never accept a title, raw Session ID, or filesystem path.
+- List only persisted top-level Sessions in the exact conversation lineage: the current Session or historical Sessions uniquely indexed by an available registered Workspace. Hide every archived record, and hide historical orphaned or unindexed, subagent/child, non-persisted, non-current live, ambiguous, and cross-scope records; revalidate the same boundary before resume and fail historical authority closed when the 1,000-entry index scan is incomplete.
+- Display only a bounded stored Session title, creation timestamp, registered Workspace title, and opaque reference. A stored title can be derived from the first human prompt and is therefore visible to every user sharing that conversation scope; never add a full prompt, message/tool preview, raw platform/Session identifier, or path fallback.
+- Resume from true idle only after checkpointing the current transcript, then atomically commit the existing v2 binding and mutation replay history while restoring the selected transcript, project, model, Agent preset, and scoped tools. Preserve the lineage high-water mark so later fresh generations cannot move backward.
+- Verify the real rc.6 Session Query, default zstd persistence, Workspace Registry, restart, LRU, pagination, scope, and failure paths together. Keep archive state read-only: the chat interface does not archive, unarchive, delete, or search Sessions.
 
 ## 0.9.4 — Structured human input
 
