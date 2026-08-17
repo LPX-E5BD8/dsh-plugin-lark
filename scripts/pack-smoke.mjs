@@ -29,6 +29,41 @@ try {
     '--no-package-lock',
     join(temporary, archiveName),
   ], { cwd: consumer, env })
+  const installed = JSON.parse((await run(
+    npm,
+    ['ls', '--all', '--json'],
+    { cwd: consumer, env },
+  )).stdout)
+  const versions = new Map()
+  function collectDependencies(dependencies) {
+    for (const [name, dependency] of Object.entries(dependencies ?? {})) {
+      const values = versions.get(name) ?? new Set()
+      if (typeof dependency.version === 'string') values.add(dependency.version)
+      versions.set(name, values)
+      collectDependencies(dependency.dependencies)
+    }
+  }
+  collectDependencies(installed.dependencies)
+  for (const name of [
+    '@deepseek-ai/cordis',
+    '@deepseek-ai/dsh-agent',
+    '@deepseek-ai/dsh-llm',
+    '@deepseek-ai/dsh-session',
+    '@deepseek-ai/dsh-storage-domain',
+    '@deepseek-ai/schemastery',
+  ]) {
+    assert.ok(versions.has(name), `packed consumer did not resolve ${name}`)
+  }
+  assert.deepEqual([...(versions.get('@deepseek-ai/cordis') ?? [])], ['4.0.1'])
+  assert.deepEqual([...(versions.get('@deepseek-ai/schemastery') ?? [])], ['3.18.1'])
+  for (const [name, resolved] of versions) {
+    if (!name.startsWith('@deepseek-ai/dsh-')) continue
+    if (resolved.size === 0) {
+      assert.equal(name, '@deepseek-ai/dsh-user-approval', `${name} was not installed`)
+      continue
+    }
+    assert.deepEqual([...resolved], ['0.1.0-rc.6'], `${name} resolved a mixed Harness cohort`)
+  }
   await writeFile(join(consumer, 'smoke.mjs'), [
     "import assert from 'node:assert/strict'",
     "import { LARK_LOCALES, name } from 'dsh-plugin-lark'",

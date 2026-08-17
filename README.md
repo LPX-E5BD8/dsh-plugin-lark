@@ -19,10 +19,22 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 
 ## Requirements
 
-- Node.js 22 or newer
-- DeepSeek Harness `0.1.0-rc.6` compatible packages
+- Node.js 22.x
+- One coherent DeepSeek Harness `0.1.0-rc.6` package cohort
 - A durable `storageDomain` service; the stock Web profile supplies its JSON-backed storage stack
 - A self-built Feishu or Lark app with a bot
+
+### Supported Harness matrix
+
+The supported row is an exact release-tested baseline. A version accepted by a broad semver range is not automatically a supported combination.
+
+| Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
+| --- | --- | --- | --- | --- |
+| `0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported; lock-based Linux CI, assembled Harness end-to-end tests, and isolated packed-consumer installation |
+
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. The bundled patch targets the stock rc.6 Web profile, but a real `dsh --profile web` installation, credentials, and Feishu/Lark network path remain deployment smoke checks rather than CI claims.
+
+Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23 or newer, later Cordis or Schemastery releases, other Harness cohorts, non-Linux hosts, alternative persistence stacks, and a host with the optional Approval service completely absent are unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents` or durable `storageDomain` support is unsupported.
 
 ## Install
 
@@ -104,6 +116,8 @@ The bundled Cordis patch uses these defaults:
     streamUpdateIntervalMs: 1000
     maxConversationHandles: 32  # steady-state live conversation-handle target
 ```
+
+The baseline requires `agents` and durable `storageDomain` services. Durable reset, project/model selection, and cold recovery also require `sessionPersistence`; `/project` requires `workspaceRegistry`, and `/model` requires the Harness `llm` service. Approval cards and the readiness route depend on the optional `approval` and `webServer` services. The verified matrix uses the stock JSON/JSONL implementations; alternative implementations remain unverified.
 
 `allowFrom` is fail-closed: an empty list with `allowAllUsers: false` denies everyone. Use `allowAllUsers: true` only for an intentionally public bot. Use `domain: lark` for apps hosted on `open.larksuite.com`.
 

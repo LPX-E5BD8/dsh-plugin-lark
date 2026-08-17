@@ -615,6 +615,39 @@ test('SDK inbound maps text and keeps unsupported content metadata-only', async 
   }
 })
 
+test('SDK lark domain maps both REST and WebSocket clients to open.larksuite.com', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  const start = Lark.WSClient.prototype.start
+  prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  Lark.WSClient.prototype.start = async function startReady() {
+    const client = this as unknown as { onReady?: () => void }
+    client.onReady?.()
+  }
+  const client = new LarkSdkClient({
+    appId: 'test-app-id',
+    appSecret: 'test-only-secret',
+    domain: 'lark',
+  })
+  const internals = client as unknown as {
+    rest?: { domain?: string }
+    ws?: { wsConfig?: { client?: { domain?: string } } }
+    prepareLoadingImage: () => Promise<void>
+  }
+  internals.prepareLoadingImage = async () => {}
+  try {
+    await client.start()
+    assert.equal(internals.rest?.domain, 'https://open.larksuite.com')
+    assert.equal(internals.ws?.wsConfig?.client?.domain, 'https://open.larksuite.com')
+  } finally {
+    await client.stop()
+    prototype.request = request
+    Lark.WSClient.prototype.start = start
+  }
+})
+
 test('SDK startup failures reject client startup', async () => {
   const prototype = Lark.Client.prototype as unknown as {
     request: (options: unknown) => Promise<unknown>

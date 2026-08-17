@@ -19,10 +19,22 @@
 
 ## 环境要求
 
-- Node.js 22 或更高版本
-- 与 DeepSeek Harness `0.1.0-rc.6` 兼容的软件包
+- Node.js 22.x
+- 一组版本一致的 DeepSeek Harness `0.1.0-rc.6` 软件包
 - 持久化的 `storageDomain` 服务；标准 Web profile 已提供基于 JSON 的完整存储栈
 - 一个带机器人的飞书或 Lark 自建应用
+
+### 支持的 Harness 兼容矩阵
+
+下表中的支持状态只对应经过发布门禁验证的精确基线；某个版本仅仅满足宽泛的 semver 范围，并不代表该组合已受支持。
+
+| 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
+| --- | --- | --- | --- | --- |
+| `0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持；已通过基于 lockfile 的 Linux CI、真实组装 Harness 端到端测试和隔离的打包消费安装 |
+
+必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、JSONL 持久化、JSON storage-domain、Tools 与 Approval 服务；平台连接、模型 provider、Workspace registry 和浏览器入口则使用受控替身。内置 patch 面向标准 rc.6 Web profile，但真实的 `dsh --profile web` 安装、凭据和飞书/Lark 网络链路仍属于部署冒烟检查，不是 CI 已覆盖范围。
+
+插件会把直接宿主 peer 固定在这组基线上，解析图中的所有 DSH 软件包也必须来自同一个 rc.6 版本组。混用 DSH 版本、Node.js 23 或更高版本、更高版本的 Cordis 或 Schemastery、其他 Harness 版本组、非 Linux 宿主、替代持久化栈，以及完全缺少可选 Approval 服务的宿主都尚未验证。自定义 profile 只有在提供[配置](#配置)章节所述服务时才受支持；缺少 `agents` 或持久化 `storageDomain` 明确不受支持。
 
 ## 安装
 
@@ -104,6 +116,8 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
     streamUpdateIntervalMs: 1000
     maxConversationHandles: 32  # 进程内活跃会话句柄的稳态目标
 ```
+
+这组基线要求宿主提供 `agents` 和持久化 `storageDomain` 服务。需要持久化的重置、项目/模型选择与冷恢复还要求 `sessionPersistence`；`/project` 依赖 `workspaceRegistry`，`/model` 依赖 Harness `llm` 服务。审批卡片和 readiness 路由分别依赖可选的 `approval` 与 `webServer` 服务。已验证矩阵使用标准 JSON/JSONL 实现，替代实现仍未验证。
 
 `allowFrom` 默认拒绝：当列表为空且 `allowAllUsers: false` 时，所有用户都无权访问。仅当机器人明确需要公开使用时才设置 `allowAllUsers: true`。托管在 `open.larksuite.com` 的应用应使用 `domain: lark`。
 
