@@ -17,6 +17,7 @@ export interface LarkConfig {
   locale?: LarkLocale
   allowFrom?: string[]
   allowAllUsers?: boolean
+  projectManageFrom?: string[]
   defaultSessionId?: string
   provider?: string
   model?: string
@@ -29,6 +30,7 @@ export const Config: Schema = Schema.object({
   locale: Schema.union(LARK_LOCALES.map((locale) => Schema.const(locale))).default(DEFAULT_CONFIG.locale),
   allowFrom: Schema.array(Schema.string()).default([]),
   allowAllUsers: Schema.boolean().default(DEFAULT_CONFIG.allowAllUsers),
+  projectManageFrom: Schema.array(Schema.string()).default([]),
   defaultSessionId: Schema.string().default(''),
   provider: Schema.string().default(DEFAULT_CONFIG.provider),
   model: Schema.string().default(DEFAULT_CONFIG.model),
@@ -122,6 +124,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
         locale: config.locale ?? DEFAULT_CONFIG.locale,
         allowFrom: config.allowFrom ?? [],
         allowAllUsers: config.allowAllUsers ?? DEFAULT_CONFIG.allowAllUsers,
+        projectManageFrom: config.projectManageFrom ?? [],
         defaultSessionId: config.defaultSessionId ?? '',
         provider: config.provider,
         model: config.model,

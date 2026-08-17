@@ -8,5 +8,6 @@
         locale: zh-CN
         allowAllUsers: false
         allowFrom: []
+        projectManageFrom: []
         defaultSessionId: ""
         maxConversationHandles: 32
