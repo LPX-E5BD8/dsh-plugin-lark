@@ -1365,6 +1365,27 @@ test('e2e: card creation failure falls back to final text', async () => {
   await bridge.stop()
 })
 
+test('e2e: an early running-card creation failure still falls back at terminal answer', async () => {
+  const client = createClient()
+  client.sendCard = async () => { throw new Error('card unavailable') }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'answer after card failure'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  await flushDeliveries()
+  assert.equal(client.sent.length, 0)
+  host.emit('lark:chat-a', assistantMessage(1, 'late fallback answer'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.some((message) => message.text === 'late fallback answer'))
+
+  assert.equal(client.sent.filter((message) => message.text === 'late fallback answer').length, 1)
+  await bridge.stop()
+})
+
 test('e2e: card update failure falls back to final text once', async () => {
   const client = createClient()
   const host = createHost()
@@ -1382,6 +1403,32 @@ test('e2e: card update failure falls back to final text once', async () => {
   await waitFor(() => client.sent.some((message) => message.text === 'fallback answer'))
 
   assert.equal(client.sent.filter((message) => message.text === 'fallback answer').length, 1)
+  await bridge.stop()
+})
+
+test('e2e: an early running-card update failure still falls back at terminal answer', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'answer after update failure'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  await waitFor(() => client.cards.length === 1)
+  client.updateCard = async () => { throw new Error('card unavailable') }
+  host.emit('lark:chat-a', {
+    type: 'tool/call',
+    data: { turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{}' },
+  })
+  await flushDeliveries()
+  assert.equal(client.sent.length, 0)
+  host.emit('lark:chat-a', assistantMessage(1, 'late update fallback answer'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.sent.some((message) => message.text === 'late update fallback answer'))
+
+  assert.equal(client.sent.filter((message) => message.text === 'late update fallback answer').length, 1)
   await bridge.stop()
 })
 

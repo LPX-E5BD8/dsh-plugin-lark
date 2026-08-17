@@ -4,7 +4,13 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import ts from 'typescript'
-import { CARD_LIMITS, renderTurnCard, renderTurnCardWithMeta } from '../src/cards.ts'
+import {
+  CARD_LIMITS,
+  renderApprovalCard,
+  renderApprovalDecisionCard,
+  renderTurnCard,
+  renderTurnCardWithMeta,
+} from '../src/cards.ts'
 import { DEFAULT_CONFIG } from '../src/config.ts'
 import { nonCatalogPolicyTypes, projectActivity, unclassifiedKnownEventTypes } from '../src/events.ts'
 import { apply, inject } from '../src/index.ts'
@@ -356,6 +362,60 @@ test('quality: rendered cards stay within the Lark byte limit', () => {
   const encoded = JSON.stringify(payload)
   assert.ok(Buffer.byteLength(encoded, 'utf8') <= CARD_LIMITS.maxBytes)
   assert.match(encoded, /…/)
+})
+
+test('quality: every Card 2.0 payload keeps platform element ids and column sets valid', () => {
+  const payloads = [
+    renderApprovalCard({
+      requestId: 'request-1',
+      toolName: 'bash',
+      reason: 'Run one command.',
+    }),
+    ...(['allowed-once', 'rejected', 'cancelled', 'unavailable'] as const)
+      .map((outcome) => renderApprovalDecisionCard(outcome, 'bash')),
+    renderTurnCard({
+      status: 'running',
+      tools: [{ id: 'tool-1', name: 'bash', status: 'running' }],
+      reasoning: 'Checking the repository.',
+      todos: [{ content: 'Run checks', status: 'in_progress' }],
+      stopRequestId: 'stop-1',
+      startedAt: 1_000,
+      updatedAt: 2_000,
+    }),
+    renderTurnCard({
+      status: 'completed',
+      tools: [{ id: 'tool-1', name: 'bash', status: 'completed' }],
+      answer: 'Done.',
+      startedAt: 1_000,
+      updatedAt: 2_000,
+    }),
+  ]
+  const allowedColumnSetKeys = new Set([
+    'columns',
+    'element_id',
+    'flex_mode',
+    'horizontal_spacing',
+    'tag',
+  ])
+  const visit = (value: unknown, elementIds: Set<string>): void => {
+    if (value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, elementIds)
+      return
+    }
+    const record = value as Record<string, unknown>
+    if (record.tag === 'column_set') {
+      for (const key of Object.keys(record)) assert.ok(allowedColumnSetKeys.has(key), key)
+    }
+    if ('element_id' in record) {
+      const elementId = String(record.element_id)
+      assert.match(elementId, /^[A-Za-z][A-Za-z0-9_]{0,19}$/u)
+      assert.equal(elementIds.has(elementId), false, `duplicate Card element id ${elementId}`)
+      elementIds.add(elementId)
+    }
+    for (const item of Object.values(record)) visit(item, elementIds)
+  }
+  for (const payload of payloads) visit(payload, new Set())
 })
 
 test('quality: card rendering reports byte-cap answer truncation', () => {

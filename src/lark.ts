@@ -80,6 +80,15 @@ export interface LarkSdkOptions {
 const TEXT_LIMIT = 4000
 const START_TIMEOUT_MS = 15_000
 
+const discardSdkLog = (..._messages: unknown[]): void => {}
+const PRIVATE_SDK_LOGGER = Object.freeze({
+  error: discardSdkLog,
+  warn: discardSdkLog,
+  info: discardSdkLog,
+  debug: discardSdkLog,
+  trace: discardSdkLog,
+})
+
 interface LarkMention {
   key?: string
   id?: { open_id?: string }
@@ -193,6 +202,53 @@ interface LarkMessageResponse {
   data?: { message_id?: string }
 }
 
+type LarkApiOperation =
+  | 'bot.info'
+  | 'message.create'
+  | 'message.reply'
+  | 'message.patch'
+  | 'message.update'
+
+function apiInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
+}
+
+function rejectedLarkApiCall(operation: LarkApiOperation, error: unknown): Error {
+  const response = asRecord(asRecord(error).response)
+  const status = apiInteger(response.status)
+  const code = apiInteger(asRecord(response.data).code)
+  if (status !== undefined && code !== undefined) {
+    return new Error(`lark: ${operation} http failure (status ${status}, code ${code})`)
+  }
+  if (status !== undefined) return new Error(`lark: ${operation} http failure (status ${status})`)
+  if (code !== undefined) return new Error(`lark: ${operation} transport failure (code ${code})`)
+  return new Error(`lark: ${operation} transport failure`)
+}
+
+async function callLarkApi(
+  operation: LarkApiOperation,
+  call: () => Promise<unknown>,
+): Promise<Record<string, unknown>> {
+  let response: unknown
+  try {
+    response = await call()
+  } catch (error) {
+    throw rejectedLarkApiCall(operation, error)
+  }
+  if (response === null || typeof response !== 'object' || Array.isArray(response)) {
+    throw new Error(`lark: ${operation} returned a malformed response`)
+  }
+  const record = response as Record<string, unknown>
+  if (record.code !== undefined && apiInteger(record.code) === undefined) {
+    throw new Error(`lark: ${operation} returned a malformed response code`)
+  }
+  const code = apiInteger(record.code)
+  if (code !== undefined && code !== 0) {
+    throw new Error(`lark: ${operation} business failure (code ${code})`)
+  }
+  return record
+}
+
 interface LarkConnectionStatus {
   state?: unknown
   reconnectAttempts?: unknown
@@ -299,16 +355,19 @@ export class LarkSdkClient implements LarkClientLike {
       appSecret: this.options.appSecret,
       appType: Lark.AppType.SelfBuild,
       domain,
+      logger: PRIVATE_SDK_LOGGER,
     })
     const rest = client as unknown as LarkRest
     try {
-      const identity = rest.request({ url: '/open-apis/bot/v3/info', method: 'GET' })
-      const bot = (await withTimeout(
+      const identity = callLarkApi('bot.info', () => (
+        rest.request({ url: '/open-apis/bot/v3/info', method: 'GET' })
+      ))
+      const bot = asRecord((await withTimeout(
         Promise.race([identity, cancelled.promise]),
         'lark: bot identity lookup timed out',
-      )).bot
+      )).bot)
       const botOpenId = bot?.open_id
-      if (botOpenId === undefined || botOpenId === '') {
+      if (typeof botOpenId !== 'string' || botOpenId === '') {
         throw new Error('lark: bot identity response is missing open_id')
       }
       const ready = Promise.withResolvers<void>()
@@ -316,6 +375,7 @@ export class LarkSdkClient implements LarkClientLike {
         appId: this.options.appId,
         appSecret: this.options.appSecret,
         domain,
+        logger: PRIVATE_SDK_LOGGER,
         handshakeTimeoutMs: START_TIMEOUT_MS,
         onReady: ready.resolve,
         onError: ready.reject,
@@ -323,7 +383,7 @@ export class LarkSdkClient implements LarkClientLike {
       this.ws = wsClient
       const self = this
       const start = wsClient.start({
-        eventDispatcher: new Lark.EventDispatcher({}).register({
+        eventDispatcher: new Lark.EventDispatcher({ logger: PRIVATE_SDK_LOGGER }).register({
           'im.message.receive_v1': async (data: {
             message?: {
               chat_id?: string
@@ -431,23 +491,26 @@ export class LarkSdkClient implements LarkClientLike {
   ): Promise<string> {
     if (this.rest === undefined) throw new Error('lark client not started')
     const replyToMessageId = options?.replyToMessageId
-    const res = replyToMessageId !== undefined && replyToMessageId !== ''
-      ? await this.rest.im.v1.message.reply({
-        path: { message_id: replyToMessageId },
-        data: {
-          msg_type: msgType,
-          content,
-          ...(options?.replyInThread === true ? { reply_in_thread: true } : {}),
-        },
-      })
-      : await this.rest.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, msg_type: msgType, content },
-      })
-    if (res.code !== undefined && res.code !== 0) {
-      throw new Error(`lark: message delivery failed (${res.code}): ${res.msg ?? 'unknown error'}`)
-    }
-    const id = res.data?.message_id
+    const operation: LarkApiOperation = replyToMessageId !== undefined && replyToMessageId !== ''
+      ? 'message.reply'
+      : 'message.create'
+    const message = this.rest.im.v1.message
+    const res = await callLarkApi(operation, () => (
+      replyToMessageId !== undefined && replyToMessageId !== ''
+        ? message.reply({
+          path: { message_id: replyToMessageId },
+          data: {
+            msg_type: msgType,
+            content,
+            ...(options?.replyInThread === true ? { reply_in_thread: true } : {}),
+          },
+        })
+        : message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: { receive_id: chatId, msg_type: msgType, content },
+        })
+    ))
+    const id = asRecord(res.data).message_id
     if (typeof id !== 'string' || id === '') {
       throw new Error('lark: message delivery response is missing message_id')
     }
@@ -458,21 +521,21 @@ export class LarkSdkClient implements LarkClientLike {
     if (this.rest === undefined) throw new Error('lark client not started')
     const patch = this.rest.im.v1.message.patch
     if (patch !== undefined) {
-      await patch({
+      await callLarkApi('message.patch', () => patch({
         path: { message_id: messageId },
         data: { content: JSON.stringify(card) },
-      })
+      }))
       return
     }
     const update = this.rest.im.v1.message.update
     if (update === undefined) throw new Error('lark client cannot update cards')
-    await update({
+    await callLarkApi('message.update', () => update({
       path: { message_id: messageId },
       data: {
         msg_type: 'interactive',
         content: JSON.stringify(card),
       },
-    })
+    }))
   }
 
   async stopReceiving(): Promise<void> {

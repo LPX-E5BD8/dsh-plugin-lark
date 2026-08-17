@@ -51,14 +51,13 @@ Start the Web profile. The Web app intentionally accepts loopback only; Feishu/L
 dsh --profile web --patch /tmp/dsh-lark-smoke.yml --host 127.0.0.1 --port 3080
 ```
 
-The startup gate passes only after both of these observations appear:
+The Web listener still announces its loopback URL:
 
 ```text
 dsh web: http://127.0.0.1:3080
-[ws] ws client ready
 ```
 
-When the Web profile is mounted, also verify the sanitized readiness response:
+Starting with v0.9.2, the plugin deliberately replaces the official SDK logger so raw HTTP configuration, Authorization headers, and message/Card bodies cannot escape before the plugin sanitizes a failure. Do not require the SDK's historical `[ws] ws client ready` log line. When the Web profile is mounted, use the sanitized readiness response as the connection gate:
 
 ```sh
 curl --fail-with-body http://127.0.0.1:3080/api/lark/health
@@ -78,7 +77,7 @@ Perform the same checks in a direct chat on each domain:
 1. Send `/help`; verify one localized help reply and the mounted Agent's compatible commands.
 2. Send a task that requires a repository tool. Verify one Card 2.0 message is updated in place, shows reasoning, no more than the latest three tools, and reaches a terminal status.
 3. Send `/new`, then a follow-up. Verify the acknowledgement arrives and the follow-up runs in the fresh session.
-4. Trigger a protected tool when approval is mounted. Verify only the initiating user in the original chat can Allow once or Deny.
+4. Trigger a protected tool when approval is mounted. Verify the initial Approval Card 2.0 is accepted by the configured platform, only the initiating user in the original chat can Allow once or Deny, the callback returns the expected toast, and the decided card update succeeds. A rejected create must resolve unavailable without running the tool; a rejected update must not reverse or repeat an admitted decision. The v0.9.2 release blocker requires this path on Feishu; an international Lark claim still requires a separate Lark app and the domain's complete checklist.
 5. Request a response longer than 6,000 Unicode code points. When the model produces one, verify the card keeps a preview and subsequent text messages include the final tail without loss.
 6. Stop the process cleanly and start it again. Verify the next message resumes the prior chat session with the same Agent preset and tools.
 7. Send an image or file in the direct chat. Verify one generic text-only notice is returned and no attachment content appears in the Agent session or plugin logs.
@@ -124,7 +123,7 @@ unset DSH_LARK_APP_ID DSH_LARK_APP_SECRET DEEPSEEK_API_KEY
 
 ## Common failures
 
-- No `[ws] ws client ready` or readiness stays at `503`: confirm the app domain, long-connection mode, credentials, and event subscription. This endpoint reports SDK WebSocket state only; it does not diagnose REST permissions, model access, or storage.
+- Readiness stays at `503`: confirm the app domain, long-connection mode, credentials, and event subscription. This endpoint reports SDK WebSocket state only; it does not diagnose REST permissions, model access, or storage. On v0.9.2 and newer, the absence of the historical raw SDK ready log is intentional.
 - The bot receives nothing: confirm `im.message.receive_v1`, bot availability, group mentions, and the `allowFrom` entry.
 - The bot receives but cannot reply: confirm message-send permissions and that the app version containing those permissions is published.
 - The live conversation count remains above `maxConversationHandles`: wait for running commands and turns to become idle, then check for durability or cleanup warnings. The setting is a steady-state target; busy or non-durable handles are retained rather than cancelled or discarded.
