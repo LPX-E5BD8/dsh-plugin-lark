@@ -35,9 +35,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASELINE_DIR: ${{ runner.temp }}/upgrade-baseline
-          BASELINE_TAG: v0.8.7
-          BASELINE_COMMIT: 56f26c98d22d2f1d7fb5b0cd6f727429d8e61bfa
-          BASELINE_DIGEST: sha256:3d17b458870c49bd404921ba8823c7cac05dbc4e160402689c4285d6c159798b
+          BASELINE_TAG: v0.8.8
+          BASELINE_COMMIT: b0936ea09b512a9316a59f2cb2176716288eb653
+          BASELINE_DIGEST: sha256:b88a42ef5ecf2c253c59a71ecaf3a53224825cc1ea6498c150f42a27c637f6b5
         run: |
           set -eu
           test ! -e "$BASELINE_DIR"

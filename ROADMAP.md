@@ -123,8 +123,9 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 ## 0.9.0 — Self-service project registration
 
 - Make an empty `/project` result actionable instead of presenting project switching as unavailable when the Workspace registry is mounted but empty.
-- Let an authorized conversation register its current canonical working directory under a display title, without accepting an arbitrary filesystem path from chat or exposing that path in replies.
-- List, select, and remove registrations through the host Workspace registry while preserving atomic generation switching, durable bindings, project isolation, and the guarantee that removing a registration never deletes files or transcripts.
+- Let an explicitly configured project manager register the current Session's canonical working directory under a bounded display title from a direct chat, without accepting an arbitrary filesystem path or exposing that path in replies or logs.
+- List and select registrations for ordinary authorized users, but require an exact full ID for manager-only removal; keep Registry visibility profile-global and make removal catalog-only so files, Agents, Sessions, bindings, and transcripts remain.
+- Serialize Lark Workspace mutations, precommit bounded replay protection, fail closed on ambiguous host mutations, and verify canonical registration/removal/restart behavior against the real rc.6 Registry and persistence stack.
 
 ## 0.9.1 — Session navigation and archival
 

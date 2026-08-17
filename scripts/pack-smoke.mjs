@@ -23,6 +23,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const temporary = await mkdtemp(join(tmpdir(), 'dsh-plugin-lark-pack-'))
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
+const sourceLock = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'))
 assert.equal(manifest.name, 'dsh-plugin-lark')
 assert.match(manifest.version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
 const expectedArchiveName = `${manifest.name}-${manifest.version}.tgz`
@@ -32,6 +33,17 @@ const env = {
   npm_config_cache: join(temporary, 'npm-cache'),
   npm_config_registry: 'https://registry.npmjs.org',
 }
+const pinnedConsumerPackages = Object.entries(sourceLock.packages ?? {})
+  .filter(([path]) => (
+    /^node_modules\/@deepseek-ai\/(?:cordis|schemastery|dsh-[^/]+)$/u.test(path)
+  ))
+  .map(([path, entry]) => {
+    assert.equal(typeof entry.version, 'string', `${path} has no locked version`)
+    return `${path.slice('node_modules/'.length)}@${entry.version}`
+  })
+  .sort()
+assert.ok(pinnedConsumerPackages.includes('@deepseek-ai/dsh-agent@0.1.0-rc.6'))
+assert.ok(pinnedConsumerPackages.includes('@deepseek-ai/dsh-workspace@0.1.0-rc.6'))
 
 async function verifyConsumer(archivePath) {
   const consumer = join(temporary, 'consumer')
@@ -41,6 +53,7 @@ async function verifyConsumer(archivePath) {
     'install',
     '--ignore-scripts',
     '--no-package-lock',
+    ...pinnedConsumerPackages,
     archivePath,
   ], { cwd: consumer, env })
   const installedPackage = join(consumer, 'node_modules', manifest.name)

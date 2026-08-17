@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, sep } from 'node:path'
 import { setImmediate as yieldImmediate } from 'node:timers/promises'
 import { test } from 'node:test'
 import { LarkBridge } from '../src/bridge.ts'
@@ -42,6 +45,7 @@ interface SentText {
 
 type ProjectClient = LarkClientLike & {
   readonly sent: SentText[]
+  sendTextHandler?: (chatId: string, text: string) => Promise<void>
   handler?: (message: LarkInbound) => Promise<void>
 }
 
@@ -50,7 +54,10 @@ function createClient(): ProjectClient {
     sent: [],
     async start() {},
     async stop() {},
-    async sendText(chatId, text, options) { client.sent.push({ chatId, text, options }) },
+    async sendText(chatId, text, options) {
+      client.sent.push({ chatId, text, options })
+      await client.sendTextHandler?.(chatId, text)
+    },
     onMessage(handler) { client.handler = handler },
   }
   return client
@@ -58,21 +65,32 @@ function createClient(): ProjectClient {
 
 let inboundSequence = 0
 
-function inbound(chatId: string, text: string): LarkInbound {
+function inbound(
+  chatId: string,
+  text: string,
+  overrides: Partial<Pick<LarkInbound, 'chatType' | 'openId' | 'messageId' | 'mentioned' | 'rootId' | 'threadId'>> = {},
+): LarkInbound {
   inboundSequence += 1
   return {
     chatId,
-    chatType: 'p2p',
-    openId: 'owner',
+    chatType: overrides.chatType ?? 'p2p',
+    openId: overrides.openId ?? 'owner',
     text,
-    messageId: `project-${inboundSequence}`,
-    mentioned: false,
+    messageId: overrides.messageId ?? `project-${inboundSequence}`,
+    mentioned: overrides.mentioned ?? false,
+    ...(overrides.rootId === undefined ? {} : { rootId: overrides.rootId }),
+    ...(overrides.threadId === undefined ? {} : { threadId: overrides.threadId }),
   }
 }
 
-async function send(client: ProjectClient, chatId: string, text: string): Promise<void> {
+async function send(
+  client: ProjectClient,
+  chatId: string,
+  text: string,
+  overrides?: Parameters<typeof inbound>[2],
+): Promise<void> {
   assert.ok(client.handler !== undefined)
-  await client.handler(inbound(chatId, text))
+  await client.handler(inbound(chatId, text, overrides))
 }
 
 async function settleSend(client: ProjectClient, chatId: string, text: string): Promise<void> {
@@ -245,7 +263,10 @@ class ProjectHost {
   readonly mounts: Array<{ readonly preset: string; readonly tools: readonly string[] }> = []
   readonly runtimeExecutions: RuntimeExecution[] = []
   readonly workspaceResolveCalls: string[] = []
+  readonly workspaceCreateCalls: Array<{ readonly path: string; readonly title: string }> = []
+  readonly workspaceDeleteCalls: string[] = []
   workspaceRegistryAvailable = true
+  workspaceRegistryMutable = true
   sessionPersistenceAvailable = true
   defaultPreset = 'coding'
   createError?: Error
@@ -253,6 +274,8 @@ class ProjectHost {
   disposeErrorOnce?: Error
   runtimeHandler?: (agent: ProjectAgent, line: string) => Promise<void>
   workspaceResolveHandler?: (path: string) => Promise<TestWorkspace | undefined>
+  workspaceCreateHandler?: (path: string, title: string) => Promise<TestWorkspace>
+  workspaceDeleteHandler?: (id: string) => Promise<boolean>
   sessionEventListener?: (session: ProjectSession, event: {
     readonly type: 'turn/start'
     readonly time: number
@@ -260,6 +283,7 @@ class ProjectHost {
   }) => void
   private readonly flushPlans: FlushPlan[] = []
   private readonly bindingPutPlans: BindingPutPlan[] = []
+  private workspaceRegistryService?: Record<string, unknown>
 
   constructor(workspaces: readonly TestWorkspace[]) {
     this.workspaces = [...workspaces]
@@ -281,7 +305,7 @@ class ProjectHost {
     get: (name: string) => {
       if (name === 'approval') return {}
       if (name === 'workspaceRegistry' && this.workspaceRegistryAvailable) {
-        return {
+        this.workspaceRegistryService ??= {
           list: () => [...this.workspaces],
           get: (id: unknown) => this.workspaces.find((workspace) => workspace.id === String(id)),
           resolveByPath: async (path: string) => {
@@ -290,7 +314,14 @@ class ProjectHost {
               ? this.workspaces.find((workspace) => workspace.path === path)
               : this.workspaceResolveHandler(path)
           },
+          ...(this.workspaceRegistryMutable
+            ? {
+                create: (path: string, title: string) => this.createWorkspace(path, title),
+                delete: (id: string) => this.deleteWorkspace(id),
+              }
+            : {}),
         }
+        return this.workspaceRegistryService
       }
       if (name === 'sessionPersistence' && this.sessionPersistenceAvailable) {
         return {
@@ -358,6 +389,34 @@ class ProjectHost {
 
   planBindingPut(plan: BindingPutPlan): void {
     this.bindingPutPlans.push(plan)
+  }
+
+  private async createWorkspace(path: string, title: string): Promise<TestWorkspace> {
+    this.workspaceCreateCalls.push({ path, title })
+    this.operations.push(`workspace-create:${title}`)
+    if (this.workspaceCreateHandler !== undefined) {
+      return this.workspaceCreateHandler(path, title)
+    }
+    const existing = this.workspaces.find((workspace) => workspace.path === path)
+    if (existing !== undefined) return existing
+    const suffix = String(this.workspaceCreateCalls.length).padStart(12, '0')
+    const workspace = new TestWorkspace(
+      `00000000-0000-4000-8000-${suffix}`,
+      title,
+      path,
+    )
+    this.workspaces.push(workspace)
+    return workspace
+  }
+
+  private async deleteWorkspace(id: string): Promise<boolean> {
+    this.workspaceDeleteCalls.push(id)
+    this.operations.push(`workspace-delete:${id}`)
+    if (this.workspaceDeleteHandler !== undefined) return this.workspaceDeleteHandler(id)
+    const index = this.workspaces.findIndex((workspace) => workspace.id === id)
+    if (index < 0) return false
+    this.workspaces.splice(index, 1)
+    return true
   }
 
   async putBinding(baseId: string, binding: ConversationBinding): Promise<void> {
@@ -498,11 +557,17 @@ function mount(
   options: {
     defaultSessionId?: string
     workspaceRegistryAvailable?: boolean
+    workspaceRegistryMutable?: boolean
     sessionPersistenceAvailable?: boolean
+    projectManageFrom?: string[]
+    allowFrom?: string[]
+    allowAllUsers?: boolean
+    cwd?: string
   } = {},
 ): { readonly host: ProjectHost; readonly client: ProjectClient; readonly bridge: LarkBridge } {
   const host = new ProjectHost(workspaces)
   host.workspaceRegistryAvailable = options.workspaceRegistryAvailable ?? true
+  host.workspaceRegistryMutable = options.workspaceRegistryMutable ?? true
   host.sessionPersistenceAvailable = options.sessionPersistenceAvailable ?? true
   const client = createClient()
   const bridge = new LarkBridge(host.ctx as never, {
@@ -516,13 +581,25 @@ function mount(
       put: (baseId, binding) => host.putBinding(baseId, binding),
       async close() {},
     },
-    allowFrom: ['owner'],
-    cwd: '/srv/default-repo',
+    allowFrom: options.allowFrom ?? ['owner'],
+    allowAllUsers: options.allowAllUsers,
+    projectManageFrom: options.projectManageFrom ?? ['owner'],
+    cwd: options.cwd ?? '/srv/default-repo',
     defaultSessionId: options.defaultSessionId,
   })
   void bridge.start()
   t.after(() => bridge.stop())
   return { host, client, bridge }
+}
+
+async function temporaryProject(
+  t: { after(callback: () => void | Promise<void>): void },
+): Promise<{ readonly root: string; readonly path: string }> {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-project-'))
+  const path = join(root, 'project')
+  await mkdir(path)
+  t.after(() => rm(root, { recursive: true, force: true }))
+  return { root, path: await realpath(path) }
 }
 
 test('/project lists titles and complete ids without leaking filesystem paths', async (t) => {
@@ -592,6 +669,747 @@ test('/project rejects duplicate titles, unknown queries, unavailable registries
   await send(nonDurable.client, 'chat-a', '/project Alpha Repo')
   assert.equal(nonDurable.host.creates.length, 0)
   assert.match(nonDurable.client.sent.at(-1)?.text ?? '', /不可用/)
+})
+
+test('an empty project list is actionable only for an authorized direct-chat project manager', async (t) => {
+  const project = await temporaryProject(t)
+  const manager = mount(t, [], { cwd: project.path, projectManageFrom: ['owner'] })
+  await send(manager.client, 'chat-manager', '/project')
+  assert.match(manager.client.sent.at(-1)?.text ?? '', /\/project register <名称>/)
+
+  const ordinary = mount(t, [], { cwd: project.path, projectManageFrom: [] })
+  await send(ordinary.client, 'chat-ordinary', '/project')
+  assert.doesNotMatch(ordinary.client.sent.at(-1)?.text ?? '', /\/project register/)
+  await send(ordinary.client, 'chat-ordinary', '/project register Ordinary')
+  assert.match(ordinary.client.sent.at(-1)?.text ?? '', /没有项目注册管理权限/)
+  assert.deepEqual(ordinary.host.workspaceCreateCalls, [])
+
+  const publicBot = mount(t, [], {
+    cwd: project.path,
+    allowFrom: [],
+    allowAllUsers: true,
+    projectManageFrom: [],
+  })
+  await send(publicBot.client, 'chat-public', '/project register Public', { openId: 'visitor' })
+  assert.match(publicBot.client.sent.at(-1)?.text ?? '', /没有项目注册管理权限/)
+  assert.deepEqual(publicBot.host.workspaceCreateCalls, [])
+
+  const group = mount(t, [], { cwd: project.path, projectManageFrom: ['owner'] })
+  await send(group.client, 'group-chat', '/project register Group', {
+    chatType: 'group',
+    mentioned: true,
+    rootId: 'root-message',
+  })
+  assert.match(group.client.sent.at(-1)?.text ?? '', /只能在.*私聊/)
+  assert.deepEqual(group.host.workspaceCreateCalls, [])
+  await send(group.client, 'group-chat', `/project remove ${WORKSPACE_IDS.alpha}`, {
+    chatType: 'group',
+    mentioned: false,
+    rootId: 'another-root',
+  })
+  assert.match(group.client.sent.at(-1)?.text ?? '', /只能在.*私聊/)
+  assert.deepEqual(group.host.workspaceDeleteCalls, [])
+
+  const managerWithoutBotAccess = mount(t, [], {
+    cwd: project.path,
+    allowFrom: ['different-user'],
+    projectManageFrom: ['owner'],
+  })
+  await send(managerWithoutBotAccess.client, 'chat-manager-only', '/project register Denied')
+  assert.match(managerWithoutBotAccess.client.sent.at(-1)?.text ?? '', /没有权限/)
+  assert.deepEqual(managerWithoutBotAccess.host.workspaceCreateCalls, [])
+
+  const noPersistence = mount(t, [], {
+    cwd: project.path,
+    sessionPersistenceAvailable: false,
+  })
+  await send(noPersistence.client, 'chat-no-persistence', '/project')
+  assert.doesNotMatch(noPersistence.client.sent.at(-1)?.text ?? '', /\/project register/)
+
+  const missingDirectory = mount(t, [], { cwd: join(project.root, 'missing') })
+  await send(missingDirectory.client, 'chat-missing-cwd', '/project')
+  assert.doesNotMatch(missingDirectory.client.sent.at(-1)?.text ?? '', /\/project register/)
+})
+
+test('project registration validates titles and registers only the active Session cwd without resetting it', async (t) => {
+  const project = await temporaryProject(t)
+  const { host, client } = mount(t, [], { cwd: project.path })
+  await send(client, 'chat-register', '/project')
+  const active = host.latestCreate()
+  const invalidTitles = [
+    '',
+    '/private/other',
+    '\\server\\share',
+    'C:\\private\\other',
+    'C:private\\other',
+    'file:///private/other',
+    '~/private',
+    '../private',
+    'bad\nname',
+    'bad\u202Ename',
+    '<at user_id="all">everyone</at>',
+    '\uD800',
+    'x'.repeat(121),
+  ]
+  for (const title of invalidTitles) {
+    await send(client, 'chat-register', `/project register ${title}`)
+    assert.match(client.sent.at(-1)?.text ?? '', /用法：\/project register/)
+  }
+  assert.deepEqual(host.workspaceCreateCalls, [])
+
+  await send(client, 'chat-register', '/project register   Team   Workspace  ')
+  assert.deepEqual(host.workspaceCreateCalls, [{ path: project.path, title: 'Team Workspace' }])
+  assert.equal(host.creates.length, 1, 'registration reset the active Session')
+  assert.equal(host.latestCreate(), active)
+  assert.deepEqual(host.disposals, [])
+  assert.deepEqual(host.workspaces[0]?.attachCalls, [])
+  assert.equal(client.sent.at(-1)?.text.includes(project.path), false)
+  assert.match(client.sent.at(-1)?.text ?? '', /已注册当前项目/)
+
+  const unicodeBoundary = mount(t, [], { cwd: project.path })
+  const maxTitle = '😀'.repeat(120)
+  await send(unicodeBoundary.client, 'chat-unicode-title', `/project register\t${maxTitle}`)
+  assert.equal(unicodeBoundary.host.workspaceCreateCalls[0]?.title, maxTitle)
+  await send(
+    unicodeBoundary.client,
+    'chat-unicode-title',
+    `/project register ${'😀'.repeat(121)}`,
+  )
+  assert.equal(unicodeBoundary.host.workspaceCreateCalls.length, 1)
+  assert.match(unicodeBoundary.client.sent.at(-1)?.text ?? '', /用法：\/project register/)
+})
+
+test('project registration rejects relative, missing, and non-directory Session cwd values', async (t) => {
+  const project = await temporaryProject(t)
+  const file = join(project.root, 'not-a-directory')
+  await writeFile(file, 'preserve me')
+  const candidates = [
+    { label: 'relative', cwd: 'relative/project' },
+    { label: 'missing', cwd: join(project.root, 'missing') },
+    { label: 'file', cwd: file },
+  ]
+  for (const candidate of candidates) {
+    const mounted = mount(t, [], { cwd: candidate.cwd })
+    await send(mounted.client, `chat-${candidate.label}`, '/project register Valid Title')
+    assert.deepEqual(mounted.host.workspaceCreateCalls, [], candidate.label)
+    assert.match(mounted.client.sent.at(-1)?.text ?? '', /暂不可用/)
+  }
+})
+
+test('a read-only custom Workspace registry keeps project selection but rejects registration management', async (t) => {
+  const project = await temporaryProject(t)
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Read Only', project.path)
+  const { host, client } = mount(t, [workspace], {
+    cwd: project.path,
+    workspaceRegistryMutable: false,
+  })
+
+  await send(client, 'chat-read-only', '/project Read Only')
+  assert.match(client.sent.at(-1)?.text ?? '', /当前已是|已是项目/)
+  await send(client, 'chat-read-only', '/project register New Name')
+  assert.match(client.sent.at(-1)?.text ?? '', /注册管理暂不可用/)
+  await send(client, 'chat-read-only', `/project remove ${workspace.id}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /注册管理暂不可用/)
+  assert.equal(host.workspaces[0], workspace)
+  assert.deepEqual(host.workspaceCreateCalls, [])
+  assert.deepEqual(host.workspaceDeleteCalls, [])
+})
+
+test('registering an existing canonical path is idempotent and never renames it', async (t) => {
+  const project = await temporaryProject(t)
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Original Name', project.path)
+  const nonCanonical = `${project.path}${sep}..${sep}project`
+  assert.notEqual(nonCanonical, project.path)
+  assert.equal(await realpath(nonCanonical), project.path)
+  const { host, client } = mount(t, [workspace], { cwd: nonCanonical })
+
+  await send(client, 'chat-existing', '/project register Replacement Name')
+
+  assert.deepEqual(host.workspaceCreateCalls, [])
+  assert.equal(workspace.title, 'Original Name')
+  assert.equal(host.creates.length, 1)
+  assert.deepEqual(workspace.attachCalls, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /已注册为项目.*未修改原名称/)
+  assert.equal(client.sent.at(-1)?.text.includes(project.path), false)
+})
+
+test('a failed project-registry precommit performs no host registry mutation', async (t) => {
+  const project = await temporaryProject(t)
+  const registration = mount(t, [], { cwd: project.path })
+  registration.host.planFlush({ result: false })
+  await send(registration.client, 'chat-register-precommit', '/project register Durable')
+  assert.deepEqual(registration.host.workspaceCreateCalls, [])
+  assert.deepEqual(registration.host.bindingPuts, [])
+  assert.match(registration.client.sent.at(-1)?.text ?? '', /暂不可用/)
+
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Durable', project.path)
+  const removal = mount(t, [workspace], { cwd: project.path })
+  removal.host.planFlush({ result: false })
+  await send(removal.client, 'chat-remove-precommit', `/project remove ${workspace.id}`)
+  assert.deepEqual(removal.host.workspaceDeleteCalls, [])
+  assert.equal(removal.host.workspaces[0], workspace)
+  assert.match(removal.client.sent.at(-1)?.text ?? '', /暂不可用/)
+})
+
+test('exact-id removal handles duplicate titles and leaves the active Session and files intact', async (t) => {
+  const project = await temporaryProject(t)
+  const otherPath = join(project.root, 'other')
+  await mkdir(otherPath)
+  const marker = join(project.path, 'marker.txt')
+  await writeFile(marker, 'workspace data survives')
+  const { host, client } = mount(t, [], { cwd: project.path })
+
+  await send(client, 'chat-remove', 'keep this transcript')
+  const active = host.latestCreate()
+  await send(client, 'chat-remove', '/project register Duplicate Title')
+  const registered = host.workspaces[0]
+  assert.ok(registered !== undefined)
+  const bindingBeforeRemoval = host.bindings.get('lark:chat-remove')
+  assert.ok(bindingBeforeRemoval !== undefined)
+  const eventsBeforeRemoval = [...active.agent.session.events]
+  const duplicate = new TestWorkspace(
+    WORKSPACE_IDS.duplicateTwo,
+    'Duplicate Title',
+    await realpath(otherPath),
+  )
+  host.workspaces.push(duplicate)
+
+  await send(client, 'chat-remove', '/project Duplicate Title')
+  assert.match(client.sent.at(-1)?.text ?? '', /多个项目/)
+  assert.equal(host.creates.length, 1)
+
+  await send(client, 'chat-remove', `/project remove\t${registered.id}`)
+  assert.deepEqual(host.workspaceDeleteCalls, [registered.id])
+  assert.deepEqual(host.workspaces, [duplicate])
+  assert.equal(host.creates.length, 1)
+  assert.equal(host.latestCreate(), active)
+  assert.equal(active.agent.disposed, false)
+  assert.deepEqual(host.disposals, [])
+  assert.equal(active.cwd, project.path)
+  assert.deepEqual(active.agent.session.events, eventsBeforeRemoval)
+  assert.equal(await readFile(marker, 'utf8'), 'workspace data survives')
+  assert.equal(host.persisted.get(active.sessionId), active.agent.session)
+  assert.deepEqual(registered.attachCalls, [])
+  const bindingAfterRemoval = host.bindings.get('lark:chat-remove')
+  assert.ok(bindingAfterRemoval !== undefined)
+  assert.equal(bindingAfterRemoval.generation, bindingBeforeRemoval.generation)
+  assert.equal(bindingAfterRemoval.suffix, bindingBeforeRemoval.suffix)
+  assert.deepEqual(bindingAfterRemoval.modelSelection, bindingBeforeRemoval.modelSelection)
+  assert.equal(bindingAfterRemoval.mutationHashes.length, bindingBeforeRemoval.mutationHashes.length + 1)
+  assert.match(client.sent.at(-1)?.text ?? '', /已移除项目注册.*目录、文件、会话和历史记录均未删除/)
+
+  await send(client, 'chat-remove', `/project ${duplicate.id}`)
+  assert.equal(host.latestCreate().cwd, duplicate.path)
+})
+
+test('an old registration delivery replay cannot recreate a project removed by a later message', async (t) => {
+  const project = await temporaryProject(t)
+  const first = mount(t, [], { cwd: project.path })
+  assert.ok(first.client.handler !== undefined)
+  const registration = inbound('chat-registry-replay', '/project register Replay Safe', {
+    messageId: 'registry-add-message',
+  })
+  await first.client.handler(registration)
+  const workspace = first.host.workspaces[0]
+  assert.ok(workspace !== undefined)
+  const removal = inbound('chat-registry-replay', `/project remove ${workspace.id}`, {
+    messageId: 'registry-remove-message',
+  })
+  await first.client.handler(removal)
+  assert.deepEqual(first.host.workspaces, [])
+  const binding = first.host.bindings.get('lark:chat-registry-replay')
+  const persisted = first.host.persisted.get('lark:chat-registry-replay')
+  assert.ok(binding !== undefined)
+  assert.ok(persisted !== undefined)
+
+  const restarted = mount(t, [], { cwd: project.path })
+  restarted.host.bindings.set('lark:chat-registry-replay', binding)
+  restarted.host.persisted.set('lark:chat-registry-replay', persisted)
+  assert.ok(restarted.client.handler !== undefined)
+  await restarted.client.handler(registration)
+
+  assert.deepEqual(restarted.host.workspaceCreateCalls, [])
+  assert.deepEqual(restarted.host.workspaces, [])
+  assert.match(restarted.client.sent.at(-1)?.text ?? '', /已处理.*查看当前列表/)
+
+  const replacement = new TestWorkspace(workspace.id, 'Replacement', project.path)
+  const replayRemoval = mount(t, [replacement], { cwd: project.path })
+  replayRemoval.host.bindings.set('lark:chat-registry-replay', binding)
+  replayRemoval.host.persisted.set('lark:chat-registry-replay', persisted)
+  assert.ok(replayRemoval.client.handler !== undefined)
+  await replayRemoval.client.handler(removal)
+  assert.deepEqual(replayRemoval.host.workspaceDeleteCalls, [])
+  assert.deepEqual(replayRemoval.host.workspaces, [replacement])
+  assert.match(replayRemoval.client.sent.at(-1)?.text ?? '', /已处理.*查看当前列表/)
+})
+
+test('pre-validation register and remove outcomes cannot gain a later side effect on replay', async (t) => {
+  const project = await temporaryProject(t)
+  const missingCwd = join(project.root, 'not-created')
+  const firstRegister = mount(t, [], { cwd: missingCwd })
+  assert.ok(firstRegister.client.handler !== undefined)
+  const registerMessage = inbound(
+    'chat-prevalidation-register',
+    '/project register Deferred Path',
+    { messageId: 'prevalidation-register-message' },
+  )
+  await firstRegister.client.handler(registerMessage)
+  assert.deepEqual(firstRegister.host.workspaceCreateCalls, [])
+  const registerBinding = firstRegister.host.bindings.get('lark:chat-prevalidation-register')
+  const registerSession = firstRegister.host.persisted.get('lark:chat-prevalidation-register')
+  assert.ok(registerBinding !== undefined)
+  assert.ok(registerSession !== undefined)
+  assert.equal(registerBinding.mutationHashes.length, 1)
+
+  const replayRegister = mount(t, [], { cwd: project.path })
+  replayRegister.host.bindings.set('lark:chat-prevalidation-register', registerBinding)
+  replayRegister.host.persisted.set('lark:chat-prevalidation-register', registerSession)
+  assert.ok(replayRegister.client.handler !== undefined)
+  await replayRegister.client.handler(registerMessage)
+  assert.deepEqual(replayRegister.host.workspaceCreateCalls, [])
+  assert.match(replayRegister.client.sent.at(-1)?.text ?? '', /已处理.*查看当前列表/)
+
+  const futureWorkspace = new TestWorkspace(
+    WORKSPACE_IDS.alpha,
+    'Future Registration',
+    project.path,
+  )
+  const firstRemove = mount(t, [], { cwd: project.path })
+  assert.ok(firstRemove.client.handler !== undefined)
+  const removeMessage = inbound(
+    'chat-prevalidation-remove',
+    `/project remove ${futureWorkspace.id}`,
+    { messageId: 'prevalidation-remove-message' },
+  )
+  await firstRemove.client.handler(removeMessage)
+  assert.deepEqual(firstRemove.host.workspaceDeleteCalls, [])
+  const removeBinding = firstRemove.host.bindings.get('lark:chat-prevalidation-remove')
+  const removeSession = firstRemove.host.persisted.get('lark:chat-prevalidation-remove')
+  assert.ok(removeBinding !== undefined)
+  assert.ok(removeSession !== undefined)
+  assert.equal(removeBinding.mutationHashes.length, 1)
+
+  const replayRemove = mount(t, [futureWorkspace], { cwd: project.path })
+  replayRemove.host.bindings.set('lark:chat-prevalidation-remove', removeBinding)
+  replayRemove.host.persisted.set('lark:chat-prevalidation-remove', removeSession)
+  assert.ok(replayRemove.client.handler !== undefined)
+  await replayRemove.client.handler(removeMessage)
+  assert.deepEqual(replayRemove.host.workspaceDeleteCalls, [])
+  assert.deepEqual(replayRemove.host.workspaces, [futureWorkspace])
+  assert.match(replayRemove.client.sent.at(-1)?.text ?? '', /已处理.*查看当前列表/)
+})
+
+test('the documented at-most-once boundary suppresses replay after an unconfirmed create acknowledgement', async (t) => {
+  const project = await temporaryProject(t)
+  const failed = mount(t, [], { cwd: project.path })
+  failed.host.workspaceCreateHandler = async () => {
+    throw new Error(`host rejected ${project.path}`)
+  }
+  assert.ok(failed.client.handler !== undefined)
+  const message = inbound('chat-at-most-once', '/project register One Attempt', {
+    messageId: 'registry-definite-failure',
+  })
+  await failed.client.handler(message)
+  assert.equal(failed.host.workspaceCreateCalls.length, 1)
+  assert.deepEqual(failed.host.workspaces, [])
+  assert.equal(
+    failed.host.errors.flat().some((value) => String(value).includes(project.path)),
+    false,
+    'a private cwd leaked through a host registry error',
+  )
+  const binding = failed.host.bindings.get('lark:chat-at-most-once')
+  const persisted = failed.host.persisted.get('lark:chat-at-most-once')
+  assert.ok(binding !== undefined)
+  assert.ok(persisted !== undefined)
+
+  const restarted = mount(t, [], { cwd: project.path })
+  restarted.host.bindings.set('lark:chat-at-most-once', binding)
+  restarted.host.persisted.set('lark:chat-at-most-once', persisted)
+  assert.ok(restarted.client.handler !== undefined)
+  await restarted.client.handler(message)
+  assert.deepEqual(restarted.host.workspaceCreateCalls, [])
+  assert.deepEqual(restarted.host.workspaces, [])
+  assert.match(restarted.client.sent.at(-1)?.text ?? '', /已处理.*查看当前列表/)
+})
+
+test('registration rechecks a symlink cwd after precommit and performs no stale-path create', async (t) => {
+  const project = await temporaryProject(t)
+  const other = join(project.root, 'other-target')
+  const link = join(project.root, 'current-project')
+  await mkdir(other)
+  await symlink(project.path, link, 'dir')
+  const { host, client } = mount(t, [], { cwd: link })
+  const bindingWrite = deferred<void>()
+  host.planBindingPut({ wait: bindingWrite.promise })
+
+  const registering = send(client, 'chat-symlink-precommit', '/project register Stable Link')
+  await waitFor(() => host.bindingPuts.length === 1, 'registration precommit did not start')
+  await rm(link)
+  await symlink(other, link, 'dir')
+  bindingWrite.resolve()
+  await registering
+
+  assert.deepEqual(host.workspaceCreateCalls, [])
+  assert.deepEqual(host.workspaces, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /注册管理暂不可用/)
+})
+
+test('a symlink cwd changed during create fails closed and requires a Workspace remount', async (t) => {
+  const project = await temporaryProject(t)
+  const other = join(project.root, 'other-target')
+  const link = join(project.root, 'current-project')
+  await mkdir(other)
+  await symlink(project.path, link, 'dir')
+  const { host, client, bridge } = mount(t, [], { cwd: link })
+  host.workspaceCreateHandler = async (path, title) => {
+    await rm(link)
+    await symlink(other, link, 'dir')
+    const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, title, path)
+    host.workspaces.push(workspace)
+    return workspace
+  }
+
+  await send(client, 'chat-symlink-create', '/project register Moving Link')
+  assert.equal(host.workspaceCreateCalls.length, 1)
+  assert.equal(host.workspaces[0]?.path, project.path)
+  assert.match(client.sent.at(-1)?.text ?? '', /注册失败.*重启服务/)
+  assert.equal(
+    host.errors.flat().some((value) => String(value).includes(project.path)),
+    false,
+  )
+  await bridge.stop()
+  await assert.rejects(
+    bridge.start(),
+    /requires a full storage remount after an interrupted workspace mutation/,
+  )
+  const hotReloaded = new LarkBridge(host.ctx as never, {
+    client: createClient(),
+    conversationBindings: {
+      read: (baseId) => host.bindings.get(baseId),
+      put: (baseId, binding) => host.putBinding(baseId, binding),
+      async close() {},
+    },
+    allowFrom: ['owner'],
+    projectManageFrom: ['owner'],
+  })
+  await assert.rejects(
+    hotReloaded.start(),
+    /requires a full storage remount after an interrupted workspace mutation/,
+  )
+})
+
+test('Workspace recovery fail-stop clears unrelated pending attachments and blocks every later mutation', async (t) => {
+  const project = await temporaryProject(t)
+  const other = join(project.root, 'other')
+  await mkdir(other)
+  const alpha = new TestWorkspace(WORKSPACE_IDS.alpha, 'Alpha', project.path)
+  const beta = new TestWorkspace(WORKSPACE_IDS.beta, 'Beta', await realpath(other))
+  const { host, client, bridge } = mount(t, [alpha, beta])
+  await send(client, 'chat-recovery-alpha', '/project Alpha')
+  const alphaSession = host.latestCreate()
+  host.workspaceDeleteHandler = async () => true
+
+  await send(client, 'chat-recovery-beta', `/project remove ${beta.id}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /移除失败.*重启服务/)
+  assert.deepEqual(host.workspaces, [alpha, beta])
+
+  await send(client, 'chat-recovery-alpha', 'ordinary work remains available')
+  assert.equal(host.followups.at(-1)?.agent, alphaSession.agent)
+  host.emitTurnStart(alphaSession.agent)
+  await yieldTurn()
+  assert.deepEqual(alpha.attachCalls, [], 'recovery mode allowed a pending attachment write')
+
+  const createsBefore = host.creates.length
+  await send(client, 'chat-recovery-alpha', `/project ${beta.id}`)
+  assert.equal(host.creates.length, createsBefore)
+  assert.match(client.sent.at(-1)?.text ?? '', /项目列表暂不可用/)
+  await send(client, 'chat-recovery-beta', '/project register Later')
+  assert.equal(host.workspaceCreateCalls.length, 0)
+  assert.match(client.sent.at(-1)?.text ?? '', /注册管理暂不可用/)
+
+  await bridge.stop()
+  await assert.rejects(
+    bridge.start(),
+    /requires a full storage remount after an interrupted workspace mutation/,
+  )
+})
+
+test('a delete rejection after an apparent effect remains unconfirmed and leaks no host path', async (t) => {
+  const project = await temporaryProject(t)
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Unconfirmed Delete', project.path)
+  const { host, client, bridge } = mount(t, [workspace], { cwd: project.path })
+  host.workspaceDeleteHandler = async (id) => {
+    const index = host.workspaces.findIndex((candidate) => candidate.id === id)
+    if (index >= 0) host.workspaces.splice(index, 1)
+    throw new Error(`delete acknowledgement exposed ${project.path}`)
+  }
+
+  await send(client, 'chat-delete-reject', `/project remove ${workspace.id}`)
+  assert.deepEqual(host.workspaces, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /移除失败.*重启服务/)
+  assert.equal(
+    host.errors.flat().some((value) => String(value).includes(project.path)),
+    false,
+  )
+  await send(client, 'chat-delete-reject', '/project register Blocked Later')
+  assert.deepEqual(host.workspaceCreateCalls, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /注册管理暂不可用/)
+  await bridge.stop()
+  await assert.rejects(
+    bridge.start(),
+    /requires a full storage remount after an interrupted workspace mutation/,
+  )
+})
+
+test('the global Workspace barrier orders switch before removal without blocking unrelated followups', async (t) => {
+  const project = await temporaryProject(t)
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Serialized', project.path)
+  const statusGate = deferred<void>()
+  workspace.statusWait = statusGate.promise
+  const { host, client } = mount(t, [workspace])
+
+  const switching = send(client, 'chat-switch-first', '/project Serialized')
+  await waitFor(() => workspace.statusCalls.length === 1, 'project switch did not enter validation')
+  const removing = send(client, 'chat-remove-second', `/project remove ${workspace.id}`)
+  await send(client, 'chat-unrelated', 'unrelated work stays live')
+  assert.equal(host.followups.at(-1)?.agent.session.id, 'lark:chat-unrelated')
+  assert.deepEqual(host.workspaceDeleteCalls, [])
+
+  statusGate.resolve()
+  await switching
+  await removing
+
+  const switched = host.creates.findLast((record) => record.cwd === project.path)
+  assert.ok(switched !== undefined)
+  assert.equal(switched.agent.disposed, false)
+  assert.deepEqual(host.workspaceDeleteCalls, [workspace.id])
+  assert.deepEqual(host.workspaces, [])
+  assert.ok(
+    host.operations.indexOf(`workspace-delete:${workspace.id}`)
+      > host.operations.indexOf(`create:${switched.sessionId}:${project.path}`),
+  )
+  assert.equal(host.bindings.get('lark:chat-switch-first')?.suffix,
+    switched.sessionId.slice('lark:chat-switch-first:'.length))
+})
+
+test('the global Workspace barrier makes a completed removal win over a later switch', async (t) => {
+  const project = await temporaryProject(t)
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Remove First', project.path)
+  const deleteGate = deferred<void>()
+  const { host, client } = mount(t, [workspace])
+  host.workspaceDeleteHandler = async (id) => {
+    await deleteGate.promise
+    const index = host.workspaces.findIndex((candidate) => candidate.id === id)
+    if (index < 0) return false
+    host.workspaces.splice(index, 1)
+    return true
+  }
+
+  const removing = send(client, 'chat-remove-first', `/project remove ${workspace.id}`)
+  await waitFor(() => host.workspaceDeleteCalls.length === 1, 'project removal did not start')
+  const switching = send(client, 'chat-switch-second', '/project Remove First')
+  await yieldTurn()
+  assert.deepEqual(workspace.statusCalls, [], 'later switch bypassed the removal barrier')
+  deleteGate.resolve()
+  await removing
+  await switching
+
+  assert.deepEqual(host.workspaces, [])
+  assert.equal(host.creates.some((record) => record.cwd === project.path), false)
+  const switchReply = client.sent.filter(({ chatId }) => chatId === 'chat-switch-second').at(-1)?.text ?? ''
+  assert.match(switchReply, /未找到/)
+})
+
+test('a stalled project-switch delivery does not retain the global Workspace barrier', async (t) => {
+  const project = await temporaryProject(t)
+  const other = join(project.root, 'other-delivery')
+  await mkdir(other)
+  const alpha = new TestWorkspace(WORKSPACE_IDS.alpha, 'Delivery Alpha', project.path)
+  const beta = new TestWorkspace(WORKSPACE_IDS.beta, 'Delivery Beta', await realpath(other))
+  const { host, client } = mount(t, [alpha, beta])
+  const deliveryGate = deferred<void>()
+  client.sendTextHandler = async (chatId, text) => {
+    if (chatId === 'chat-stalled-delivery' && /已切换到项目/.test(text)) {
+      await deliveryGate.promise
+    }
+  }
+
+  const switching = send(client, 'chat-stalled-delivery', '/project Delivery Alpha')
+  await waitFor(() => client.sent.some(({ chatId, text }) => (
+    chatId === 'chat-stalled-delivery' && /已切换到项目/.test(text)
+  )), 'project switch did not reach delivery')
+  await send(client, 'chat-after-delivery', `/project remove ${beta.id}`)
+
+  assert.deepEqual(host.workspaceDeleteCalls, [beta.id])
+  assert.deepEqual(host.workspaces, [alpha])
+  deliveryGate.resolve()
+  await switching
+})
+
+test('shutdown starts no Registry write after precommit and drains an already-started create', async (t) => {
+  const project = await temporaryProject(t)
+  const beforeMutation = mount(t, [], { cwd: project.path })
+  const bindingGate = deferred<void>()
+  beforeMutation.host.planBindingPut({ wait: bindingGate.promise })
+  const precommitting = send(
+    beforeMutation.client,
+    'chat-stop-precommit',
+    '/project register Stop Before Create',
+  )
+  await waitFor(() => beforeMutation.host.bindingPuts.length === 1, 'precommit did not start')
+  const precommitStop = beforeMutation.bridge.stop()
+  bindingGate.resolve()
+  await precommitting
+  await precommitStop
+  assert.deepEqual(beforeMutation.host.workspaceCreateCalls, [])
+
+  const duringResolve = mount(t, [], { cwd: project.path })
+  const resolveGate = deferred<void>()
+  duringResolve.host.workspaceResolveHandler = async () => {
+    await resolveGate.promise
+    return undefined
+  }
+  const resolving = send(
+    duringResolve.client,
+    'chat-stop-resolve',
+    '/project register Stop After Resolve',
+  )
+  await waitFor(
+    () => duringResolve.host.workspaceResolveCalls.length === 1,
+    'post-precommit Registry resolve did not start',
+  )
+  const resolveStop = duringResolve.bridge.stop()
+  resolveGate.resolve()
+  await resolving
+  await resolveStop
+  assert.deepEqual(duringResolve.host.workspaceCreateCalls, [])
+
+  const duringMutation = mount(t, [], { cwd: project.path })
+  const createGate = deferred<void>()
+  duringMutation.host.workspaceCreateHandler = async (path, title) => {
+    await createGate.promise
+    const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, title, path)
+    duringMutation.host.workspaces.push(workspace)
+    return workspace
+  }
+  const registering = send(
+    duringMutation.client,
+    'chat-stop-create',
+    '/project register Drain Started Create',
+  )
+  await waitFor(() => duringMutation.host.workspaceCreateCalls.length === 1, 'create did not start')
+  let stopped = false
+  const draining = duringMutation.bridge.stop().then(() => { stopped = true })
+  await yieldTurn()
+  assert.equal(stopped, false, 'shutdown abandoned an in-flight Registry create')
+  createGate.resolve()
+  await registering
+  await draining
+  assert.equal(stopped, true)
+  assert.equal(duringMutation.host.workspaces.length, 1)
+  assert.match(duringMutation.client.sent.at(-1)?.text ?? '', /已注册当前项目/)
+
+  const deleteWorkspace = new TestWorkspace(WORKSPACE_IDS.beta, 'Drain Delete', project.path)
+  const duringDelete = mount(t, [deleteWorkspace], { cwd: project.path })
+  const deleteGate = deferred<void>()
+  duringDelete.host.workspaceDeleteHandler = async (id) => {
+    await deleteGate.promise
+    const index = duringDelete.host.workspaces.findIndex((candidate) => candidate.id === id)
+    if (index < 0) return false
+    duringDelete.host.workspaces.splice(index, 1)
+    return true
+  }
+  const removing = send(
+    duringDelete.client,
+    'chat-stop-delete',
+    `/project remove ${deleteWorkspace.id}`,
+  )
+  await waitFor(() => duringDelete.host.workspaceDeleteCalls.length === 1, 'delete did not start')
+  let deleteStopped = false
+  const drainingDelete = duringDelete.bridge.stop().then(() => { deleteStopped = true })
+  await yieldTurn()
+  assert.equal(deleteStopped, false, 'shutdown abandoned an in-flight Registry delete')
+  deleteGate.resolve()
+  await removing
+  await drainingDelete
+  assert.equal(deleteStopped, true)
+  assert.deepEqual(duringDelete.host.workspaces, [])
+  assert.match(duringDelete.client.sent.at(-1)?.text ?? '', /已移除项目注册/)
+})
+
+test('shutdown starts no delete after waiting for an in-flight attachment to quiesce', async (t) => {
+  const project = await temporaryProject(t)
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Stop Removal', project.path)
+  const { host, client, bridge } = mount(t, [workspace])
+  await send(client, 'chat-stop-attachment', '/project Stop Removal')
+  const active = host.latestCreate()
+  const attachmentGate = deferred<void>()
+  workspace.statusWait = attachmentGate.promise
+  await send(client, 'chat-stop-attachment', 'start pending attachment')
+  host.emitTurnStart(active.agent)
+  await waitFor(() => workspace.statusCalls.length >= 3, 'attachment status did not start')
+
+  const removing = send(client, 'chat-stop-removal', `/project remove ${workspace.id}`)
+  await waitFor(() => host.flushCalls.length >= 4, 'removal precommit did not finish')
+  const stopping = bridge.stop()
+  attachmentGate.resolve()
+  await removing
+  await stopping
+
+  assert.deepEqual(host.workspaceDeleteCalls, [])
+  assert.deepEqual(host.workspaces, [workspace])
+})
+
+test('defaultSessionId shares project state without sharing project-manager authority', async (t) => {
+  const project = await temporaryProject(t)
+  const { host, client } = mount(t, [], {
+    cwd: project.path,
+    defaultSessionId: 'shared-project-session',
+    allowFrom: ['owner', 'peer'],
+    projectManageFrom: ['owner'],
+  })
+
+  await send(client, 'chat-owner', '/project register Shared Project')
+  const workspace = host.workspaces[0]
+  assert.ok(workspace !== undefined)
+  await send(client, 'chat-peer', '/project', { openId: 'peer' })
+  assert.match(client.sent.at(-1)?.text ?? '', /Shared Project/)
+  await send(client, 'chat-peer', `/project remove ${workspace.id}`, { openId: 'peer' })
+  assert.match(client.sent.at(-1)?.text ?? '', /没有项目注册管理权限/)
+  assert.deepEqual(host.workspaceDeleteCalls, [])
+
+  await send(client, 'chat-owner', `/project remove ${workspace.id}`)
+  assert.deepEqual(host.workspaceDeleteCalls, [workspace.id])
+  assert.equal(host.creates.length, 1)
+  assert.equal(host.latestCreate().sessionId, 'shared-project-session')
+  assert.equal(host.latestCreate().agent.disposed, false)
+  assert.equal(host.bindings.get('shared-project-session')?.mutationHashes.length, 2)
+})
+
+test('removal quiesces an in-flight Workspace attachment and prevents retries to the old id', async (t) => {
+  const project = await temporaryProject(t)
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Attach Target', project.path)
+  const { host, client } = mount(t, [workspace])
+  await send(client, 'chat-attach', '/project Attach Target')
+  const active = host.latestCreate()
+  const attachmentStatus = deferred<void>()
+  workspace.statusWait = attachmentStatus.promise
+  await send(client, 'chat-attach', 'make this generation durable')
+  host.emitTurnStart(active.agent)
+  await waitFor(() => workspace.statusCalls.length >= 3, 'Workspace attachment did not start')
+
+  const removing = send(client, 'chat-remove-attach', `/project remove ${workspace.id}`)
+  await yieldTurn()
+  assert.deepEqual(host.workspaceDeleteCalls, [], 'removal raced past the in-flight attachment')
+  attachmentStatus.resolve()
+  await removing
+
+  assert.deepEqual(workspace.attachCalls, [])
+  assert.deepEqual(host.workspaceDeleteCalls, [workspace.id])
+  host.emitTurnStart(active.agent, 2)
+  await yieldTurn()
+  assert.deepEqual(workspace.attachCalls, [], 'a removed Workspace attachment retried')
+  assert.equal(active.agent.disposed, false)
 })
 
 test('a successful project switch creates an empty durable generation with cwd, preset, and scoped tools', async (t) => {
@@ -1401,14 +2219,14 @@ test('workspace attach failure is warned after commit and does not roll back the
   host.emitTurnStart(fresh.agent)
   await waitFor(
     () => host.warnings.some((args) => (
-      args.some((value) => String(value).includes('workspace index unavailable'))
+      args.some((value) => String(value).includes('durable workspace session attachment failed'))
     )),
     'deferred Workspace attachment failure was not reported',
   )
   assert.deepEqual(workspace.attachCalls, [fresh.sessionId])
-  assert.ok(host.warnings.some((args) => (
-    args.some((value) => String(value).includes('workspace index unavailable'))
-  )))
+  assert.equal(host.warnings.flat().some((value) => (
+    String(value).includes('workspace index unavailable')
+  )), false)
 
   assert.equal(host.followups.at(-1)?.agent, fresh.agent)
   assert.ok(client.sent.some(({ text }) => /Alpha Repo/.test(text)))

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { realpath, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
@@ -35,6 +36,7 @@ export interface LarkBridgeOptions {
   locale?: LarkLocale
   allowFrom?: string[]
   allowAllUsers?: boolean
+  projectManageFrom?: string[]
   defaultSessionId?: string
   provider?: string
   model?: string
@@ -139,12 +141,38 @@ interface WorkspaceRegistryLike {
   list(): ReadonlyArray<RegisteredWorkspace>
   get(id: string): RegisteredWorkspace | undefined
   resolveByPath?(path: string): Promise<RegisteredWorkspace | undefined>
+  create?(path: string, title: string): Promise<RegisteredWorkspace>
+  delete?(id: string): Promise<boolean>
 }
 
 interface ProjectSelection {
   readonly registry: WorkspaceRegistryLike
   readonly workspaces: readonly RegisteredWorkspace[]
   readonly workspace: RegisteredWorkspace
+}
+
+type ProjectSelectionResult = {
+  readonly kind: 'selected'
+  readonly selection: ProjectSelection
+} | {
+  readonly kind: 'missing'
+  readonly workspace: RegisteredWorkspace
+} | {
+  readonly kind: 'ambiguous' | 'failed' | 'unavailable' | 'unknown'
+}
+
+type ProjectSwitchCommandResult = {
+  readonly kind: 'switched' | 'already-current' | 'missing'
+  readonly workspace: RegisteredWorkspace
+} | {
+  readonly kind: 'ambiguous' | 'busy' | 'history-failed' | 'unavailable' | 'unknown' | 'failed'
+}
+
+type ProjectRegistryCommandResult = {
+  readonly kind: 'registered' | 'already-registered' | 'removed'
+  readonly workspace: RegisteredWorkspace
+} | {
+  readonly kind: 'busy' | 'unavailable' | 'unknown' | 'replayed' | 'register-failed' | 'remove-failed'
 }
 
 interface PendingWorkspaceAttachment {
@@ -188,6 +216,8 @@ interface CommandRuntimeLike {
 
 interface MessageRoute {
   readonly chatId: string
+  readonly chatType: LarkInbound['chatType']
+  readonly mentioned: boolean
   readonly openId: string
   readonly replyToMessageId: string
   readonly sessionBaseId: string
@@ -256,6 +286,12 @@ const MODEL_PROVIDER_ID_LIMIT = 256
 const MODEL_ID_LIMIT = 512
 const MODEL_CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu
 const MODEL_CONTROL_CHARACTER_TEST_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const PROJECT_TITLE_LIMIT = 120
+const PROJECT_ID_LIMIT = 256
+const PROJECT_CONTROL_CHARACTER_TEST_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const PROJECT_PATH_LIKE_TITLE_PATTERN = /^(?:[A-Za-z]:\S|file:(?:[/\\]|$)|[/\\]{1,2}|~(?:[/\\]|$)|\.{1,2}(?:[/\\]|$))/iu
+const PROJECT_PLATFORM_TAG_TEST_PATTERN = /<[^>]*>/u
+const WORKSPACE_REGISTRIES_REQUIRING_REMOUNT = new WeakSet<object>()
 
 const APPROVAL_DECISION = {
   allowOnce: 'allowed-once',
@@ -545,6 +581,35 @@ function safeModelDisplay(value: string, fallback: string): { readonly text: str
   return { text: `${runes.slice(0, MODEL_DISPLAY_FIELD_LIMIT - 1).join('')}…`, truncated: true }
 }
 
+function projectRegistrationTitle(input: string): string | undefined {
+  if (!input.isWellFormed()
+    || PROJECT_CONTROL_CHARACTER_TEST_PATTERN.test(input)
+    || PROJECT_PLATFORM_TAG_TEST_PATTERN.test(input)) return undefined
+  const normalized = input.replace(/\s+/gu, ' ').trim()
+  if (normalized === ''
+    || [...normalized].length > PROJECT_TITLE_LIMIT
+    || PROJECT_PATH_LIKE_TITLE_PATTERN.test(normalized)) return undefined
+  return normalized
+}
+
+async function canonicalProjectDirectory(value: unknown): Promise<string | undefined> {
+  if (typeof value !== 'string' || !isAbsolute(value) || !value.isWellFormed()) return undefined
+  try {
+    const canonical = await realpath(value)
+    return (await stat(canonical)).isDirectory() ? canonical : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function validProjectIdInput(input: string): boolean {
+  return input !== ''
+    && input.length <= PROJECT_ID_LIMIT
+    && input.isWellFormed()
+    && !/\s/u.test(input)
+    && !PROJECT_CONTROL_CHARACTER_TEST_PATTERN.test(input)
+}
+
 function modelTarget(input: string): ConversationModelSelection | undefined {
   const match = /^(\S+)\s+(.+)$/u.exec(input.trim())
   if (match === null) return undefined
@@ -711,8 +776,8 @@ function registeredWorkspace(value: unknown): RegisteredWorkspace {
   }
   const candidate = value as Partial<RegisteredWorkspace>
   if (typeof candidate.id !== 'string'
-    || candidate.id === ''
-    || /\s/.test(candidate.id)
+    || !validProjectIdInput(candidate.id)
+    || PROJECT_PLATFORM_TAG_TEST_PATTERN.test(candidate.id)
     || typeof candidate.path !== 'string'
     || !isAbsolute(candidate.path)
     || typeof candidate.title !== 'string'
@@ -735,7 +800,9 @@ function workspaceRegistryOf(ctx: Context): WorkspaceRegistryLike | undefined {
   const candidate = service as Partial<WorkspaceRegistryLike>
   if (typeof candidate.list !== 'function'
     || typeof candidate.get !== 'function'
-    || (candidate.resolveByPath !== undefined && typeof candidate.resolveByPath !== 'function')) {
+    || (candidate.resolveByPath !== undefined && typeof candidate.resolveByPath !== 'function')
+    || (candidate.create !== undefined && typeof candidate.create !== 'function')
+    || (candidate.delete !== undefined && typeof candidate.delete !== 'function')) {
     throw new TypeError('lark: workspaceRegistry service is invalid')
   }
   return candidate as WorkspaceRegistryLike
@@ -788,6 +855,7 @@ export class LarkBridge {
   private readonly text: ReturnType<typeof localeCopy>['bridge']
   private readonly allowFrom: ReadonlySet<string>
   private readonly allowAllUsers: boolean
+  private readonly projectManageFrom: ReadonlySet<string>
   private readonly sharedSessionBaseId: string | undefined
   private readonly provider: string
   private readonly model: string
@@ -819,6 +887,7 @@ export class LarkBridge {
   private readonly conversationBindings: ConversationBindingStore | undefined
   private readonly sessionOperations = new Map<string, Promise<void>>()
   private readonly conversationBarriers = new Map<string, Promise<void>>()
+  private workspaceMutationTail: Promise<void> = Promise.resolve()
   private readonly pendingWorkspaceAttachments = new Map<string, PendingWorkspaceAttachment>()
   private readonly workspaceAttachmentTasks = new Map<string, Promise<void>>()
   private readonly workspaceAttachmentRetries = new Set<string>()
@@ -836,6 +905,7 @@ export class LarkBridge {
   private conversationEvictionRequested = false
   private conversationAccessSequence = 0
   private bindingRecoveryRequired = false
+  private workspaceMutationRecoveryRequired = false
   private commandAbort = new AbortController()
 
   constructor(ctx: Context, options: LarkBridgeOptions) {
@@ -847,6 +917,9 @@ export class LarkBridge {
     this.text = localeCopy(this.locale).bridge
     this.allowFrom = new Set((options.allowFrom ?? []).map((openId) => openId.trim()).filter(Boolean))
     this.allowAllUsers = options.allowAllUsers ?? DEFAULT_CONFIG.allowAllUsers
+    this.projectManageFrom = new Set(
+      (options.projectManageFrom ?? []).map((openId) => openId.trim()).filter(Boolean),
+    )
     const defaultSessionId = (options.defaultSessionId ?? '').trim()
     this.sharedSessionBaseId = defaultSessionId === '' ? undefined : defaultSessionId
     this.provider = options.provider ?? DEFAULT_CONFIG.provider
@@ -870,9 +943,22 @@ export class LarkBridge {
   }
 
   start(): Promise<void> {
+    try {
+      const registry = workspaceRegistryOf(this.ctx)
+      if (registry !== undefined && WORKSPACE_REGISTRIES_REQUIRING_REMOUNT.has(registry)) {
+        this.workspaceMutationRecoveryRequired = true
+      }
+    } catch {
+      // Service validation remains command-scoped, as before.
+    }
     if (this.bindingRecoveryRequired) {
       return Promise.reject(new Error(
         'lark: bridge requires a full storage remount after an interrupted binding confirmation',
+      ))
+    }
+    if (this.workspaceMutationRecoveryRequired) {
+      return Promise.reject(new Error(
+        'lark: bridge requires a full storage remount after an interrupted workspace mutation',
       ))
     }
     if (this.stopPromise !== undefined) {
@@ -1037,6 +1123,8 @@ export class LarkBridge {
     const mutationHash = inboundMutationHash(msg.chatId, msg.messageId)
     const route: MessageRoute = {
       chatId: msg.chatId,
+      chatType: msg.chatType,
+      mentioned: msg.mentioned,
       openId: msg.openId,
       replyToMessageId: msg.messageId,
       sessionBaseId: this.sessionBaseId(msg),
@@ -1297,8 +1385,18 @@ export class LarkBridge {
         break
       case '/project': {
         const target = text.slice(command.length).trim()
-        if (target === '') await this.showProjects(route)
-        else await this.scheduleProjectSwitch(route, target)
+        const separator = target.search(/\s/u)
+        const action = separator < 0 ? target : target.slice(0, separator)
+        const actionInput = separator < 0 ? '' : target.slice(separator).trim()
+        if (target === '' || target === 'list') {
+          await this.showProjects(route)
+        } else if (action === 'register') {
+          await this.scheduleProjectRegistration(route, actionInput)
+        } else if (action === 'remove') {
+          await this.scheduleProjectRemoval(route, actionInput)
+        } else {
+          await this.scheduleProjectSwitch(route, target)
+        }
         break
       }
       case '/model': {
@@ -1329,14 +1427,27 @@ export class LarkBridge {
       const workspaces = listedWorkspaces(registry)
       await this.withConversation(route.sessionBaseId, async (conversation) => {
         const current = await this.currentWorkspace(conversation, registry, workspaces)
+        const canRegisterCurrent = this.canManageProjects(route)
+          && !this.workspaceMutationRecoveryRequired
+          && registry.create !== undefined
+          && registry.delete !== undefined
+          && registry.resolveByPath !== undefined
+          && sessionPersistenceOf(this.ctx) !== undefined
+          && this.conversationBindings !== undefined
+          && route.mutationHash !== undefined
+          && await canonicalProjectDirectory(conversation.handle.agent.session.header.cwd) !== undefined
         await this.safeSend(
           route.chatId,
-          this.text.projectList(current?.id, workspaces),
+          this.text.projectList(
+            current?.id,
+            workspaces,
+            canRegisterCurrent,
+          ),
           routeDeliveryOptions(route),
         )
       })
-    } catch (error) {
-      this.ctx.logger.warn('[lark] project listing failed: %s', messageOf(error))
+    } catch {
+      this.ctx.logger.warn('[lark] project listing failed')
       await this.safeSend(route.chatId, this.text.projectUnavailable, routeDeliveryOptions(route))
     }
   }
@@ -1383,9 +1494,413 @@ export class LarkBridge {
       if (conversation.sessionId !== activeSessionId || conversation.handle !== activeHandle) return undefined
       if (listed !== undefined) conversation.workspaceId = listed.id
       return listed
-    } catch (error) {
-      this.ctx.logger.warn('[lark] current project resolution failed: %s', messageOf(error))
+    } catch {
+      this.ctx.logger.warn('[lark] current project resolution failed')
       return undefined
+    }
+  }
+
+  private canManageProjects(route: MessageRoute): boolean {
+    return route.chatType === 'p2p' && this.projectManageFrom.has(route.openId)
+  }
+
+  private async requireProjectManager(route: MessageRoute): Promise<boolean> {
+    if (!this.projectManageFrom.has(route.openId)) {
+      await this.safeSend(
+        route.chatId,
+        this.text.projectManagementDenied,
+        routeDeliveryOptions(route),
+      )
+      return false
+    }
+    if (route.chatType !== 'p2p') {
+      await this.safeSend(
+        route.chatId,
+        this.text.projectManagementDirectOnly,
+        routeDeliveryOptions(route),
+      )
+      return false
+    }
+    return true
+  }
+
+  private scheduleProjectRegistration(route: MessageRoute, input: string): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, async () => {
+      if (!await this.requireProjectManager(route)) return
+      const title = projectRegistrationTitle(input)
+      if (title === undefined) {
+        await this.safeSend(route.chatId, this.text.projectRegisterUsage, routeDeliveryOptions(route))
+        return
+      }
+      const result = await this.enqueueWorkspaceMutation(() => (
+        this.withConversation(route.sessionBaseId, async (conversation) => {
+          await this.sessionOperations.get(conversation.baseId)
+          return this.registerCurrentProject(route, conversation, title)
+        })
+      ))
+      await this.sendProjectRegistryResult(route, result)
+    })
+  }
+
+  private async registerCurrentProject(
+    route: MessageRoute,
+    conversation: ConversationSession,
+    title: string,
+  ): Promise<ProjectRegistryCommandResult> {
+    if (this.stopping || this.workspaceMutationRecoveryRequired) return { kind: 'unavailable' }
+    const registry = workspaceRegistryOf(this.ctx)
+    if (registry?.create === undefined
+      || registry.delete === undefined
+      || registry.resolveByPath === undefined
+      || sessionPersistenceOf(this.ctx) === undefined
+      || this.conversationBindings === undefined
+      || route.mutationHash === undefined) return { kind: 'unavailable' }
+    if (this.conversationBindings.read(conversation.baseId)?.mutationHashes.includes(
+      route.mutationHash,
+    )) return { kind: 'replayed' }
+
+    const handle = conversation.handle
+    const sessionId = conversation.sessionId
+    const cwd = handle.agent.session.header.cwd
+    const canonical = await canonicalProjectDirectory(cwd)
+
+    const precommit = await this.precommitProjectRegistryMutation(route, conversation)
+    if (precommit !== 'recorded') return { kind: precommit }
+    if (this.stopping || this.commandAbort.signal.aborted) return { kind: 'unavailable' }
+    if (canonical === undefined) return { kind: 'unavailable' }
+    if (conversation.handle !== handle
+      || conversation.sessionId !== sessionId
+      || handle.agent.session.header.cwd !== cwd
+      || await canonicalProjectDirectory(cwd) !== canonical) return { kind: 'unavailable' }
+
+    let existingRaw: RegisteredWorkspace | undefined
+    try {
+      const resolved = await registry.resolveByPath(canonical)
+      existingRaw = resolved === undefined ? undefined : registeredWorkspace(resolved)
+    } catch {
+      return { kind: 'register-failed' }
+    }
+
+    if (existingRaw !== undefined) {
+      try {
+        const workspace = await this.confirmWorkspaceRegistration(registry, existingRaw, canonical)
+        if (conversation.handle !== handle
+          || conversation.sessionId !== sessionId
+          || handle.agent.session.header.cwd !== cwd
+          || await canonicalProjectDirectory(cwd) !== canonical) return { kind: 'register-failed' }
+        conversation.workspaceId = workspace.id
+        return { kind: 'already-registered', workspace }
+      } catch {
+        return { kind: 'register-failed' }
+      }
+    }
+
+    if (this.stopping || this.commandAbort.signal.aborted) return { kind: 'unavailable' }
+
+    let created: unknown
+    try {
+      created = await registry.create(canonical, title)
+    } catch {
+      this.requireWorkspaceRemount(registry, 'project registration is unconfirmed')
+      return { kind: 'register-failed' }
+    }
+
+    let workspace: RegisteredWorkspace
+    try {
+      workspace = await this.confirmWorkspaceRegistration(registry, created, canonical)
+    } catch {
+      const observed = await this.inspectWorkspaceRegistration(registry, canonical)
+      if (observed.kind !== 'confirmed') {
+        this.requireWorkspaceRemount(registry, 'project registration postcondition is unconfirmed')
+        return { kind: 'register-failed' }
+      }
+      workspace = observed.workspace
+    }
+    if (conversation.handle !== handle
+      || conversation.sessionId !== sessionId
+      || handle.agent.session.header.cwd !== cwd
+      || await canonicalProjectDirectory(cwd) !== canonical) {
+      this.requireWorkspaceRemount(registry, 'project registration cwd changed during commit')
+      return { kind: 'register-failed' }
+    }
+    conversation.workspaceId = workspace.id
+    return {
+      kind: workspace.title === title ? 'registered' : 'already-registered',
+      workspace,
+    }
+  }
+
+  private async inspectWorkspaceRegistration(
+    registry: WorkspaceRegistryLike,
+    canonical: string,
+  ): Promise<{
+    readonly kind: 'confirmed'
+    readonly workspace: RegisteredWorkspace
+  } | {
+    readonly kind: 'absent'
+  } | {
+    readonly kind: 'ambiguous'
+  }> {
+    try {
+      const resolved = await registry.resolveByPath?.(canonical)
+      if (resolved !== undefined) {
+        return {
+          kind: 'confirmed',
+          workspace: await this.confirmWorkspaceRegistration(registry, resolved, canonical),
+        }
+      }
+      return listedWorkspaces(registry).some((workspace) => workspace.path === canonical)
+        ? { kind: 'ambiguous' }
+        : { kind: 'absent' }
+    } catch {
+      return { kind: 'ambiguous' }
+    }
+  }
+
+  private async confirmWorkspaceRegistration(
+    registry: WorkspaceRegistryLike,
+    value: unknown,
+    canonical: string,
+  ): Promise<RegisteredWorkspace> {
+    const workspace = registeredWorkspace(value)
+    if (workspace.path !== canonical || await workspace.status() !== 'ok') {
+      throw new Error('workspace registration postcondition failed')
+    }
+    const byId = registry.get(workspace.id)
+    if (byId === undefined) throw new Error('workspace registration is absent by id')
+    const confirmed = registeredWorkspace(byId)
+    if (confirmed.id !== workspace.id || confirmed.path !== canonical) {
+      throw new Error('workspace registration id/path mismatch')
+    }
+    const listed = listedWorkspaces(registry).filter((candidate) => candidate.id === workspace.id)
+    if (listed.length !== 1 || listed[0]?.path !== canonical) {
+      throw new Error('workspace registration list mismatch')
+    }
+    const resolved = registry.resolveByPath === undefined
+      ? undefined
+      : await registry.resolveByPath(canonical)
+    if (resolved === undefined) throw new Error('workspace registration path resolution failed')
+    const pathMatch = registeredWorkspace(resolved)
+    if (pathMatch.id !== workspace.id || pathMatch.path !== canonical) {
+      throw new Error('workspace registration path mismatch')
+    }
+    if (await realpath(canonical) !== canonical) {
+      throw new Error('workspace registration canonical path changed')
+    }
+    return workspace
+  }
+
+  private scheduleProjectRemoval(route: MessageRoute, input: string): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, async () => {
+      if (!await this.requireProjectManager(route)) return
+      const id = input.trim()
+      if (!validProjectIdInput(id)) {
+        await this.safeSend(route.chatId, this.text.projectRemoveUsage, routeDeliveryOptions(route))
+        return
+      }
+      const result = await this.enqueueWorkspaceMutation(() => (
+        this.withConversation(route.sessionBaseId, async (conversation) => {
+          await this.sessionOperations.get(conversation.baseId)
+          return this.removeProjectRegistration(route, conversation, id)
+        })
+      ))
+      await this.sendProjectRegistryResult(route, result)
+    })
+  }
+
+  private async removeProjectRegistration(
+    route: MessageRoute,
+    conversation: ConversationSession,
+    id: string,
+  ): Promise<ProjectRegistryCommandResult> {
+    if (this.stopping || this.workspaceMutationRecoveryRequired) return { kind: 'unavailable' }
+    const registry = workspaceRegistryOf(this.ctx)
+    if (registry?.create === undefined
+      || registry.delete === undefined
+      || registry.resolveByPath === undefined
+      || sessionPersistenceOf(this.ctx) === undefined
+      || this.conversationBindings === undefined
+      || route.mutationHash === undefined) return { kind: 'unavailable' }
+    if (this.conversationBindings.read(conversation.baseId)?.mutationHashes.includes(
+      route.mutationHash,
+    )) return { kind: 'replayed' }
+
+    const precommit = await this.precommitProjectRegistryMutation(route, conversation)
+    if (precommit !== 'recorded') return { kind: precommit }
+    if (this.stopping || this.commandAbort.signal.aborted) return { kind: 'unavailable' }
+
+    let workspace: RegisteredWorkspace | undefined
+    try {
+      workspace = listedWorkspaces(registry).find((candidate) => candidate.id === id)
+      if (workspace === undefined) return { kind: 'unknown' }
+      const current = registry.get(id)
+      if (current === undefined) return { kind: 'unknown' }
+      const confirmed = registeredWorkspace(current)
+      if (confirmed.id !== workspace.id || confirmed.path !== workspace.path) {
+        return { kind: 'unavailable' }
+      }
+    } catch {
+      return { kind: 'unavailable' }
+    }
+
+    await this.quiesceWorkspaceAttachments(workspace.id)
+    if (this.stopping || this.commandAbort.signal.aborted) return { kind: 'unavailable' }
+    let deletionResult: boolean | undefined
+    try {
+      deletionResult = await registry.delete(workspace.id)
+    } catch {
+      this.requireWorkspaceRemount(registry, 'project registration removal is unconfirmed')
+      return { kind: 'remove-failed' }
+    }
+    const removalState = this.inspectWorkspaceRemoval(registry, workspace)
+    if (removalState === 'ambiguous') {
+      this.requireWorkspaceRemount(registry, 'project registration removal is unconfirmed')
+      return { kind: 'remove-failed' }
+    }
+    if (removalState === 'present') {
+      if (deletionResult === false) return { kind: 'remove-failed' }
+      this.requireWorkspaceRemount(registry, 'project registration removal postcondition failed')
+      return { kind: 'remove-failed' }
+    }
+    this.invalidateWorkspaceRegistration(workspace.id)
+    return { kind: 'removed', workspace }
+  }
+
+  private inspectWorkspaceRemoval(
+    registry: WorkspaceRegistryLike,
+    workspace: RegisteredWorkspace,
+  ): 'absent' | 'present' | 'ambiguous' {
+    try {
+      const byIdRaw = registry.get(workspace.id)
+      const listed = listedWorkspaces(registry).filter((candidate) => candidate.id === workspace.id)
+      if (byIdRaw === undefined && listed.length === 0) return 'absent'
+      if (byIdRaw === undefined || listed.length !== 1) return 'ambiguous'
+      const byId = registeredWorkspace(byIdRaw)
+      const fromList = listed[0]
+      return byId.id === workspace.id
+        && byId.path === workspace.path
+        && fromList?.path === workspace.path
+        ? 'present'
+        : 'ambiguous'
+    } catch {
+      return 'ambiguous'
+    }
+  }
+
+  private requireWorkspaceRemount(registry: WorkspaceRegistryLike, reason: string): void {
+    this.workspaceMutationRecoveryRequired = true
+    WORKSPACE_REGISTRIES_REQUIRING_REMOUNT.add(registry)
+    this.pendingWorkspaceAttachments.clear()
+    this.workspaceAttachmentRetries.clear()
+    this.ctx.logger.error(`[lark] ${reason}; remount required`)
+  }
+
+  private async precommitProjectRegistryMutation(
+    route: MessageRoute,
+    conversation: ConversationSession,
+  ): Promise<'recorded' | 'busy' | 'unavailable'> {
+    const mutationHash = route.mutationHash
+    if (this.stopping
+      || this.commandAbort.signal.aborted
+      || mutationHash === undefined
+      || sessionPersistenceOf(this.ctx) === undefined
+      || this.conversationBindings === undefined) return 'unavailable'
+    const handle = conversation.handle
+    const sessionId = conversation.sessionId
+    let maintenance: Promise<'recorded' | 'busy' | 'unavailable'>
+    try {
+      maintenance = handle.agent.runMaintenance(async (signal) => {
+        if (signal.aborted || handle.agent.inbox.hasPending) return 'busy'
+        const durable = await this.ctx.sessions.flush(handle.agent.session)
+        if (durable !== true) return 'unavailable'
+        if (signal.aborted
+          || handle.agent.inbox.hasPending
+          || conversation.handle !== handle
+          || conversation.sessionId !== sessionId) return 'busy'
+        const committed = this.conversationBindings?.read(conversation.baseId)
+        if (committed !== undefined
+          && String(boundSessionId(conversation.baseId, committed)) !== sessionId) {
+          return 'unavailable'
+        }
+        await this.putConversationBinding(
+          conversation.baseId,
+          this.mutatedConversationBinding(
+            conversation.baseId,
+            sessionId,
+            conversation.modelSelection,
+            mutationHash,
+          ),
+        )
+        if (this.stopping || this.commandAbort.signal.aborted) return 'unavailable'
+        return 'recorded'
+      })
+    } catch {
+      return 'busy'
+    }
+    try {
+      return await maintenance
+    } catch (error) {
+      if (error instanceof BindingConfirmationInterruptedError) throw error
+      this.ctx.logger.error('[lark] project registry mutation precommit failed')
+      return 'unavailable'
+    }
+  }
+
+  private async quiesceWorkspaceAttachments(workspaceId: string): Promise<void> {
+    const tasks = new Set<Promise<void>>()
+    for (const [sessionId, pending] of this.pendingWorkspaceAttachments) {
+      if (pending.workspaceId !== workspaceId) continue
+      this.pendingWorkspaceAttachments.delete(sessionId)
+      this.workspaceAttachmentRetries.delete(sessionId)
+      const task = this.workspaceAttachmentTasks.get(sessionId)
+      if (task !== undefined) tasks.add(task)
+    }
+    await Promise.all(tasks)
+  }
+
+  private invalidateWorkspaceRegistration(workspaceId: string): void {
+    for (const conversation of this.conversations.values()) {
+      if (conversation.workspaceId === workspaceId) conversation.workspaceId = undefined
+    }
+    for (const [sessionId, pending] of this.pendingWorkspaceAttachments) {
+      if (pending.workspaceId !== workspaceId) continue
+      this.pendingWorkspaceAttachments.delete(sessionId)
+      this.workspaceAttachmentRetries.delete(sessionId)
+    }
+  }
+
+  private async sendProjectRegistryResult(
+    route: MessageRoute,
+    result: ProjectRegistryCommandResult,
+  ): Promise<void> {
+    const options = routeDeliveryOptions(route)
+    switch (result.kind) {
+      case 'registered':
+        await this.safeSend(route.chatId, this.text.projectRegistered(result.workspace), options)
+        return
+      case 'already-registered':
+        await this.safeSend(route.chatId, this.text.projectAlreadyRegistered(result.workspace), options)
+        return
+      case 'removed':
+        await this.safeSend(route.chatId, this.text.projectRemoved(result.workspace), options)
+        return
+      case 'busy':
+        await this.safeSend(route.chatId, this.text.projectBusy, options)
+        return
+      case 'unknown':
+        await this.safeSend(route.chatId, this.text.projectUnknown, options)
+        return
+      case 'replayed':
+        await this.safeSend(route.chatId, this.text.projectRegistryMutationReplayed, options)
+        return
+      case 'unavailable':
+        await this.safeSend(route.chatId, this.text.projectRegistrationUnavailable, options)
+        return
+      case 'register-failed':
+        await this.safeSend(route.chatId, this.text.projectRegistrationFailed, options)
+        return
+      case 'remove-failed':
+        await this.safeSend(route.chatId, this.text.projectRemovalFailed, options)
     }
   }
 
@@ -1404,37 +1919,38 @@ export class LarkBridge {
         })
         return
       }
-      const selection = await this.resolveProjectSelection(route, target)
-      if (selection === undefined) return
-      await this.withConversation(route.sessionBaseId, async (conversation) => {
-        await this.sessionOperations.get(conversation.baseId)
-        await this.switchProject(route, conversation, selection)
+      const result = await this.enqueueWorkspaceMutation<ProjectSwitchCommandResult>(async () => {
+        const resolved = await this.resolveProjectSelection(target)
+        if (resolved.kind !== 'selected') return resolved
+        return this.withConversation(route.sessionBaseId, async (conversation) => {
+          await this.sessionOperations.get(conversation.baseId)
+          return this.switchProject(route, conversation, resolved.selection)
+        })
       })
+      await this.sendProjectSwitchResult(route, result)
     })
   }
 
   private async resolveProjectSelection(
-    route: MessageRoute,
     target: string,
-  ): Promise<ProjectSelection | undefined> {
-    const deliveryOptions = routeDeliveryOptions(route)
+  ): Promise<ProjectSelectionResult> {
     let registry: WorkspaceRegistryLike | undefined
     let workspaces: RegisteredWorkspace[]
     try {
+      if (this.stopping || this.workspaceMutationRecoveryRequired) {
+        return { kind: 'unavailable' }
+      }
       registry = workspaceRegistryOf(this.ctx)
       if (registry === undefined) {
-        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
-        return
+        return { kind: 'unavailable' }
       }
       if (sessionPersistenceOf(this.ctx) === undefined || this.conversationBindings === undefined) {
-        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
-        return
+        return { kind: 'unavailable' }
       }
       workspaces = listedWorkspaces(registry)
-    } catch (error) {
-      this.ctx.logger.warn('[lark] project registry lookup failed: %s', messageOf(error))
-      await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
-      return
+    } catch {
+      this.ctx.logger.warn('[lark] project registry lookup failed')
+      return { kind: 'unavailable' }
     }
 
     const idMatch = workspaces.find((workspace) => workspace.id === target)
@@ -1442,39 +1958,28 @@ export class LarkBridge {
       ? workspaces.filter((workspace) => workspace.title === target)
       : []
     if (idMatch === undefined && titleMatches.length === 0) {
-      await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
-      return
+      return { kind: 'unknown' }
     }
     if (idMatch === undefined && titleMatches.length > 1) {
-      await this.safeSend(route.chatId, this.text.projectAmbiguous, deliveryOptions)
-      return
+      return { kind: 'ambiguous' }
     }
     const selected = idMatch ?? titleMatches[0]
-    if (selected === undefined) {
-      await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
-      return
-    }
+    if (selected === undefined) return { kind: 'unknown' }
 
     try {
       if (await selected.status() !== 'ok') {
-        await this.safeSend(route.chatId, this.text.projectMissingDirectory(selected), deliveryOptions)
-        return
+        return { kind: 'missing', workspace: selected }
       }
       const resolved = registry.get(selected.id)
-      if (resolved === undefined) {
-        await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
-        return
-      }
+      if (resolved === undefined) return { kind: 'unknown' }
       const workspace = registeredWorkspace(resolved)
       if (workspace.id !== selected.id || workspace.path !== selected.path) {
-        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
-        return
+        return { kind: 'unavailable' }
       }
-      return { registry, workspaces, workspace }
-    } catch (error) {
-      this.ctx.logger.warn('[lark] project validation failed: %s', messageOf(error))
-      await this.safeSend(route.chatId, this.text.projectSwitchFailed, deliveryOptions)
-      return
+      return { kind: 'selected', selection: { registry, workspaces, workspace } }
+    } catch {
+      this.ctx.logger.warn('[lark] project validation failed')
+      return { kind: 'failed' }
     }
   }
 
@@ -1482,23 +1987,15 @@ export class LarkBridge {
     route: MessageRoute,
     conversation: ConversationSession,
     selection: ProjectSelection,
-  ): Promise<void> {
-    const deliveryOptions = routeDeliveryOptions(route)
+  ): Promise<ProjectSwitchCommandResult> {
     const { registry, workspaces, workspace: selected } = selection
 
     const current = await this.currentWorkspace(conversation, registry, workspaces)
     if (current?.id === selected.id) {
       const mutation = await this.recordCurrentProjectMutation(route, conversation)
-      if (mutation === 'busy') {
-        await this.safeSend(route.chatId, this.text.projectBusy, deliveryOptions)
-        return
-      }
-      if (mutation === 'failed') {
-        await this.safeSend(route.chatId, this.text.projectHistoryCheckpointFailed, deliveryOptions)
-        return
-      }
-      await this.safeSend(route.chatId, this.text.projectAlreadyCurrent(selected), deliveryOptions)
-      return
+      if (mutation === 'busy') return { kind: 'busy' }
+      if (mutation === 'failed') return { kind: 'history-failed' }
+      return { kind: 'already-current', workspace: selected }
     }
     const previousSessionId = conversation.sessionId
     const previousHandle = conversation.handle
@@ -1519,7 +2016,7 @@ export class LarkBridge {
           )
         } catch (error) {
           if (error instanceof BindingConfirmationInterruptedError) throw error
-          this.ctx.logger.error('[lark] previous project session checkpoint failed: %s', messageOf(error))
+          this.ctx.logger.error('[lark] previous project session checkpoint failed')
           return { kind: 'history-failed' }
         }
         if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'busy' }
@@ -1534,8 +2031,8 @@ export class LarkBridge {
             return { kind: 'unavailable' }
           }
           if (await workspace.status() !== 'ok') return { kind: 'missing' }
-        } catch (error) {
-          this.ctx.logger.warn('[lark] project revalidation failed: %s', messageOf(error))
+        } catch {
+          this.ctx.logger.warn('[lark] project revalidation failed')
           return { kind: 'failed' }
         }
         if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'busy' }
@@ -1557,8 +2054,8 @@ export class LarkBridge {
             conversation.modelSelection,
           )
           modelSelectionRef = this.modelSelectionFor(handle)
-        } catch (error) {
-          this.ctx.logger.error('[lark] project session creation failed: %s', messageOf(error))
+        } catch {
+          this.ctx.logger.error('[lark] project session creation failed')
           return { kind: 'failed' }
         }
 
@@ -1570,8 +2067,8 @@ export class LarkBridge {
           this.materializeFreshHandle(handle)
           const durable = await this.ctx.sessions.flush(handle.agent.session)
           if (durable !== true) throw new Error('no durability listener participated')
-        } catch (error) {
-          this.ctx.logger.error('[lark] project session checkpoint failed: %s', messageOf(error))
+        } catch {
+          this.ctx.logger.error('[lark] project session checkpoint failed')
           await this.abandonFreshHandle(String(sessionId), handle)
           return { kind: 'failed' }
         }
@@ -1590,7 +2087,7 @@ export class LarkBridge {
             ),
           )
         } catch (error) {
-          this.ctx.logger.error('[lark] project binding commit failed: %s', messageOf(error))
+          this.ctx.logger.error('[lark] project binding commit failed')
           await this.abandonFreshHandle(String(sessionId), handle)
           if (error instanceof BindingConfirmationInterruptedError) throw error
           return { kind: 'failed' }
@@ -1610,8 +2107,7 @@ export class LarkBridge {
         }
       })
     } catch {
-      await this.safeSend(route.chatId, this.text.projectBusy, deliveryOptions)
-      return
+      return { kind: 'busy' }
     }
 
     let result: ProjectSwitchMaintenanceResult
@@ -1619,32 +2115,60 @@ export class LarkBridge {
       result = await maintenance
     } catch (error) {
       if (error instanceof BindingConfirmationInterruptedError) throw error
-      this.ctx.logger.error('[lark] project switch maintenance failed: %s', messageOf(error))
-      await this.safeSend(route.chatId, this.text.projectSwitchFailed, deliveryOptions)
-      return
+      this.ctx.logger.error('[lark] project switch maintenance failed')
+      return { kind: 'failed' }
     }
     switch (result.kind) {
       case 'committed':
         this.retireHandleAfterIdle(result.previousSessionId, result.previousHandle, 'project')
-        await this.safeSend(route.chatId, this.text.projectSwitched(result.workspace), deliveryOptions)
-        return
+        return { kind: 'switched', workspace: result.workspace }
       case 'busy':
-        await this.safeSend(route.chatId, this.text.projectBusy, deliveryOptions)
-        return
+        return { kind: 'busy' }
       case 'history-failed':
-        await this.safeSend(route.chatId, this.text.projectHistoryCheckpointFailed, deliveryOptions)
-        return
+        return { kind: 'history-failed' }
       case 'unavailable':
-        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
-        return
+        return { kind: 'unavailable' }
       case 'unknown':
-        await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
+        return { kind: 'unknown' }
+      case 'missing':
+        return { kind: 'missing', workspace: selected }
+      case 'failed':
+        return { kind: 'failed' }
+    }
+  }
+
+  private async sendProjectSwitchResult(
+    route: MessageRoute,
+    result: ProjectSwitchCommandResult,
+  ): Promise<void> {
+    const options = routeDeliveryOptions(route)
+    switch (result.kind) {
+      case 'switched':
+        await this.safeSend(route.chatId, this.text.projectSwitched(result.workspace), options)
+        return
+      case 'already-current':
+        await this.safeSend(route.chatId, this.text.projectAlreadyCurrent(result.workspace), options)
         return
       case 'missing':
-        await this.safeSend(route.chatId, this.text.projectMissingDirectory(selected), deliveryOptions)
+        await this.safeSend(route.chatId, this.text.projectMissingDirectory(result.workspace), options)
+        return
+      case 'busy':
+        await this.safeSend(route.chatId, this.text.projectBusy, options)
+        return
+      case 'history-failed':
+        await this.safeSend(route.chatId, this.text.projectHistoryCheckpointFailed, options)
+        return
+      case 'ambiguous':
+        await this.safeSend(route.chatId, this.text.projectAmbiguous, options)
+        return
+      case 'unavailable':
+        await this.safeSend(route.chatId, this.text.projectUnavailable, options)
+        return
+      case 'unknown':
+        await this.safeSend(route.chatId, this.text.projectUnknown, options)
         return
       case 'failed':
-        await this.safeSend(route.chatId, this.text.projectSwitchFailed, deliveryOptions)
+        await this.safeSend(route.chatId, this.text.projectSwitchFailed, options)
     }
   }
 
@@ -2058,6 +2582,13 @@ export class LarkBridge {
     return this.enqueueConversationBarrier(baseId, task)
   }
 
+  private enqueueWorkspaceMutation<T>(task: () => Promise<T>): Promise<T> {
+    const operation = this.workspaceMutationTail.then(task)
+    const tail = operation.then(() => {}, () => {})
+    this.workspaceMutationTail = tail
+    return operation
+  }
+
   private scheduleReset(route: MessageRoute): Promise<void> {
     return this.enqueueConversationBarrier(route.sessionBaseId, () => (
       this.withConversation(route.sessionBaseId, async (conversation) => {
@@ -2199,13 +2730,12 @@ export class LarkBridge {
   }
 
   private async restoreConversationWorkspace(conversation: ConversationSession): Promise<void> {
-    if (conversation.workspaceId !== undefined) return
     try {
       const registry = workspaceRegistryOf(this.ctx)
       if (registry === undefined) return
       await this.currentWorkspace(conversation, registry, listedWorkspaces(registry))
-    } catch (error) {
-      this.ctx.logger.warn('[lark] fresh session project resolution failed: %s', messageOf(error))
+    } catch {
+      this.ctx.logger.warn('[lark] fresh session project resolution failed')
     }
   }
 
@@ -2214,13 +2744,14 @@ export class LarkBridge {
     workspaceId: string | undefined,
     workspacePath: string,
   ): void {
-    if (workspaceId === undefined) return
+    if (workspaceId === undefined || this.workspaceMutationRecoveryRequired) return
     const pending = this.pendingWorkspaceAttachments.get(sessionId)
     if (pending?.workspaceId === workspaceId && pending.workspacePath === workspacePath) return
     this.pendingWorkspaceAttachments.set(sessionId, { workspaceId, workspacePath })
   }
 
   private prepareWorkspaceAttachment(conversation: ConversationSession): void {
+    if (this.workspaceMutationRecoveryRequired) return
     try {
       const registry = workspaceRegistryOf(this.ctx)
       if (registry === undefined) return
@@ -2241,16 +2772,19 @@ export class LarkBridge {
       const workspace = cached
         ?? (sessionMatches.length === 1 ? sessionMatches[0] : undefined)
         ?? (pathMatches.length === 1 ? pathMatches[0] : undefined)
-      if (workspace === undefined) return
+      if (workspace === undefined) {
+        conversation.workspaceId = undefined
+        return
+      }
       conversation.workspaceId = workspace.id
       this.deferWorkspaceAttachment(conversation.sessionId, workspace.id, workspace.path)
-    } catch (error) {
-      this.ctx.logger.warn('[lark] workspace attachment preparation failed: %s', messageOf(error))
+    } catch {
+      this.ctx.logger.warn('[lark] workspace attachment preparation failed')
     }
   }
 
   private scheduleWorkspaceAttachment(session: Session): void {
-    if (this.stopping) return
+    if (this.stopping || this.workspaceMutationRecoveryRequired) return
     const sessionId = String(session.id)
     const pending = this.pendingWorkspaceAttachments.get(sessionId)
     if (pending === undefined) return
@@ -2264,7 +2798,9 @@ export class LarkBridge {
         this.workspaceAttachmentTasks.delete(sessionId)
       }
       const retry = this.workspaceAttachmentRetries.delete(sessionId)
-      if (retry && this.pendingWorkspaceAttachments.has(sessionId)) {
+      if (retry
+        && !this.workspaceMutationRecoveryRequired
+        && this.pendingWorkspaceAttachments.has(sessionId)) {
         this.scheduleWorkspaceAttachment(session)
       }
       this.requestConversationEviction()
@@ -2278,26 +2814,35 @@ export class LarkBridge {
   ): Promise<void> {
     const sessionId = String(session.id)
     try {
+      if (this.workspaceMutationRecoveryRequired) return
       const durable = await this.ctx.sessions.flush(session)
       if (durable !== true) {
         throw new Error('no durability listener participated')
       }
-      if (this.stopping || this.pendingWorkspaceAttachments.get(sessionId) !== pending) return
+      if (this.stopping
+        || this.workspaceMutationRecoveryRequired
+        || this.pendingWorkspaceAttachments.get(sessionId) !== pending) return
       const registry = workspaceRegistryOf(this.ctx)
       const resolved = registry?.get(pending.workspaceId)
-      if (resolved === undefined) return
+      if (resolved === undefined) {
+        if (this.pendingWorkspaceAttachments.get(sessionId) === pending) {
+          this.pendingWorkspaceAttachments.delete(sessionId)
+        }
+        return
+      }
       const workspace = registeredWorkspace(resolved)
       if (workspace.id !== pending.workspaceId || workspace.path !== pending.workspacePath) return
       if (await workspace.status() !== 'ok') return
-      if (this.stopping || this.pendingWorkspaceAttachments.get(sessionId) !== pending) return
+      if (this.stopping
+        || this.workspaceMutationRecoveryRequired
+        || this.pendingWorkspaceAttachments.get(sessionId) !== pending) return
       await workspace.attachSession(session.id)
       if (this.pendingWorkspaceAttachments.get(sessionId) === pending) {
         this.pendingWorkspaceAttachments.delete(sessionId)
       }
-    } catch (error) {
+    } catch {
       this.ctx.logger.warn(
-        '[lark] durable workspace session attachment failed; leaving it unindexed: %s',
-        messageOf(error),
+        '[lark] durable workspace session attachment failed; leaving it unindexed',
       )
     }
   }

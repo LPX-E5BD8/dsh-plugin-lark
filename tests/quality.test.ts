@@ -59,6 +59,15 @@ test('quality: public defaults fail closed', () => {
   assert.equal(DEFAULT_CONFIG.allowAllUsers, false)
 })
 
+test('quality: project management configuration stays fail-closed through the bundle seam', () => {
+  const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8')
+  const patch = readFileSync(join(process.cwd(), 'cordis.patch.yml'), 'utf8')
+  assert.match(source, /projectManageFrom\?: string\[\]/u)
+  assert.match(source, /projectManageFrom: Schema\.array\(Schema\.string\(\)\)\.default\(\[\]\)/u)
+  assert.match(source, /projectManageFrom: config\.projectManageFrom \?\? \[\]/u)
+  assert.equal((patch.match(/^\s+projectManageFrom: \[\]$/gmu) ?? []).length, 1)
+})
+
 test('quality: malformed app ids fail before startup', () => {
   const previousAppId = process.env.DSH_LARK_APP_ID
   const previousAppSecret = process.env.DSH_LARK_APP_SECRET
@@ -148,6 +157,7 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
     '@deepseek-ai/dsh-storage-json': harnessVersion,
     '@deepseek-ai/dsh-tools': harnessVersion,
     '@deepseek-ai/dsh-user-approval': harnessVersion,
+    '@deepseek-ai/dsh-workspace': harnessVersion,
   }
   assert.ok(root !== undefined)
   assert.equal(manifest.engines?.node, nodeRange)
@@ -196,11 +206,11 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
 
   const [major, minor] = manifest.version.split('.')
   const releaseLine = `${major}.${minor}.x`
-  const macosNode24Floor = '0.8.7'
+  const currentReleaseFloor = `${major}.${minor}.0`
   for (const path of ['README.md', 'README.zh-CN.md']) {
     const content = readFileSync(join(process.cwd(), path), 'utf8')
     const matrixRow = content.split('\n')
-      .find((line) => line.startsWith(`| \`${macosNode24Floor}\`–\`${releaseLine}\` |`))
+      .find((line) => line.startsWith(`| \`${currentReleaseFloor}\`–\`${releaseLine}\` |`))
     assert.ok(matrixRow !== undefined, `${path} omits the current compatibility row`)
     for (const marker of [releaseLine, harnessVersion, cordisVersion, schemasteryVersion, '22.x', '24.x']) {
       assert.match(matrixRow, new RegExp(`\\x60${marker.replaceAll('.', '\\.')}\\x60`), `${path} omits ${marker}`)

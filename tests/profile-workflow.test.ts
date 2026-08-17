@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.8.7'
-const BASELINE_COMMIT = '56f26c98d22d2f1d7fb5b0cd6f727429d8e61bfa'
-const BASELINE_DIGEST = 'sha256:3d17b458870c49bd404921ba8823c7cac05dbc4e160402689c4285d6c159798b'
+const BASELINE_TAG = 'v0.8.8'
+const BASELINE_COMMIT = 'b0936ea09b512a9316a59f2cb2176716288eb653'
+const BASELINE_DIGEST = 'sha256:b88a42ef5ecf2c253c59a71ecaf3a53224825cc1ea6498c150f42a27c637f6b5'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 
@@ -148,7 +148,7 @@ test('profile lifecycle receives the pinned baseline and the dynamic tested cand
   const version = JSON.parse(readFileSync('package.json', 'utf8')).version as string
   assert.match(
     readFileSync('ROADMAP.md', 'utf8'),
-    new RegExp(`## ${version.replaceAll('.', '\\.')} — Product roadmap`, 'u'),
+    new RegExp(`## ${version.replaceAll('.', '\\.')} — `, 'u'),
   )
 })
 
@@ -226,6 +226,7 @@ test('profile smoke proves clean install and in-place upgrade composition', () =
 
   assert.match(profileSmoke, /const deepseekScope = join\(home, 'profiles', 'node_modules', '@deepseek-ai'\)/u)
   assert.match(profileSmoke, /filter\(\(entry\) => entry\.name\.startsWith\('dsh-'\)\)/u)
+  assert.match(profileSmoke, /packageDirectories\.includes\('dsh-workspace'\)/u)
   assert.match(profileSmoke, /manifest\.version,[\s\S]*expectedDshVersion,[\s\S]*drifted outside the supported Harness cohort/u)
   assert.match(profileSmoke, /\['cordis', '4\.0\.1'\],[\s\S]*\['schemastery', '3\.18\.1'\]/u)
   assert.equal([...profileSmoke.matchAll(/await assertHarnessFallback\(/gu)].length, 3)

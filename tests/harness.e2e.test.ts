@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, realpath, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { installModelSelection } from '@deepseek-ai/dsh-agent'
@@ -17,6 +17,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import type { PreToolDecision } from '@deepseek-ai/dsh-tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
+import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { LarkBridge } from '../src/bridge.ts'
 import {
   DurableConversationBindingStore,
@@ -251,6 +252,7 @@ async function mount(
   preset?: HarnessPreset,
   maxConversationHandles?: number,
   workspaceSpecs?: readonly HarnessWorkspaceSpec[],
+  realWorkspaceCwd?: string,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
@@ -274,6 +276,7 @@ async function mount(
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
     await ctx.plugin(ApprovalService)
+    if (realWorkspaceCwd !== undefined) await ctx.plugin(WorkspaceRegistry)
     if (preset !== undefined) {
       ctx.provide('agentPresets', {
         resolve(id?: string) {
@@ -319,9 +322,11 @@ async function mount(
       conversationBindings,
       locale,
       allowFrom: ['owner'],
+      projectManageFrom: realWorkspaceCwd === undefined ? [] : ['owner'],
       provider: adapter === undefined ? undefined : 'mock',
       model: adapter === undefined ? undefined : 'mock',
       maxConversationHandles,
+      cwd: realWorkspaceCwd,
     })
     await bridge.start()
     let disposal: Promise<void> | undefined
@@ -1194,4 +1199,126 @@ test('harness e2e: a blank project generation stays unindexed across restart unt
   ))
   assert.equal(second.workspaces[0]?.sessionIds[0], blankAgent.id)
   await second.dispose()
+})
+
+test('harness e2e: the real Workspace registry persists registration and removes no files or transcript', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-real-workspace-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const projectPath = join(root, 'project')
+  const nestedPath = join(projectPath, 'nested')
+  await mkdir(nestedPath, { recursive: true })
+  const canonicalPath = await realpath(projectPath)
+  const nonCanonicalPath = `${nestedPath}${sep}..`
+  assert.notEqual(nonCanonicalPath, canonicalPath)
+  assert.equal(await realpath(nonCanonicalPath), canonicalPath)
+  const markerPath = join(projectPath, 'marker.txt')
+  await writeFile(markerPath, 'registration removal must not delete this file')
+
+  const firstAdapter = new ScriptedAdapter([
+    textResponse('durable transcript answer'),
+    textResponse('attached transcript answer'),
+  ])
+  const first = await mount(
+    root,
+    firstAdapter,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    nonCanonicalPath,
+  )
+  t.after(() => first.dispose())
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-real-workspace',
+    'durable transcript marker',
+  ))
+  await waitFor(() => firstAdapter.requests.length === 1)
+  const session = first.ctx.agents.list()[0]
+  assert.ok(session !== undefined)
+  await session.whenIdle()
+  assert.equal(await first.ctx.sessions.flush(session.session), true)
+
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-real-workspace',
+    '/project register Real Workspace',
+  ))
+  const registered = first.ctx.workspaceRegistry.list()[0]
+  assert.ok(registered !== undefined)
+  const firstId = String(registered.id)
+  assert.equal(registered.path, canonicalPath)
+  assert.equal(registered.title, 'Real Workspace')
+  assert.deepEqual(registered.sessionIds, [])
+  assert.equal(first.client.sent.at(-1)?.includes(canonicalPath), false)
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-real-workspace',
+    'attach registered session marker',
+  ))
+  await waitFor(() => firstAdapter.requests.length === 2)
+  await session.whenIdle()
+  await waitFor(() => registered.sessionIds.some((id) => String(id) === String(session.id)))
+  const transcriptBefore = await first.ctx.sessionPersistence.inspect(session.id)
+  assert.match(JSON.stringify(transcriptBefore.events), /durable transcript marker/)
+  assert.match(JSON.stringify(transcriptBefore.events), /durable transcript answer/)
+  assert.match(JSON.stringify(transcriptBefore.events), /attach registered session marker/)
+  await first.dispose()
+
+  const second = await mount(
+    root,
+    new ScriptedAdapter([]),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    nonCanonicalPath,
+  )
+  t.after(() => second.dispose())
+  const restored = second.ctx.workspaceRegistry.list()[0]
+  assert.ok(restored !== undefined)
+  assert.equal(String(restored.id), firstId)
+  assert.equal(restored.path, canonicalPath)
+  assert.equal(restored.title, 'Real Workspace')
+  assert.equal(restored.sessionIds.some((id) => String(id) === String(session.id)), true)
+  await second.client.messageHandler?.(conversationCommand(
+    'chat-real-workspace',
+    `/project remove ${firstId}`,
+  ))
+  assert.deepEqual(second.ctx.workspaceRegistry.list(), [])
+  assert.equal(await readFile(markerPath, 'utf8'), 'registration removal must not delete this file')
+  const transcriptAfterRemoval = await second.ctx.sessionPersistence.inspect(session.id)
+  assert.deepEqual(
+    transcriptAfterRemoval.events.slice(0, transcriptBefore.events.length),
+    transcriptBefore.events,
+  )
+  assert.ok(transcriptAfterRemoval.events.slice(transcriptBefore.events.length).every((event) => (
+    event.type === 'session/end-seed'
+  )))
+  await second.dispose()
+
+  const third = await mount(
+    root,
+    new ScriptedAdapter([]),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    nonCanonicalPath,
+  )
+  t.after(() => third.dispose())
+  assert.deepEqual(third.ctx.workspaceRegistry.list(), [])
+  assert.equal(await readFile(markerPath, 'utf8'), 'registration removal must not delete this file')
+  assert.match(
+    JSON.stringify((await third.ctx.sessionPersistence.inspect(session.id)).events),
+    /durable transcript marker/,
+  )
+
+  await third.client.messageHandler?.(conversationCommand(
+    'chat-real-workspace',
+    '/project register Real Workspace Again',
+  ))
+  const reregistered = third.ctx.workspaceRegistry.list()[0]
+  assert.ok(reregistered !== undefined)
+  assert.notEqual(String(reregistered.id), firstId)
+  assert.equal(reregistered.path, canonicalPath)
+  assert.deepEqual(reregistered.sessionIds, [])
+  await third.dispose()
 })
