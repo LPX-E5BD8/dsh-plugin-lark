@@ -114,11 +114,84 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Require both engine-strict runtimes to repeat the source/Harness, audit, independent packed-consumer, and exact Ubuntu-built canonical archive consumer checks.
 - Keep macOS Web-profile composition, app boot, credentials, network readiness, state migration, Intel hardware, and other macOS releases outside the verified boundary.
 
+## 0.8.8 — Product roadmap
+
+- Prioritize user-facing project, session, human-input, media, delivery, policy, and operations gaps ahead of further low-impact compatibility expansion.
+- Define each 0.9 milestone as one independently reviewable capability with explicit authorization, durability, privacy, failure, and upgrade boundaries.
+- Record deliberate exclusions so later work does not weaken the registered-Workspace boundary, secret ownership, serialized message semantics, or the core channel's minimal permission surface.
+
+## 0.9.0 — Self-service project registration
+
+- Make an empty `/project` result actionable instead of presenting project switching as unavailable when the Workspace registry is mounted but empty.
+- Let an authorized conversation register its current canonical working directory under a display title, without accepting an arbitrary filesystem path from chat or exposing that path in replies.
+- List, select, and remove registrations through the host Workspace registry while preserving atomic generation switching, durable bindings, project isolation, and the guarantee that removing a registration never deletes files or transcripts.
+
+## 0.9.1 — Session navigation and archival
+
+- List resumable sessions visible to the exact conversation scope using bounded titles, timestamps, project labels, and opaque IDs without exposing prompts, filesystem paths, or another chat's sessions.
+- Resume a selected committed session through the same checkpoint, binding-authority, replay-protection, and idle-maintenance rules used by project switching.
+- Archive and unarchive old sessions without deleting their transcripts; keep destructive bulk deletion outside the chat interface.
+
+## 0.9.2 — Structured human input
+
+- Expose an Agent tool for single-choice, multiple-choice, and bounded free-text questions that renders a native interactive card and returns the answer to the same running turn.
+- Bind each question to its Agent session, conversation scope, chat, message, and eligible user so stale, duplicate, or cross-chat answers fail closed.
+- Define explicit timeout, cancellation, reset, shutdown, delivery-failure, and restart behavior; pause the run timeout only while an admitted question is awaiting its authorized answer.
+
+## 0.9.3 — Secure attachment and artifact exchange
+
+- Add opt-in inbound support for bounded text, log, patch, diff, and image resources using strict MIME, byte, count, and permission checks; isolate downloads per session and remove them through a documented retention policy.
+- Pass text content or image inputs only through a capability-aware Harness request shape, and fail clearly when the active provider cannot consume that media type.
+- Add an explicit Agent tool for sending generated files and images from approved workspace or temporary roots, with safe names and size limits; never infer arbitrary local paths from model-authored text or `file:` URLs.
+- Keep resource keys, credentials, private paths, and attachment contents out of logs, receipts, durable bindings, and error replies.
+
+## 0.9.4 — Reliable proactive delivery
+
+- Let an Agent send a completion or attention notification to a previously registered conversation scope, including a bounded explicit mention list, without accepting arbitrary destination IDs from model output.
+- Persist a bounded outbox with idempotency keys, retry state, expiry, rate limits, and terminal delivery outcomes so process restarts cannot silently lose or duplicate admitted notifications.
+- Leave scheduling to Harness or an external scheduler; keep the channel responsible only for authorization, durable delivery, and observability.
+
+## 0.9.5 — Operator status and diagnostics
+
+- Add an operator-only status command covering the current plugin version, uptime, connection state, conversation/session identity, project, model, active work, and bounded context/usage information.
+- Add a sanitized diagnostic command that checks Bot REST identity, required scopes, Workspace registration count, session persistence, storage-domain write/flush participation, provider configuration, and recent categorized failures.
+- Return actionable remediation without revealing credentials, platform identifiers, prompts, message/session IDs, private paths, provider endpoints, or raw errors.
+
+## 0.9.6 — Conversation-scoped policy
+
+- Support per-chat and per-group policy for authorized users, mention requirements, visible/selectable Workspaces, selectable provider/model routes, and allowed tool or approval classes.
+- Intersect scoped policy with the global fail-closed configuration so a local rule can only narrow access unless an explicit administrator-controlled policy says otherwise.
+- Apply policy before listing protected names or IDs as well as before execution, and persist no secret values in the policy document.
+
+## 0.9.7 — Runtime supervision and safe recovery
+
+- Ship optional, reviewable service-manager templates with graceful shutdown, bounded restart, stable logs, credential-environment guidance, and readiness checks for supported hosts.
+- Detect a failed or non-ready DSH profile from outside that process and provide a minimal recovery path without loading the failing third-party profile graph.
+- Prevent split-brain channel ownership through a heartbeat or lease, and require explicit operator action before any recovery component changes plugins, profiles, or durable state.
+
+## 0.9.8 — Explicit parallel tasks
+
+- Let a user explicitly create, list, inspect, and stop bounded parallel tasks, each with its own DSH session, run ID, reply target, lifecycle card, and durable conversation association.
+- Keep ordinary consecutive messages serialized; never reinterpret them as implicit parallel work.
+- Define project-level write-collision policy and concurrency limits so parallel tasks cannot silently modify the same Workspace without an explicit safe configuration.
+
+## 0.9.9 — Optional document handoff
+
+- Read only an explicitly supplied, authorized Lark document link through a separately permissioned tool with bounded content and clear source attribution.
+- Publish a long final report as a document on explicit request, then return its link in the originating conversation while preserving the normal chat answer and delivery receipt.
+- Keep the general Docs, Calendar, Base, Sheets, Tasks, Wiki, and Drive API surface in separate optional tools rather than expanding the core channel's default permissions.
+
 ## 1.0 — Stable release
 
+- Complete the high-value 0.9 conversation, media, delivery, policy, and operations gates without weakening the existing authorization, durability, privacy, or reply-routing contracts.
 - Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and credential-backed Web-profile startup plus persisted-state upgrade paths pass their own evidence-backed gates.
+- Freeze public configuration and durable schemas only after cold upgrade, rollback, failure-injection, and long-running resource tests have passed on the supported deployment baseline.
 
 ## Not planned
 
 - An administration UI.
 - A generic card-authoring framework.
+- Accepting arbitrary filesystem paths from chat.
+- Reading or modifying provider credentials through chat commands.
+- Implicit or unbounded parallel execution of ordinary messages.
+- Bundling the complete Lark office API surface into the core channel.

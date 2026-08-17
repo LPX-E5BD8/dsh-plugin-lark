@@ -35,7 +35,7 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 | `0.8.5` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
 | `0.8.0`–`0.8.4` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported on the original Node 22/Linux baseline; v0.8.4 adds the boot-free Web-profile package lifecycle gate. |
 
-The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.8.6 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, and Approval services. They replace the platform connection, model provider, Workspace registry, and browser surface with controlled test doubles. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.8.7 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
 
 Starting with v0.8.5, that same Linux release gate then switches to Node 24, recreates `node_modules` with engine-strict enabled, repeats the complete source/Harness and independent packed-consumer gates, and consumes the already packed canonical candidate in an isolated stock profile. The v0.8.5 gate used a clean install because its v0.8.4 baseline supported only Node 22; starting with v0.8.6, Node 24 also verifies the adjacent upgrade from the now-compatible v0.8.5 baseline.
 
@@ -80,7 +80,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.8.7'
+version='0.8.8'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
