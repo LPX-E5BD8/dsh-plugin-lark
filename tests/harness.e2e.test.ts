@@ -19,6 +19,7 @@ import type { PreToolDecision } from '@deepseek-ai/dsh-tools'
 import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { LarkBridge } from '../src/bridge.ts'
+import { inject as larkInject } from '../src/index.ts'
 import {
   DurableConversationBindingStore,
   type ConversationBindingStore,
@@ -253,6 +254,7 @@ async function mount(
   maxConversationHandles?: number,
   workspaceSpecs?: readonly HarnessWorkspaceSpec[],
   realWorkspaceCwd?: string,
+  sessionCompression: 'none' | 'zstd' = 'none',
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
@@ -274,7 +276,7 @@ async function mount(
     await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await ctx.plugin(JsonlSessionPersistence, { root, compression: 'none' })
+    await ctx.plugin(JsonlSessionPersistence, { root, compression: sessionCompression })
     await ctx.plugin(ApprovalService)
     if (realWorkspaceCwd !== undefined) await ctx.plugin(WorkspaceRegistry)
     if (preset !== undefined) {
@@ -316,19 +318,34 @@ async function mount(
       HARNESS_DEDUP_NAMESPACE,
     )
     const client = createClient()
-    bridge = new LarkBridge(ctx, {
-      client,
-      inboundDeduplicator: deduplicator,
-      conversationBindings,
-      locale,
-      allowFrom: ['owner'],
-      projectManageFrom: realWorkspaceCwd === undefined ? [] : ['owner'],
-      provider: adapter === undefined ? undefined : 'mock',
-      model: adapter === undefined ? undefined : 'mock',
-      maxConversationHandles,
-      cwd: realWorkspaceCwd,
+    const bridgeReady = Promise.withResolvers<LarkBridge>()
+    ctx.plugin({
+      name: 'lark-harness-owner',
+      inject: larkInject,
+      async apply(ownerCtx) {
+        const candidate = new LarkBridge(ownerCtx, {
+          client,
+          inboundDeduplicator: deduplicator,
+          conversationBindings,
+          locale,
+          allowFrom: ['owner'],
+          projectManageFrom: realWorkspaceCwd === undefined ? [] : ['owner'],
+          provider: adapter === undefined ? undefined : 'mock',
+          model: adapter === undefined ? undefined : 'mock',
+          maxConversationHandles,
+          cwd: realWorkspaceCwd,
+        })
+        bridge = candidate
+        try {
+          await candidate.start()
+          bridgeReady.resolve(candidate)
+        } catch (error) {
+          bridgeReady.reject(error)
+          throw error
+        }
+      },
     })
-    await bridge.start()
+    bridge = await bridgeReady.promise
     let disposal: Promise<void> | undefined
     return {
       ctx,
@@ -1320,5 +1337,102 @@ test('harness e2e: the real Workspace registry persists registration and removes
   assert.notEqual(String(reregistered.id), firstId)
   assert.equal(reregistered.path, canonicalPath)
   assert.deepEqual(reregistered.sessionIds, [])
+  await third.dispose()
+})
+
+test('harness e2e: first-command registry mutations survive cold owner-context restarts', async (t) => {
+  assert.ok(larkInject.includes('sessions'))
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-first-command-workspace-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const projectPath = join(root, 'project')
+  await mkdir(projectPath)
+  const canonicalPath = await realpath(projectPath)
+  const first = await mount(
+    root,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => first.dispose())
+
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-first-command-workspace',
+    '/project register First Command',
+  ))
+
+  const registered = first.ctx.workspaceRegistry.list()[0]
+  assert.ok(registered !== undefined)
+  assert.equal(registered.path, canonicalPath)
+  assert.equal(registered.title, 'First Command')
+  assert.deepEqual(registered.sessionIds, [])
+  assert.equal(first.ctx.agents.list().length, 1)
+  const firstSessionId = first.ctx.agents.list()[0]?.id
+  assert.ok(firstSessionId !== undefined)
+  assert.deepEqual(
+    (await first.ctx.sessionPersistence.inspect(firstSessionId)).events.map((event) => event.type),
+    ['todo/write'],
+  )
+  assert.ok((await first.ctx.sessionPersistence.list()).some(({ id }) => id === firstSessionId))
+  await first.dispose()
+
+  const second = await mount(
+    root,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => second.dispose())
+  assert.equal(second.ctx.workspaceRegistry.list().length, 1)
+
+  await second.client.messageHandler?.(conversationCommand(
+    'chat-first-command-workspace',
+    '/help',
+  ))
+
+  assert.equal(second.ctx.agents.list().length, 1)
+  assert.equal(second.ctx.agents.list()[0]?.id, firstSessionId)
+  assert.equal(second.ctx.workspaceRegistry.list()[0]?.id, registered.id)
+  await second.client.messageHandler?.(conversationCommand(
+    'chat-first-command-removal',
+    `/project remove ${registered.id}`,
+  ))
+  assert.deepEqual(second.ctx.workspaceRegistry.list(), [])
+  const removalSession = second.ctx.agents.list().find(({ id }) => id !== firstSessionId)
+  assert.ok(removalSession !== undefined)
+  assert.deepEqual(
+    (await second.ctx.sessionPersistence.inspect(removalSession.id)).events.map((event) => event.type),
+    ['todo/write'],
+  )
+  assert.ok((await second.ctx.sessionPersistence.list()).some(({ id }) => id === removalSession.id))
+  await second.dispose()
+
+  const third = await mount(
+    root,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => third.dispose())
+  assert.deepEqual(third.ctx.workspaceRegistry.list(), [])
+
+  await third.client.messageHandler?.(conversationCommand(
+    'chat-first-command-removal',
+    '/help',
+  ))
+
+  assert.equal(third.ctx.agents.list().length, 1)
+  assert.equal(third.ctx.agents.list()[0]?.id, removalSession.id)
   await third.dispose()
 })

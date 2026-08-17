@@ -21,6 +21,7 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 
 - Node.js 22.x, or Node.js 24.x with plugin v0.8.5 or newer
 - One coherent DeepSeek Harness `0.1.0-rc.6` package cohort
+- The Harness `agents` and `sessions` services; the stock Web profile mounts both
 - A durable `storageDomain` service; the stock Web profile supplies its JSON-backed storage stack
 - A self-built Feishu or Lark app with a bot
 
@@ -30,13 +31,13 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7, plus a real rc.6 Workspace Registry lifecycle test covering canonical registration, restart, removal, retained files/transcripts, and fresh-ID re-registration. |
+| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage. |
 | `0.8.7`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 produces the canonical archive; Node 22 and 24 run adjacent-upgrade profile gates. GitHub-hosted macOS 26 arm64 additionally verifies Node 22 and 24 package/runtime compatibility, not Web-profile deployment. |
 | `0.8.6` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Ubuntu support; macOS 26 arm64 package/runtime evidence covers Node 22 only. |
 | `0.8.5` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
 | `0.8.0`–`0.8.4` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported on the original Node 22/Linux baseline; v0.8.4 adds the boot-free Web-profile package lifecycle gate. |
 
-The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, Approval, and Workspace services. Platform connection, model provider, and browser behavior use controlled doubles; project mutation also has a real Registry persistence lifecycle test. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.8.8 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, JSONL persistence, JSON storage-domain, Tools, Approval, and Workspace services. Platform connection, model provider, and browser behavior use controlled doubles; project mutation also has a real Registry persistence lifecycle test. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.9.0 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
 
 The profile gate also pins npm resolution to the registry snapshot immediately after the rc.6 cohort was published. Harness prerelease packages use caret ranges internally, so an exact top-level `dsh@0.1.0-rc.6` alone can otherwise drift to a later prerelease in a clean npm-exec environment; every resolved DSH package is still checked as exactly rc.6.
 
@@ -46,7 +47,7 @@ Starting with v0.8.6, a separate required gate runs engine-strict Node 22 on Git
 
 That Web-profile gate is deliberately boot-free: it validates package installation, upgrade, bundle resolution, and configuration composition, but does not start the Web app or exercise credentials, the SDK WebSocket connection, `/api/lark/health`, the Feishu/Lark network path, or persisted-state migration. Those remain deployment and credential-backed smoke checks.
 
-Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23.x or 25 and newer, Node.js 24 with plugin v0.8.4 or older, later Cordis or Schemastery releases, other Harness cohorts, Ubuntu architectures outside x64, and a host with the optional Approval service completely absent are unverified. Starting with v0.8.7, the macOS evidence is limited to macOS 26 arm64 with Node 22 or 24 package/runtime consumption; Intel Macs, other macOS releases, stock Web-profile operation, and state migration on macOS remain unverified. Alternative persistence stacks are also unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents` or durable `storageDomain` support is unsupported.
+Direct host peers are pinned to this baseline, and every DSH package in the resolved graph must stay in the same rc.6 cohort. Mixed DSH releases, Node.js 23.x or 25 and newer, Node.js 24 with plugin v0.8.4 or older, later Cordis or Schemastery releases, other Harness cohorts, Ubuntu architectures outside x64, and a host with the optional Approval service completely absent are unverified. Starting with v0.8.7, the macOS evidence is limited to macOS 26 arm64 with Node 22 or 24 package/runtime consumption; Intel Macs, other macOS releases, stock Web-profile operation, and state migration on macOS remain unverified. Alternative persistence stacks are also unverified. Custom profiles are supported only when they provide the services documented in [Config](#config); missing `agents`, `sessions`, or durable `storageDomain` support is unsupported.
 
 ## Install
 
@@ -83,7 +84,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.9.0'
+version='0.9.1'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -190,7 +191,7 @@ The bundled Cordis patch uses these defaults:
     maxConversationHandles: 32  # steady-state live conversation-handle target
 ```
 
-The baseline requires `agents` and durable `storageDomain` services. Durable reset, project/model selection, and cold recovery also require `sessionPersistence`; `/project` requires `workspaceRegistry`, and `/model` requires the Harness `llm` service. Approval cards and the readiness route depend on the optional `approval` and `webServer` services. The verified matrix uses the stock JSON/JSONL implementations; alternative implementations remain unverified.
+The baseline requires `agents`, `sessions`, and durable `storageDomain` services. Durable reset, project/model selection, and cold recovery also require `sessionPersistence`; `/project` requires `workspaceRegistry`, and `/model` requires the Harness `llm` service. Approval cards and the readiness route depend on the optional `approval` and `webServer` services. The verified matrix uses the stock JSON/JSONL implementations; alternative implementations remain unverified.
 
 `allowFrom` is fail-closed: an empty list with `allowAllUsers: false` denies everyone. Use `allowAllUsers: true` only for an intentionally public bot. Use `domain: lark` for apps hosted on `open.larksuite.com`.
 

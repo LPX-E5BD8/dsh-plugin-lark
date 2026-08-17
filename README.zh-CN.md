@@ -21,6 +21,7 @@
 
 - Node.js 22.x，或在插件 v0.8.5 及更高版本中使用 Node.js 24.x
 - 一组版本一致的 DeepSeek Harness `0.1.0-rc.6` 软件包
+- Harness `agents` 与 `sessions` 服务；标准 Web profile 已挂载两者
 - 持久化的 `storageDomain` 服务；标准 Web profile 已提供基于 JSON 的完整存储栈
 - 一个带机器人的飞书或 Lark 自建应用
 
@@ -30,13 +31,13 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁，并增加真实 rc.6 Workspace Registry 生命周期测试，覆盖 canonical 注册、重启、移除、文件/transcript 保留与新 ID 重新注册。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
 | `0.8.0`–`0.8.4` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持原有 Node 22/Linux 基线；v0.8.4 新增不启动应用的 Web profile package lifecycle 门禁。 |
 
-必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、JSONL 持久化、JSON storage-domain、Tools、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.8.8 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
+必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、JSONL 持久化、JSON storage-domain、Tools、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.0 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
 
 Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
 
@@ -46,7 +47,7 @@ Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 reg
 
 该 Web profile 门禁刻意不启动应用：它验证 package 安装、升级、bundle 解析与配置组合，但不会启动 Web app，也不覆盖凭据、SDK WebSocket 连接、`/api/lark/health`、飞书/Lark 网络链路或持久化状态迁移；这些仍属于部署和真实凭据冒烟检查。
 
-插件会把直接宿主 peer 固定在这组基线上，解析图中的所有 DSH 软件包也必须来自同一个 rc.6 版本组。混用 DSH 版本、Node.js 23.x 或 25 及更高版本、在 v0.8.4 及更早插件上使用 Node.js 24、更高版本的 Cordis 或 Schemastery、其他 Harness 版本组、Ubuntu x64 以外的 Ubuntu 架构，以及完全缺少可选 Approval 服务的宿主都尚未验证。从 v0.8.7 起，macOS 证据仅限 macOS 26 arm64/Node 22 或 24 的 package/runtime 消费；Intel Mac、其他 macOS 版本、标准 Web profile 运行和状态迁移仍未验证。替代持久化栈也未验证。自定义 profile 只有在提供[配置](#配置)章节所述服务时才受支持；缺少 `agents` 或持久化 `storageDomain` 明确不受支持。
+插件会把直接宿主 peer 固定在这组基线上，解析图中的所有 DSH 软件包也必须来自同一个 rc.6 版本组。混用 DSH 版本、Node.js 23.x 或 25 及更高版本、在 v0.8.4 及更早插件上使用 Node.js 24、更高版本的 Cordis 或 Schemastery、其他 Harness 版本组、Ubuntu x64 以外的 Ubuntu 架构，以及完全缺少可选 Approval 服务的宿主都尚未验证。从 v0.8.7 起，macOS 证据仅限 macOS 26 arm64/Node 22 或 24 的 package/runtime 消费；Intel Mac、其他 macOS 版本、标准 Web profile 运行和状态迁移仍未验证。替代持久化栈也未验证。自定义 profile 只有在提供[配置](#配置)章节所述服务时才受支持；缺少 `agents`、`sessions` 或持久化 `storageDomain` 明确不受支持。
 
 ## 安装
 
@@ -83,7 +84,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.0'
+version='0.9.1'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -190,7 +191,7 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
     maxConversationHandles: 32  # 进程内活跃会话句柄的稳态目标
 ```
 
-这组基线要求宿主提供 `agents` 和持久化 `storageDomain` 服务。需要持久化的重置、项目/模型选择与冷恢复还要求 `sessionPersistence`；`/project` 依赖 `workspaceRegistry`，`/model` 依赖 Harness `llm` 服务。审批卡片和 readiness 路由分别依赖可选的 `approval` 与 `webServer` 服务。已验证矩阵使用标准 JSON/JSONL 实现，替代实现仍未验证。
+这组基线要求宿主提供 `agents`、`sessions` 和持久化 `storageDomain` 服务。需要持久化的重置、项目/模型选择与冷恢复还要求 `sessionPersistence`；`/project` 依赖 `workspaceRegistry`，`/model` 依赖 Harness `llm` 服务。审批卡片和 readiness 路由分别依赖可选的 `approval` 与 `webServer` 服务。已验证矩阵使用标准 JSON/JSONL 实现，替代实现仍未验证。
 
 `allowFrom` 默认拒绝：当列表为空且 `allowAllUsers: false` 时，所有用户都无权访问。仅当机器人明确需要公开使用时才设置 `allowAllUsers: true`。托管在 `open.larksuite.com` 的应用应使用 `domain: lark`。
 
