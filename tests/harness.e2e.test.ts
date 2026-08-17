@@ -416,6 +416,56 @@ test('harness e2e: /model snapshots the same durable session and survives reset 
   await second.dispose()
 })
 
+test('harness e2e: /project carries the selected model into the blank generation', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-model-project-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const projectPath = join(root, 'selected-project')
+  await mkdir(projectPath, { recursive: true })
+  const canonicalProjectPath = await realpath(projectPath)
+  const adapter = new ScriptedAdapter([textResponse('project model answer')])
+  const harness = await mount(
+    root,
+    adapter,
+    undefined,
+    undefined,
+    undefined,
+    [{
+      id: '33333333-3333-4333-8333-333333333333',
+      title: 'Selected Model Project',
+      path: canonicalProjectPath,
+    }],
+  )
+  t.after(() => harness.dispose())
+
+  await harness.client.messageHandler?.(conversationCommand(
+    'chat-model-project',
+    '/model mock project-selected',
+  ))
+  const originalAgent = harness.ctx.agents.list()[0]
+  assert.ok(originalAgent !== undefined)
+
+  await harness.client.messageHandler?.(conversationCommand(
+    'chat-model-project',
+    '/project Selected Model Project',
+  ))
+  const projectAgent = harness.ctx.agents.list().find((agent) => (
+    agent.session.header.cwd === canonicalProjectPath
+  ))
+  assert.ok(projectAgent !== undefined)
+  assert.notEqual(projectAgent.id, originalAgent.id)
+
+  await harness.client.messageHandler?.(conversationCommand(
+    'chat-model-project',
+    'use the selected model in this project',
+  ))
+  await waitFor(() => adapter.requests.length === 1)
+  assert.equal(adapter.requests[0]?.provider, 'mock')
+  assert.equal(adapter.requests[0]?.model, 'project-selected')
+  assert.equal(projectAgent.session.requestHeader()?.config.model, 'project-selected')
+  await projectAgent.whenIdle()
+  await harness.dispose()
+})
+
 test('harness e2e: the durable Lark selector stays authoritative over a later surface selector', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-lark-model-authority-'))
   t.after(() => rm(root, { recursive: true, force: true }))
