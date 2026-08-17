@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
-import { setImmediate as yieldImmediate } from 'node:timers/promises'
+import { setImmediate as yieldImmediate, setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { LarkBridge } from '../src/bridge.ts'
 import type { ConversationBinding } from '../src/conversation-binding.ts'
@@ -26,7 +26,7 @@ function deferred<T>(): Deferred<T> {
 async function waitFor(predicate: () => boolean, message: string): Promise<void> {
   for (let attempt = 0; attempt < 500; attempt += 1) {
     if (predicate()) return
-    await yieldImmediate()
+    await delay(2)
   }
   assert.fail(message)
 }
@@ -1043,11 +1043,14 @@ test('registration rechecks a symlink cwd after precommit and performs no stale-
   host.planBindingPut({ wait: bindingWrite.promise })
 
   const registering = send(client, 'chat-symlink-precommit', '/project register Stable Link')
-  await waitFor(() => host.bindingPuts.length === 1, 'registration precommit did not start')
-  await rm(link)
-  await symlink(other, link, 'dir')
-  bindingWrite.resolve()
-  await registering
+  try {
+    await waitFor(() => host.bindingPuts.length === 1, 'registration precommit did not start')
+    await rm(link)
+    await symlink(other, link, 'dir')
+  } finally {
+    bindingWrite.resolve()
+    await registering
+  }
 
   assert.deepEqual(host.workspaceCreateCalls, [])
   assert.deepEqual(host.workspaces, [])
