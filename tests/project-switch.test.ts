@@ -403,6 +403,7 @@ class ProjectHost {
     const sessionId = String(options.sessionId)
     const scopedTools: string[] = []
     const setupResult = await options.setup?.({
+      on: () => () => {},
       tools: { register: (tool: { name: string }) => { scopedTools.push(tool.name) } },
     }) as { commit?: () => void } | undefined
     setupResult?.commit?.()
