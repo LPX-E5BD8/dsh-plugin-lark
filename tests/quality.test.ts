@@ -7,7 +7,7 @@ import ts from 'typescript'
 import { CARD_LIMITS, renderTurnCard, renderTurnCardWithMeta } from '../src/cards.ts'
 import { DEFAULT_CONFIG } from '../src/config.ts'
 import { nonCatalogPolicyTypes, projectActivity, unclassifiedKnownEventTypes } from '../src/events.ts'
-import { apply } from '../src/index.ts'
+import { apply, inject } from '../src/index.ts'
 import { LARK_LOCALES } from '../src/locale.ts'
 
 const MAX_CONTROL_DEPTH = 3
@@ -57,6 +57,7 @@ function assertControlDepth(source: ts.SourceFile): void {
 
 test('quality: public defaults fail closed', () => {
   assert.equal(DEFAULT_CONFIG.allowAllUsers, false)
+  assert.deepEqual(inject, ['agents', 'storageDomain', 'sessions'])
 })
 
 test('quality: project management configuration stays fail-closed through the bundle seam', () => {

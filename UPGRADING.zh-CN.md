@@ -37,6 +37,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.8.0` | 可读取 v1/v2 绑定，并写入包含 `modelSelection` 的严格 v2 record。v1 只会在下一次绑定写入时惰性升级，不会在启动时批量改写。 | `0.7.0` 只接受严格 v1；任意一条 v2 record 都会让它的全表启动校验失败。必须恢复 v0.8 前的冷备份。 |
 | `0.8.1`–`0.8.8` | 与 v0.8.0 相比没有插件自有持久化 schema 变化。 | 在精确 rc.6 版本组上可与 v0.8.0 共用 v2 状态，但仍应遵守冷备份规则。插件 v0.8.1–v0.8.4 要求 Node.js 22。 |
 | `0.9.0` | 插件自有 conversation binding 仍为 v2，但允许已授权 Lark 管理员在 Harness 自有的 `workspace` domain v2 中创建和删除 record。 | 回滚插件代码不会撤销快照后新增或移除的注册。命令绝不会删除目录与 transcript，但必须显式核对 Registry 可见性/顺序，或恢复完整冷快照。 |
+| `0.9.1` | Schema 保持不变；在提交项目 Registry mutation binding 前，先实体化首条命令对应的 Session。 | 状态与 v0.9.0 兼容。回滚代码会重新引入项目 Registry 服务依赖缺陷，并移除首条命令所需的检查点实体化；应保留完整冷快照并优先前滚。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -53,7 +54,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.0'
+target_tag='v0.9.1'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -195,9 +196,10 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 ## 回滚决策表
 
-| 从 v0.9.0 回滚到 | 状态处理方式 |
+| 从 v0.9.1 回滚到 | 状态处理方式 |
 | --- | --- |
-| v0.8.8、v0.8.7、v0.8.6 或 v0.8.5 | 使用相同 v2 binding schema 和 Node.js 22/24 engine contract。旧插件会忽略项目管理命令，但回滚不会恢复已移除注册，也不会删除 v0.9.0 新增的注册。恢复服务前必须保留完整快照并核对 Harness `workspace` domain；项目目录、文件和 transcript 都会保留。 |
+| v0.9.0 | 使用相同的 v2 binding 与 Workspace schema；v0.9.1 已实体化的 Session 仍可读取，但 v0.9.0 会重新引入项目 Registry 检查点失败，并缺少安全的首条命令实体化。必须保留完整快照，并优先通过前滚恢复。 |
+| v0.8.8、v0.8.7、v0.8.6 或 v0.8.5 | 使用相同 v2 binding schema 和 Node.js 22/24 engine contract。旧插件会忽略项目管理命令，但回滚不会恢复 v0.9.x 期间移除的注册，也不会删除 v0.9.x 期间新增的注册。恢复服务前必须保留完整快照并核对 Harness `workspace` domain；项目目录、文件和 transcript 都会保留。 |
 | v0.8.4、v0.8.3、v0.8.2、v0.8.1 或 v0.8.0 | 使用相同 v2 binding schema。在精确 rc.6 版本组上，优雅停机并保留快照后可以原地回滚代码。本手册只支持这些目标运行在 Node.js 22 上：v0.8.1–v0.8.4 会通过 `engines` 强制该边界；v0.8.0 历史上的宽范围也没有建立 Node.js 24 支持。已经运行 Node.js 24 的部署必须先在单独的冷步骤中恢复 runtime，再启动旧插件。 |
 | v0.7.0 | 不能让它读取可能已被 v0.8.x 写过的状态。v0.7 无法读取任何 v2 binding，必须恢复完整的 v0.8 前快照。 |
 | v0.3.0–v0.6.1 | 必须恢复 v0.7 前的快照；这些版本会忽略提交权威 binding，并可能选择更新的 orphan generation。 |

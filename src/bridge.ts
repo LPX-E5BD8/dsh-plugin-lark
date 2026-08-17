@@ -1811,6 +1811,7 @@ export class LarkBridge {
     try {
       maintenance = handle.agent.runMaintenance(async (signal) => {
         if (signal.aborted || handle.agent.inbox.hasPending) return 'busy'
+        this.materializeFreshHandle(handle)
         const durable = await this.ctx.sessions.flush(handle.agent.session)
         if (durable !== true) return 'unavailable'
         if (signal.aborted

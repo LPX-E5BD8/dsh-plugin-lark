@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.8.8'
-const BASELINE_COMMIT = 'b0936ea09b512a9316a59f2cb2176716288eb653'
-const BASELINE_DIGEST = 'sha256:b88a42ef5ecf2c253c59a71ecaf3a53224825cc1ea6498c150f42a27c637f6b5'
+const BASELINE_TAG = 'v0.9.0'
+const BASELINE_COMMIT = 'c806f990a57447a5b4ed474737be2fcd24090798'
+const BASELINE_DIGEST = 'sha256:61f6e8a78dee53eedc689a5c7210302bee8ad111f5ba20ea8d6b234829d1fd19'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 

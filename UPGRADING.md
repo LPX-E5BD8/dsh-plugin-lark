@@ -37,6 +37,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.8.0` | Reads v1 or v2 bindings and writes strict v2 records with `modelSelection`. A v1 record is upgraded lazily on its next binding write, not at startup. | `0.7.0` accepts only strict v1. Any v2 record makes its full-table startup validation fail. Restore a pre-v0.8 cold snapshot. |
 | `0.8.1`–`0.8.8` | No plugin-owned durable schema change from v0.8.0. | These releases can share v2 state with v0.8.0, subject to the normal cold-backup rule. Plugin v0.8.1–v0.8.4 requires Node.js 22. |
 | `0.9.0` | Keeps plugin-owned conversation bindings at v2, but allows authorized Lark managers to create and delete records in the Harness-owned `workspace` domain v2. | Rolling plugin code back does not undo registrations added or removed after the snapshot. Directories and transcripts are never deleted by these commands, but Registry visibility/order must be reconciled explicitly or restored from the complete cold snapshot. |
+| `0.9.1` | Keeps the same schemas while materializing a first-command Session before committing its project-registry mutation binding. | State remains compatible with v0.9.0. Rolling code back reintroduces the project-registry service-dependency defect and removes the first-command checkpoint materializer; keep a complete cold snapshot and prefer rolling forward. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -53,7 +54,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.0'
+target_tag='v0.9.1'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -195,9 +196,10 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 ## Rollback decision table
 
-| Rollback target from v0.9.0 | State handling |
+| Rollback target from v0.9.1 | State handling |
 | --- | --- |
-| v0.8.8, v0.8.7, v0.8.6, or v0.8.5 | Same v2 binding schema and Node.js 22/24 engine contract. The older plugin ignores project-management commands, but rollback does not restore removed registrations or remove registrations added by v0.9.0. Keep the complete snapshot and reconcile the Harness `workspace` domain before serving traffic; project directories, files, and transcripts remain. |
+| v0.9.0 | Same v2 binding and Workspace schemas. The already materialized v0.9.1 Session remains readable, but v0.9.0 reintroduces failed project-registry checkpoints and lacks safe first-command materialization; retain the full snapshot and prefer roll-forward recovery. |
+| v0.8.8, v0.8.7, v0.8.6, or v0.8.5 | Same v2 binding schema and Node.js 22/24 engine contract. The older plugin ignores project-management commands, but rollback does not restore registrations removed during v0.9.x or remove registrations added during v0.9.x. Keep the complete snapshot and reconcile the Harness `workspace` domain before serving traffic; project directories, files, and transcripts remain. |
 | v0.8.4, v0.8.3, v0.8.2, v0.8.1, or v0.8.0 | Same v2 binding schema. Stop cleanly and keep a snapshot; an in-place code rollback is schema-compatible on the exact rc.6 cohort. This runbook supports only Node.js 22 for these targets: v0.8.1–v0.8.4 enforce it in `engines`, while v0.8.0's broader historical range did not establish Node.js 24 support. A deployment already on Node.js 24 must restore the runtime in a separate cold step before starting the older plugin. |
 | v0.7.0 | Do not start it on state that v0.8.x may have written. Restore the complete pre-v0.8 snapshot because v0.7 cannot read any v2 binding. |
 | v0.3.0–v0.6.1 | Restore a snapshot taken before v0.7. Those versions ignore commit-authority bindings and can select a newer orphan generation. |

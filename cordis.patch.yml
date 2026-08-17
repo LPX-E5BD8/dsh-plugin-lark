@@ -1,5 +1,5 @@
 # Credentials come from DSH_LARK_APP_ID and DSH_LARK_APP_SECRET.
-# Requires agents and storageDomain; the stock Web profile mounts both.
+# Requires agents, sessions, and storageDomain; the stock Web profile mounts all three.
 - insert:
     - id: lark
       name: dsh-plugin-lark

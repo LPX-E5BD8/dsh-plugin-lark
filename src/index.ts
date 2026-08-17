@@ -10,7 +10,7 @@ import { LARK_LOCALES } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 
 export const name = 'lark'
-export const inject = ['agents', 'storageDomain']
+export const inject = ['agents', 'storageDomain', 'sessions']
 
 export interface LarkConfig {
   domain?: 'feishu' | 'lark'
