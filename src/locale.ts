@@ -1,6 +1,22 @@
 export const LARK_LOCALES = ['zh-CN', 'en-US'] as const
 export type LarkLocale = typeof LARK_LOCALES[number]
 
+interface ProjectListItem {
+  readonly id: string
+  readonly title: string
+}
+
+function projectTitle(title: string, fallback: string): string {
+  const normalized = title.replace(/\s+/g, ' ').trim()
+  if (normalized === '') return fallback
+  const runes = [...normalized]
+  return runes.length <= 120 ? normalized : `${runes.slice(0, 119).join('')}…`
+}
+
+function projectLabel(project: ProjectListItem, unnamed: string): string {
+  return `${projectTitle(project.title, unnamed)} (${project.id})`
+}
+
 interface LocaleCopy {
   readonly bridge: {
     readonly help: string
@@ -19,12 +35,24 @@ interface LocaleCopy {
     readonly blocked: string
     readonly cancelled: string
     readonly freshSession: string
+    readonly freshSessionFailed: string
     readonly stopRequested: string
     readonly stopExpired: string
     readonly stopUnavailable: string
     readonly stopWrongContext: string
     readonly commandFailed: string
     readonly longAnswer: string
+    readonly projectUnavailable: string
+    readonly projectUnknown: string
+    readonly projectAmbiguous: string
+    readonly projectBusy: string
+    readonly projectHistoryCheckpointFailed: string
+    readonly projectSwitchFailed: string
+    readonly projectMutationReplayed: string
+    projectList(currentId: string | undefined, projects: readonly ProjectListItem[]): string
+    projectMissingDirectory(project: ProjectListItem): string
+    projectAlreadyCurrent(project: ProjectListItem): string
+    projectSwitched(project: ProjectListItem): string
     commandDescription(name: string, fallback: string): string
     unknownCommand(command: string): string
     unknownTurnEnd(kind: string): string
@@ -78,6 +106,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       help: [
         '/new — 开始新会话',
         '/clear — 重置当前会话',
+        '/project [项目名或 ID] — 查看或切换项目',
         '/help — 显示帮助',
       ].join('\n'),
       denied: '没有权限。',
@@ -95,12 +124,40 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       blocked: '执行被阻塞。',
       cancelled: '执行已取消。',
       freshSession: '已开始新会话。',
+      freshSessionFailed: '无法安全开始新会话，当前会话保持不变；请等待现有任务完成后重试。',
       stopRequested: '正在停止。',
       stopExpired: '该执行已结束或停止。',
       stopUnavailable: '暂时无法停止。',
       stopWrongContext: '只能由发起用户在原会话中停止。',
       commandFailed: '命令执行失败，请重试。',
       longAnswer: '回复较长，以下为完整内容：',
+      projectUnavailable: '项目列表暂不可用，请稍后重试。',
+      projectUnknown: '未找到该已注册项目。发送 /project 查看可用项目。',
+      projectAmbiguous: '有多个项目使用该名称，请改用 /project 列出的完整 ID。',
+      projectBusy: '当前会话仍有执行或待处理消息，请等待完成后重试。',
+      projectHistoryCheckpointFailed: '无法确认当前会话历史已保存，项目未切换；请检查持久化存储后重试。',
+      projectSwitchFailed: '项目切换失败，当前会话保持不变，请重试。',
+      projectMutationReplayed: '该项目切换已处理；当前会话保持最新状态。',
+      projectList: (currentId, projects) => {
+        const current = projects.find((project) => project.id === currentId)
+        const currentLine = current === undefined
+          ? '当前项目：未关联已注册项目'
+          : `当前项目：${projectLabel(current, '未命名项目')}`
+        if (projects.length === 0) return `${currentLine}\n已注册项目：无`
+        const items = projects.map((project) => (
+          `- ${projectLabel(project, '未命名项目')}${project.id === currentId ? ' [当前]' : ''}`
+        ))
+        return `${currentLine}\n已注册项目：\n${items.join('\n')}`
+      },
+      projectMissingDirectory: (project) => (
+        `项目 ${projectLabel(project, '未命名项目')} 的目录不存在，未切换会话。`
+      ),
+      projectAlreadyCurrent: (project) => (
+        `当前已是项目 ${projectLabel(project, '未命名项目')}。`
+      ),
+      projectSwitched: (project) => (
+        `已切换到项目 ${projectLabel(project, '未命名项目')}，并开始新会话。`
+      ),
       commandDescription: (name, fallback) => ({
         compact: '整理较早的会话上下文',
         goal: '查看或设置长任务目标',
@@ -157,6 +214,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       help: [
         '/new — start a fresh session',
         '/clear — reset the current session',
+        '/project [name or ID] — list or switch projects',
         '/help — show this help',
       ].join('\n'),
       denied: "You don't have permission.",
@@ -174,12 +232,40 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       blocked: 'Execution was blocked.',
       cancelled: 'Execution was cancelled.',
       freshSession: 'Started a fresh session.',
+      freshSessionFailed: 'A fresh session could not be started safely. The current session was left unchanged; wait for existing work to finish and try again.',
       stopRequested: 'Stopping.',
       stopExpired: 'This run has already ended or stopped.',
       stopUnavailable: 'Unable to stop this run.',
       stopWrongContext: 'Only the initiating user can stop this run in the original chat.',
       commandFailed: 'Command execution failed. Please try again.',
       longAnswer: 'The reply is long. Here is the complete content:',
+      projectUnavailable: 'The project list is unavailable. Please try again later.',
+      projectUnknown: 'No registered project matched. Send /project to list available projects.',
+      projectAmbiguous: 'More than one project uses that name. Use a full ID from /project.',
+      projectBusy: 'This conversation still has running or pending work. Wait for it to finish and try again.',
+      projectHistoryCheckpointFailed: 'The current transcript could not be confirmed durable, so the project was not switched. Check session storage and try again.',
+      projectSwitchFailed: 'Project switch failed. The current session was left unchanged. Please try again.',
+      projectMutationReplayed: 'That project switch was already handled. The conversation remains at its latest state.',
+      projectList: (currentId, projects) => {
+        const current = projects.find((project) => project.id === currentId)
+        const currentLine = current === undefined
+          ? 'Current project: no registered project'
+          : `Current project: ${projectLabel(current, 'Untitled project')}`
+        if (projects.length === 0) return `${currentLine}\nRegistered projects: none`
+        const items = projects.map((project) => (
+          `- ${projectLabel(project, 'Untitled project')}${project.id === currentId ? ' [current]' : ''}`
+        ))
+        return `${currentLine}\nRegistered projects:\n${items.join('\n')}`
+      },
+      projectMissingDirectory: (project) => (
+        `The directory for ${projectLabel(project, 'Untitled project')} is missing. The session was not switched.`
+      ),
+      projectAlreadyCurrent: (project) => (
+        `${projectLabel(project, 'Untitled project')} is already the current project.`
+      ),
+      projectSwitched: (project) => (
+        `Switched to ${projectLabel(project, 'Untitled project')} and started a fresh session.`
+      ),
       commandDescription: (_name, fallback) => fallback,
       unknownCommand: (command) => `Unknown command ${command}. Send /help.`,
       unknownTurnEnd: (kind) => `Unknown execution result: ${kind}`,

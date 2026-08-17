@@ -54,9 +54,17 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Publish equivalent English and Simplified Chinese READMEs with a complete, scannable feature overview.
 - Document provider-key ownership and the current project/model switching boundary explicitly.
 
+## 0.7.0 — Conversation projects
+
+- Let an authorized conversation list and select only Workspaces registered by the Web profile, without accepting arbitrary filesystem paths from chat.
+- Start a blank, durable session generation in the selected Workspace and restore that exact project after restart or idle-handle eviction.
+- Checkpoint the old transcript before switching, and keep each blank Lark generation out of the Workspace reuse index until its first durable turn.
+- Commit the exact active generation through a privacy-preserving durable sidecar so failed candidates cannot win restart recovery, and retain a bounded hashed mutation history so receipt-loss replays cannot roll back a later project or reset.
+- Serialize project changes against true Agent maintenance and bind replies to claimed message IDs across concurrent Lark and Web input.
+- Reject an interrupted ambiguous mutation callback without a receipt, and require a fresh Bridge/storage remount before recovery.
+
 ## Later 0.x — Usability
 
-- Let each authorized conversation select a validated project/workspace without affecting other conversations.
 - Let each conversation select and persist an available provider/model without cross-session leakage.
 
 ## 1.0 — Stable release

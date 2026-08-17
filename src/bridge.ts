@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { isAbsolute } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -9,6 +11,8 @@ import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-app
 import { CARD_ACTIONS, CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCardWithMeta } from './cards.ts'
 import type { ToolCardItem, TurnCard, TurnCardStatus, TurnCardTodo, TurnCardUsage } from './cards.ts'
 import { DEFAULT_CONFIG, MIN_STREAM_UPDATE_INTERVAL_MS } from './config.ts'
+import { CONVERSATION_MUTATION_HISTORY_LIMIT } from './conversation-binding.ts'
+import type { ConversationBinding, ConversationBindingStore } from './conversation-binding.ts'
 import { projectActivity, sessionEventPolicy } from './events.ts'
 import type { ActivityProjection, CatalogSessionEvent } from './events.ts'
 import type { InboundDeduplicator } from './inbound-dedup.ts'
@@ -34,6 +38,7 @@ export interface LarkBridgeOptions {
   cwd?: string
   client: LarkClientLike
   inboundDeduplicator?: InboundDeduplicator
+  conversationBindings?: ConversationBindingStore
 }
 
 interface ConversationSession {
@@ -41,6 +46,7 @@ interface ConversationSession {
   handle: AgentHandle
   sessionId: string
   lastAccess: number
+  workspaceId?: string
 }
 
 type ConversationEvictionResult = 'evicted' | 'retained' | 'busy' | 'not-durable'
@@ -74,6 +80,51 @@ interface AgentComposition {
   readonly setup?: (agentCtx: Context) => Promise<void>
 }
 
+interface RegisteredWorkspace {
+  readonly id: string
+  readonly path: string
+  readonly title: string
+  readonly sessionIds?: ReadonlyArray<ReturnType<typeof SessionId>>
+  status(): Promise<'ok' | 'missing-dir'>
+  attachSession(sessionId: ReturnType<typeof SessionId>): Promise<void>
+}
+
+interface WorkspaceRegistryLike {
+  list(): ReadonlyArray<RegisteredWorkspace>
+  get(id: string): RegisteredWorkspace | undefined
+  resolveByPath?(path: string): Promise<RegisteredWorkspace | undefined>
+}
+
+interface ProjectSelection {
+  readonly registry: WorkspaceRegistryLike
+  readonly workspaces: readonly RegisteredWorkspace[]
+  readonly workspace: RegisteredWorkspace
+}
+
+interface PendingWorkspaceAttachment {
+  readonly workspaceId: string
+  readonly workspacePath: string
+}
+
+type ProjectSwitchMaintenanceResult = {
+  readonly kind: 'committed'
+  readonly workspace: RegisteredWorkspace
+  readonly previousSessionId: string
+  readonly previousHandle: AgentHandle
+} | {
+  readonly kind: 'busy' | 'history-failed' | 'unavailable' | 'unknown' | 'missing' | 'failed'
+}
+
+type CurrentProjectMutationResult = 'recorded' | 'busy' | 'failed'
+
+type ResetMaintenanceResult = {
+  readonly kind: 'committed'
+  readonly previousSessionId: string
+  readonly previousHandle: AgentHandle
+} | {
+  readonly kind: 'failed'
+}
+
 interface CommandRuntimeLike {
   list(agent: Agent): ReadonlyArray<{
     readonly name: string
@@ -92,12 +143,13 @@ interface MessageRoute {
   readonly openId: string
   readonly replyToMessageId: string
   readonly sessionBaseId: string
+  readonly mutationHash?: string
   readonly replyInThread?: true
 }
 
-interface RouteQueue {
-  readonly items: MessageRoute[]
-  head: number
+interface PendingMessageRoute {
+  readonly sessionId: string
+  readonly route: MessageRoute
 }
 
 interface TurnState {
@@ -129,12 +181,14 @@ interface TurnState {
 interface PendingApproval {
   settle: (outcome: ApprovalOutcome, messageId?: string) => Promise<void>
   readonly sessionId: string
+  readonly baseId: string
   readonly chatId: string
   readonly openId: string
 }
 
 interface PendingStop {
   readonly sessionId: string
+  readonly baseId: string
   readonly chatId: string
   readonly openId: string
   stopping: boolean
@@ -144,7 +198,8 @@ const SESSION_RESET_SEPARATOR = ':'
 const GROUP_SESSION_SCOPE_VERSION = 'group-v1'
 const RECENT_INBOUND_LIMIT = 1024
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear'])
+const INBOUND_MUTATION_HASH_DOMAIN = 'dsh-plugin-lark/conversation-mutation/v1'
+const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear', 'project'])
 const UNSUPPORTED_RUNTIME_COMMANDS = new Set(['feedback', 'export'])
 
 const APPROVAL_DECISION = {
@@ -158,6 +213,13 @@ const APPROVAL_OUTCOME = {
   cancelled: 'cancelled',
   unavailable: 'unavailable',
 } as const
+
+class BindingConfirmationInterruptedError extends Error {
+  constructor(cause?: unknown) {
+    super('lark: conversation binding confirmation was interrupted by shutdown', { cause })
+    this.name = 'BindingConfirmationInterruptedError'
+  }
+}
 
 function assistantText(event: Extract<SessionEvent, { type: 'assistant/message' }>): string | undefined {
   const blocks = event.data.message.content.flatMap((block) => (
@@ -325,6 +387,85 @@ function sessionGeneration(baseId: string, sessionId: string): number | undefine
   return Number.isSafeInteger(generation) && generation > 0 ? generation : undefined
 }
 
+function conversationBinding(
+  baseId: string,
+  sessionId: string,
+  mutationHashes: readonly string[] = [],
+): ConversationBinding {
+  const generation = sessionGeneration(baseId, sessionId)
+  if (generation === undefined) {
+    throw new TypeError('lark: active session id is outside its conversation lineage')
+  }
+  return {
+    generation,
+    suffix: generation === 0
+      ? null
+      : sessionId.slice(baseId.length + SESSION_RESET_SEPARATOR.length),
+    mutationHashes: Object.freeze([...mutationHashes]),
+  }
+}
+
+function appendMutationHash(
+  mutationHashes: readonly string[],
+  mutationHash: string | undefined,
+): readonly string[] {
+  if (mutationHash === undefined) return mutationHashes
+  const next = mutationHashes.filter((hash) => hash !== mutationHash)
+  next.push(mutationHash)
+  return Object.freeze(next.slice(-CONVERSATION_MUTATION_HISTORY_LIMIT))
+}
+
+function inboundMutationHash(chatId: string, messageId: string): string | undefined {
+  if (messageId === '') return undefined
+  return createHash('sha256')
+    .update(INBOUND_MUTATION_HASH_DOMAIN)
+    .update('\0')
+    .update(String(Buffer.byteLength(chatId, 'utf8')))
+    .update(':')
+    .update(chatId, 'utf8')
+    .update(String(Buffer.byteLength(messageId, 'utf8')))
+    .update(':')
+    .update(messageId, 'utf8')
+    .digest('hex')
+}
+
+function boundSessionId(baseId: string, binding: ConversationBinding): ReturnType<typeof SessionId> {
+  const sessionId = binding.suffix === null
+    ? baseId
+    : `${baseId}${SESSION_RESET_SEPARATOR}${binding.suffix}`
+  if (sessionGeneration(baseId, sessionId) !== binding.generation) {
+    throw new TypeError('lark: persisted conversation binding is invalid')
+  }
+  return SessionId(sessionId)
+}
+
+function sameConversationBinding(left: ConversationBinding | undefined, right: ConversationBinding): boolean {
+  return left?.generation === right.generation
+    && left.suffix === right.suffix
+    && left.mutationHashes.length === right.mutationHashes.length
+    && left.mutationHashes.every((hash, index) => hash === right.mutationHashes[index])
+}
+
+function bindingReadBackAfterError(
+  store: ConversationBindingStore,
+  baseId: string,
+  binding: ConversationBinding,
+  writeError: unknown,
+): { readonly confirmed: true } | { readonly confirmed: false; readonly error: unknown } {
+  try {
+    if (sameConversationBinding(store.read(baseId), binding)) return { confirmed: true }
+    return { confirmed: false, error: writeError }
+  } catch (readError) {
+    return {
+      confirmed: false,
+      error: new AggregateError(
+        [writeError, readError],
+        'conversation binding write and read-back failed',
+      ),
+    }
+  }
+}
+
 function optionalAgentPreset(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
@@ -347,6 +488,32 @@ function selectedAgentPreset(
   return optionalAgentPreset(headerPreset)
 }
 
+function activeSessionComposition(session: Session): {
+  readonly cwd?: string
+  readonly agentPreset?: string
+} {
+  const candidate = session as unknown as {
+    readonly header?: { readonly cwd?: unknown; readonly agentPreset?: unknown }
+    readonly events?: unknown
+  }
+  const cwd = candidate.header?.cwd
+  if (cwd !== undefined && (typeof cwd !== 'string' || !isAbsolute(cwd))) {
+    throw new TypeError('lark: active session cwd is invalid')
+  }
+  const events = candidate.events === undefined
+    ? []
+    : candidate.events
+  if (!Array.isArray(events)) throw new TypeError('lark: active session events are invalid')
+  const agentPreset = selectedAgentPreset(
+    optionalAgentPreset(candidate.header?.agentPreset),
+    events as ReadonlyArray<{ readonly type: string; readonly data: unknown }>,
+  )
+  return {
+    ...(cwd === undefined ? {} : { cwd }),
+    ...(agentPreset === undefined ? {} : { agentPreset }),
+  }
+}
+
 function agentPresetsOf(ctx: Context): AgentPresetsLike | undefined {
   const service = ctx.get('agentPresets') as unknown
   if (service === undefined) return undefined
@@ -358,6 +525,88 @@ function agentPresetsOf(ctx: Context): AgentPresetsLike | undefined {
     throw new TypeError('lark: agentPresets service is invalid')
   }
   return candidate as AgentPresetsLike
+}
+
+function sessionPersistenceOf(ctx: Context): SessionPersistenceLike | undefined {
+  const service = ctx.get('sessionPersistence') as unknown
+  if (service === undefined) return undefined
+  if (service === null || typeof service !== 'object') {
+    throw new TypeError('lark: sessionPersistence service is invalid')
+  }
+  const candidate = service as Partial<SessionPersistenceLike>
+  if (typeof candidate.list !== 'function'
+    || (candidate.inspect !== undefined && typeof candidate.inspect !== 'function')) {
+    throw new TypeError('lark: sessionPersistence service is invalid')
+  }
+  return candidate as SessionPersistenceLike
+}
+
+function conversationBindingsOf(ctx: Context): ConversationBindingStore | undefined {
+  if (typeof ctx.get !== 'function') return undefined
+  const service = ctx.get('larkConversationBindings') as unknown
+  if (service === undefined) return undefined
+  if (service === null || typeof service !== 'object') {
+    throw new TypeError('lark: conversation binding service is invalid')
+  }
+  const candidate = service as Partial<ConversationBindingStore>
+  if (typeof candidate.read !== 'function'
+    || typeof candidate.put !== 'function'
+    || typeof candidate.close !== 'function') {
+    throw new TypeError('lark: conversation binding service is invalid')
+  }
+  return candidate as ConversationBindingStore
+}
+
+function registeredWorkspace(value: unknown): RegisteredWorkspace {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('lark: workspaceRegistry returned an invalid workspace')
+  }
+  const candidate = value as Partial<RegisteredWorkspace>
+  if (typeof candidate.id !== 'string'
+    || candidate.id === ''
+    || /\s/.test(candidate.id)
+    || typeof candidate.path !== 'string'
+    || !isAbsolute(candidate.path)
+    || typeof candidate.title !== 'string'
+    || typeof candidate.status !== 'function'
+    || typeof candidate.attachSession !== 'function'
+    || (candidate.sessionIds !== undefined
+      && (!Array.isArray(candidate.sessionIds)
+        || candidate.sessionIds.some((sessionId) => typeof sessionId !== 'string')))) {
+    throw new TypeError('lark: workspaceRegistry returned an invalid workspace')
+  }
+  return candidate as RegisteredWorkspace
+}
+
+function workspaceRegistryOf(ctx: Context): WorkspaceRegistryLike | undefined {
+  const service = ctx.get('workspaceRegistry') as unknown
+  if (service === undefined) return undefined
+  if (service === null || typeof service !== 'object') {
+    throw new TypeError('lark: workspaceRegistry service is invalid')
+  }
+  const candidate = service as Partial<WorkspaceRegistryLike>
+  if (typeof candidate.list !== 'function'
+    || typeof candidate.get !== 'function'
+    || (candidate.resolveByPath !== undefined && typeof candidate.resolveByPath !== 'function')) {
+    throw new TypeError('lark: workspaceRegistry service is invalid')
+  }
+  return candidate as WorkspaceRegistryLike
+}
+
+function listedWorkspaces(registry: WorkspaceRegistryLike): RegisteredWorkspace[] {
+  const listed = registry.list()
+  if (!Array.isArray(listed)) {
+    throw new TypeError('lark: workspaceRegistry.list returned an invalid value')
+  }
+  const ids = new Set<string>()
+  return listed.map((value) => {
+    const workspace = registeredWorkspace(value)
+    if (ids.has(workspace.id)) {
+      throw new TypeError('lark: workspaceRegistry.list returned a duplicate id')
+    }
+    ids.add(workspace.id)
+    return workspace
+  })
 }
 
 function latestSessionBinding(
@@ -403,7 +652,9 @@ export class LarkBridge {
   private readonly conversationEvictions = new Map<string, Promise<void>>()
   private readonly conversationIdleWatchers = new Map<string, Promise<void>>()
   private readonly handles = new Map<string, Promise<AgentHandle>>()
-  private readonly queuedRoutes = new Map<string, RouteQueue>()
+  private readonly handleRetirements = new Set<Promise<void>>()
+  private readonly messageRoutes = new Map<string, PendingMessageRoute>()
+  private readonly turnStarts = new Map<string, Map<number, number>>()
   private readonly turns = new Map<string, Map<number, TurnState>>()
   private readonly activeRoutes = new Map<string, MessageRoute>()
   private readonly contextWindows = new Map<string, number>()
@@ -415,9 +666,16 @@ export class LarkBridge {
   private readonly activeInboundTasks = new Set<Promise<void>>()
   private readonly completedInboundKeys: string[] = []
   private readonly inboundDeduplicator: InboundDeduplicator | undefined
+  private readonly conversationBindings: ConversationBindingStore | undefined
   private readonly sessionOperations = new Map<string, Promise<void>>()
+  private readonly conversationBarriers = new Map<string, Promise<void>>()
+  private readonly pendingWorkspaceAttachments = new Map<string, PendingWorkspaceAttachment>()
+  private readonly workspaceAttachmentTasks = new Map<string, Promise<void>>()
+  private readonly workspaceAttachmentRetries = new Set<string>()
   private readonly lastSessionGenerations = new Map<string, number>()
   private disposeEvents: (() => void) | undefined
+  private disposeInboxClaimed: (() => void) | undefined
+  private disposeInboxDiscarded: (() => void) | undefined
   private disposeApproval: (() => void) | undefined
   private approvalWaterfallBound = false
   private startPromise: Promise<void> | undefined
@@ -427,14 +685,14 @@ export class LarkBridge {
   private stopping = false
   private conversationEvictionRequested = false
   private conversationAccessSequence = 0
+  private bindingRecoveryRequired = false
   private commandAbort = new AbortController()
-  // Resets are rare; use per-session barriers only if contention is measured.
-  private resetBarrier: Promise<void> = Promise.resolve()
 
   constructor(ctx: Context, options: LarkBridgeOptions) {
     this.ctx = ctx
     this.client = options.client
     this.inboundDeduplicator = options.inboundDeduplicator
+    this.conversationBindings = options.conversationBindings ?? conversationBindingsOf(ctx)
     this.locale = options.locale ?? DEFAULT_CONFIG.locale
     this.text = localeCopy(this.locale).bridge
     this.allowFrom = new Set((options.allowFrom ?? []).map((openId) => openId.trim()).filter(Boolean))
@@ -456,6 +714,11 @@ export class LarkBridge {
   }
 
   start(): Promise<void> {
+    if (this.bindingRecoveryRequired) {
+      return Promise.reject(new Error(
+        'lark: bridge requires a full storage remount after an interrupted binding confirmation',
+      ))
+    }
     if (this.stopPromise !== undefined) {
       return Promise.reject(new Error('lark: bridge is stopping'))
     }
@@ -465,6 +728,12 @@ export class LarkBridge {
     this.commandAbort = new AbortController()
     this.disposeEvents = this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       this.handleSessionEvent(session, event)
+    })
+    this.disposeInboxClaimed = this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
+      this.claimMessageRoute(String(agent.id), String(message.id), turn)
+    })
+    this.disposeInboxDiscarded = this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
+      this.discardMessageRoute(String(agent.id), String(message.id))
     })
     this.bindApprovalSeam()
     this.client.onMessage((msg) => this.handleInbound(msg))
@@ -494,6 +763,14 @@ export class LarkBridge {
       this.disposeEvents()
       this.disposeEvents = undefined
     }
+    if (this.disposeInboxClaimed !== undefined) {
+      this.disposeInboxClaimed()
+      this.disposeInboxClaimed = undefined
+    }
+    if (this.disposeInboxDiscarded !== undefined) {
+      this.disposeInboxDiscarded()
+      this.disposeInboxDiscarded = undefined
+    }
     if (this.disposeApproval !== undefined) {
       this.disposeApproval()
       this.disposeApproval = undefined
@@ -513,7 +790,17 @@ export class LarkBridge {
       await collectSettled([Promise.resolve().then(() => this.client.stop())], failures)
     }
     if (start !== undefined) await Promise.allSettled([start])
-    await collectSettled([...this.activeInboundTasks], failures)
+    const inboundResults = await Promise.allSettled([...this.activeInboundTasks])
+    for (const result of inboundResults) {
+      if (result.status === 'rejected'
+        && !(result.reason instanceof BindingConfirmationInterruptedError)) {
+        failures.push(result.reason)
+      }
+    }
+    this.pendingWorkspaceAttachments.clear()
+    this.workspaceAttachmentRetries.clear()
+    await collectSettled([...this.workspaceAttachmentTasks.values()], failures)
+    this.workspaceAttachmentTasks.clear()
     const evictionWorker = this.conversationEvictionWorker
     if (evictionWorker !== undefined) await collectSettled([evictionWorker], failures)
     if (this.conversationEvictionWorker === evictionWorker) {
@@ -533,9 +820,12 @@ export class LarkBridge {
     this.handles.clear()
     this.inboundTasks.clear()
     this.activeInboundTasks.clear()
+    this.conversationBarriers.clear()
     this.completedInboundKeys.length = 0
     this.clearRoutes()
     await collectSettled([...new Set(agents)].map((handle) => handle.dispose()), failures)
+    await collectSettled([...this.handleRetirements], failures)
+    this.handleRetirements.clear()
     this.conversationAccessSequence = 0
     this.clientStarted = false
     if (failures.length > 0) throw new AggregateError(failures, 'lark: bridge teardown failed')
@@ -588,11 +878,13 @@ export class LarkBridge {
     const command = isTextMessage ? inboundCommand(msg.text) : undefined
     if (msg.chatType === 'group' && !msg.mentioned && command === undefined) return
     const replyInThread = msg.chatType === 'group' && hasPlatformId(msg.threadId)
+    const mutationHash = inboundMutationHash(msg.chatId, msg.messageId)
     const route: MessageRoute = {
       chatId: msg.chatId,
       openId: msg.openId,
       replyToMessageId: msg.messageId,
       sessionBaseId: this.sessionBaseId(msg),
+      ...(mutationHash === undefined ? {} : { mutationHash }),
       ...(replyInThread ? { replyInThread: true } : {}),
     }
     if (!this.authorized(msg.openId)) {
@@ -607,21 +899,25 @@ export class LarkBridge {
       await this.handleCommand(route, command)
       return
     }
-    await this.resetBarrier
-    await this.withConversation(route.sessionBaseId, async (conversation) => {
-      this.enqueueRoute(conversation.sessionId, route)
-      try {
-        conversation.handle.agent.followup(createUserMessage({
+    await this.enqueueConversationOperation(route.sessionBaseId, () => (
+      this.withConversation(route.sessionBaseId, async (conversation) => {
+        await this.sessionOperations.get(conversation.baseId)
+        this.prepareWorkspaceAttachment(conversation)
+        const message = createUserMessage({
           content: [{ type: 'text', text: msg.text.trim() }],
           source: { kind: 'user' },
-        }))
-      } catch (error) {
-        this.removeQueuedRoute(conversation.sessionId, route)
-        this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
-        await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
-        throw error
-      }
-    })
+        })
+        this.enqueueMessageRoute(conversation.sessionId, String(message.id), route)
+        try {
+          conversation.handle.agent.followup(message)
+        } catch (error) {
+          this.removeMessageRoute(String(message.id), route)
+          this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
+          await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
+          throw error
+        }
+      })
+    ))
   }
 
   async handleCardAction(action: LarkCardAction): Promise<LarkCardActionResult> {
@@ -636,13 +932,15 @@ export class LarkBridge {
     if (requestId === '' || outcome === undefined) {
       return actionToast('error', this.text.approvalMalformed)
     }
-    await this.resetBarrier
-    const pending = this.pending.get(requestId)
-    if (pending === undefined) return actionToast('info', this.text.approvalExpired)
-    if (pending.chatId !== action.chatId || pending.openId !== action.openId) {
+    const candidate = this.pending.get(requestId)
+    if (candidate === undefined) return actionToast('info', this.text.approvalExpired)
+    if (candidate.chatId !== action.chatId || candidate.openId !== action.openId) {
       this.ctx.logger.warn('[lark] rejected approval from a different chat or user')
       return actionToast('error', this.text.approvalWrongContext)
     }
+    await this.conversationBarriers.get(candidate.baseId)
+    const pending = this.pending.get(requestId)
+    if (pending !== candidate) return actionToast('info', this.text.approvalExpired)
     const messageId = action.messageId !== '' ? action.messageId : undefined
     await pending.settle(outcome, messageId)
     const content = outcome === APPROVAL_OUTCOME.allowedOnce
@@ -654,13 +952,15 @@ export class LarkBridge {
   private async handleStopAction(action: LarkCardAction): Promise<LarkCardActionResult> {
     const requestId = String(action.value.request_id ?? '')
     if (requestId === '') return actionToast('error', this.text.stopUnavailable)
-    await this.resetBarrier
-    const pending = this.pendingStops.get(requestId)
-    if (pending === undefined) return actionToast('info', this.text.stopExpired)
-    if (pending.chatId !== action.chatId || pending.openId !== action.openId) {
+    const candidate = this.pendingStops.get(requestId)
+    if (candidate === undefined) return actionToast('info', this.text.stopExpired)
+    if (candidate.chatId !== action.chatId || candidate.openId !== action.openId) {
       this.ctx.logger.warn('[lark] rejected stop from a different chat or user')
       return actionToast('error', this.text.stopWrongContext)
     }
+    await this.conversationBarriers.get(candidate.baseId)
+    const pending = this.pendingStops.get(requestId)
+    if (pending !== candidate) return actionToast('info', this.text.stopExpired)
     if (pending.stopping) return actionToast('info', this.text.stopRequested)
     const handle = this.handles.get(pending.sessionId)
     if (handle === undefined) {
@@ -768,6 +1068,7 @@ export class LarkBridge {
       const pending: PendingApproval = {
         settle,
         sessionId,
+        baseId: route.sessionBaseId,
         chatId: route.chatId,
         openId: route.openId,
       }
@@ -824,21 +1125,415 @@ export class LarkBridge {
     switch (command) {
       case '/start':
       case '/help':
-        await this.resetBarrier
-        await this.withConversation(route.sessionBaseId, async (conversation) => {
-          await this.safeSend(
-            route.chatId,
-            this.commandHelp(conversation.handle.agent),
-            routeDeliveryOptions(route),
-          )
-        })
+        await this.enqueueConversationOperation(route.sessionBaseId, () => (
+          this.withConversation(route.sessionBaseId, async (conversation) => {
+            await this.safeSend(
+              route.chatId,
+              this.commandHelp(conversation.handle.agent),
+              routeDeliveryOptions(route),
+            )
+          })
+        ))
         break
       case '/new':
       case '/clear':
         await this.scheduleReset(route)
         break
+      case '/project': {
+        const target = text.slice(command.length).trim()
+        if (target === '') await this.showProjects(route)
+        else await this.scheduleProjectSwitch(route, target)
+        break
+      }
       default:
         await this.executeRuntimeCommand(route, text, command)
+    }
+  }
+
+  private showProjects(route: MessageRoute): Promise<void> {
+    return this.enqueueConversationOperation(
+      route.sessionBaseId,
+      () => this.showProjectsNow(route),
+    )
+  }
+
+  private async showProjectsNow(route: MessageRoute): Promise<void> {
+    try {
+      const registry = workspaceRegistryOf(this.ctx)
+      if (registry === undefined) {
+        await this.safeSend(route.chatId, this.text.projectUnavailable, routeDeliveryOptions(route))
+        return
+      }
+      const workspaces = listedWorkspaces(registry)
+      await this.withConversation(route.sessionBaseId, async (conversation) => {
+        const current = await this.currentWorkspace(conversation, registry, workspaces)
+        await this.safeSend(
+          route.chatId,
+          this.text.projectList(current?.id, workspaces),
+          routeDeliveryOptions(route),
+        )
+      })
+    } catch (error) {
+      this.ctx.logger.warn('[lark] project listing failed: %s', messageOf(error))
+      await this.safeSend(route.chatId, this.text.projectUnavailable, routeDeliveryOptions(route))
+    }
+  }
+
+  private async currentWorkspace(
+    conversation: ConversationSession,
+    registry: WorkspaceRegistryLike,
+    workspaces: readonly RegisteredWorkspace[],
+  ): Promise<RegisteredWorkspace | undefined> {
+    const activeSessionId = conversation.sessionId
+    const activeHandle = conversation.handle
+    const cwd = activeHandle.agent.session.header.cwd
+    const cached = conversation.workspaceId === undefined
+      ? undefined
+      : workspaces.find((workspace) => workspace.id === conversation.workspaceId)
+    if (cached !== undefined && (
+      cached.path === cwd
+      || cached.sessionIds?.some((sessionId) => String(sessionId) === activeSessionId) === true
+    )) return cached
+    conversation.workspaceId = undefined
+
+    const sessionMatches = workspaces.filter((workspace) => (
+      workspace.sessionIds?.some((sessionId) => String(sessionId) === activeSessionId) === true
+    ))
+    if (sessionMatches.length === 1) {
+      conversation.workspaceId = sessionMatches[0]?.id
+      return sessionMatches[0]
+    }
+
+    if (cwd === undefined) return undefined
+    const pathMatches = workspaces.filter((workspace) => workspace.path === cwd)
+    if (pathMatches.length === 1) {
+      conversation.workspaceId = pathMatches[0]?.id
+      return pathMatches[0]
+    }
+    if (registry.resolveByPath === undefined) return undefined
+    try {
+      const resolved = await registry.resolveByPath(cwd)
+      if (resolved === undefined) return undefined
+      const workspace = registeredWorkspace(resolved)
+      const listed = workspaces.find((candidate) => (
+        candidate.id === workspace.id && candidate.path === workspace.path
+      ))
+      if (conversation.sessionId !== activeSessionId || conversation.handle !== activeHandle) return undefined
+      if (listed !== undefined) conversation.workspaceId = listed.id
+      return listed
+    } catch (error) {
+      this.ctx.logger.warn('[lark] current project resolution failed: %s', messageOf(error))
+      return undefined
+    }
+  }
+
+  private scheduleProjectSwitch(route: MessageRoute, target: string): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, async () => {
+      if (route.mutationHash !== undefined
+        && this.conversationBindings?.read(route.sessionBaseId)?.mutationHashes.includes(
+          route.mutationHash,
+        )) {
+        await this.withConversation(route.sessionBaseId, async () => {
+          await this.safeSend(
+            route.chatId,
+            this.text.projectMutationReplayed,
+            routeDeliveryOptions(route),
+          )
+        })
+        return
+      }
+      const selection = await this.resolveProjectSelection(route, target)
+      if (selection === undefined) return
+      await this.withConversation(route.sessionBaseId, async (conversation) => {
+        await this.sessionOperations.get(conversation.baseId)
+        await this.switchProject(route, conversation, selection)
+      })
+    })
+  }
+
+  private async resolveProjectSelection(
+    route: MessageRoute,
+    target: string,
+  ): Promise<ProjectSelection | undefined> {
+    const deliveryOptions = routeDeliveryOptions(route)
+    let registry: WorkspaceRegistryLike | undefined
+    let workspaces: RegisteredWorkspace[]
+    try {
+      registry = workspaceRegistryOf(this.ctx)
+      if (registry === undefined) {
+        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
+        return
+      }
+      if (sessionPersistenceOf(this.ctx) === undefined || this.conversationBindings === undefined) {
+        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
+        return
+      }
+      workspaces = listedWorkspaces(registry)
+    } catch (error) {
+      this.ctx.logger.warn('[lark] project registry lookup failed: %s', messageOf(error))
+      await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
+      return
+    }
+
+    const idMatch = workspaces.find((workspace) => workspace.id === target)
+    const titleMatches = idMatch === undefined
+      ? workspaces.filter((workspace) => workspace.title === target)
+      : []
+    if (idMatch === undefined && titleMatches.length === 0) {
+      await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
+      return
+    }
+    if (idMatch === undefined && titleMatches.length > 1) {
+      await this.safeSend(route.chatId, this.text.projectAmbiguous, deliveryOptions)
+      return
+    }
+    const selected = idMatch ?? titleMatches[0]
+    if (selected === undefined) {
+      await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
+      return
+    }
+
+    try {
+      if (await selected.status() !== 'ok') {
+        await this.safeSend(route.chatId, this.text.projectMissingDirectory(selected), deliveryOptions)
+        return
+      }
+      const resolved = registry.get(selected.id)
+      if (resolved === undefined) {
+        await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
+        return
+      }
+      const workspace = registeredWorkspace(resolved)
+      if (workspace.id !== selected.id || workspace.path !== selected.path) {
+        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
+        return
+      }
+      return { registry, workspaces, workspace }
+    } catch (error) {
+      this.ctx.logger.warn('[lark] project validation failed: %s', messageOf(error))
+      await this.safeSend(route.chatId, this.text.projectSwitchFailed, deliveryOptions)
+      return
+    }
+  }
+
+  private async switchProject(
+    route: MessageRoute,
+    conversation: ConversationSession,
+    selection: ProjectSelection,
+  ): Promise<void> {
+    const deliveryOptions = routeDeliveryOptions(route)
+    const { registry, workspaces, workspace: selected } = selection
+
+    const current = await this.currentWorkspace(conversation, registry, workspaces)
+    if (current?.id === selected.id) {
+      const mutation = await this.recordCurrentProjectMutation(route, conversation)
+      if (mutation === 'busy') {
+        await this.safeSend(route.chatId, this.text.projectBusy, deliveryOptions)
+        return
+      }
+      if (mutation === 'failed') {
+        await this.safeSend(route.chatId, this.text.projectHistoryCheckpointFailed, deliveryOptions)
+        return
+      }
+      await this.safeSend(route.chatId, this.text.projectAlreadyCurrent(selected), deliveryOptions)
+      return
+    }
+    const previousSessionId = conversation.sessionId
+    const previousHandle = conversation.handle
+    const baseId = conversation.baseId
+    let maintenance: Promise<ProjectSwitchMaintenanceResult>
+    try {
+      maintenance = previousHandle.agent.runMaintenance(async (signal) => {
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'busy' }
+        try {
+          if (sessionPersistenceOf(this.ctx) === undefined || this.conversationBindings === undefined) {
+            return { kind: 'unavailable' }
+          }
+          const durable = await this.ctx.sessions.flush(previousHandle.agent.session)
+          if (durable !== true) throw new Error('no durability listener participated')
+          await this.putConversationBinding(
+            baseId,
+            this.currentConversationBinding(baseId, previousSessionId),
+          )
+        } catch (error) {
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          this.ctx.logger.error('[lark] previous project session checkpoint failed: %s', messageOf(error))
+          return { kind: 'history-failed' }
+        }
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'busy' }
+
+        let workspace: RegisteredWorkspace
+        try {
+          if (sessionPersistenceOf(this.ctx) === undefined) return { kind: 'unavailable' }
+          const resolved = registry.get(selected.id)
+          if (resolved === undefined) return { kind: 'unknown' }
+          workspace = registeredWorkspace(resolved)
+          if (workspace.id !== selected.id || workspace.path !== selected.path) {
+            return { kind: 'unavailable' }
+          }
+          if (await workspace.status() !== 'ok') return { kind: 'missing' }
+        } catch (error) {
+          this.ctx.logger.warn('[lark] project revalidation failed: %s', messageOf(error))
+          return { kind: 'failed' }
+        }
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'busy' }
+
+        let sessionId: ReturnType<typeof SessionId>
+        let handle: AgentHandle
+        try {
+          const { agentPreset } = activeSessionComposition(previousHandle.agent.session)
+          const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
+          this.lastSessionGenerations.set(baseId, generation)
+          sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
+          handle = await this.ensureHandle(sessionId, false, false, agentPreset, selected.path)
+        } catch (error) {
+          this.ctx.logger.error('[lark] project session creation failed: %s', messageOf(error))
+          return { kind: 'failed' }
+        }
+
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) {
+          await this.abandonFreshHandle(String(sessionId), handle)
+          return { kind: 'busy' }
+        }
+        try {
+          this.materializeFreshHandle(handle)
+          const durable = await this.ctx.sessions.flush(handle.agent.session)
+          if (durable !== true) throw new Error('no durability listener participated')
+        } catch (error) {
+          this.ctx.logger.error('[lark] project session checkpoint failed: %s', messageOf(error))
+          await this.abandonFreshHandle(String(sessionId), handle)
+          return { kind: 'failed' }
+        }
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) {
+          await this.abandonFreshHandle(String(sessionId), handle)
+          return { kind: 'busy' }
+        }
+        try {
+          await this.putConversationBinding(
+            baseId,
+            this.mutatedConversationBinding(baseId, String(sessionId), route.mutationHash),
+          )
+        } catch (error) {
+          this.ctx.logger.error('[lark] project binding commit failed: %s', messageOf(error))
+          await this.abandonFreshHandle(String(sessionId), handle)
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          return { kind: 'failed' }
+        }
+
+        conversation.handle = handle
+        conversation.sessionId = String(sessionId)
+        conversation.workspaceId = workspace.id
+        this.deferWorkspaceAttachment(String(sessionId), workspace.id, workspace.path)
+        this.clearSessionState(previousSessionId)
+        return {
+          kind: 'committed',
+          workspace,
+          previousSessionId,
+          previousHandle,
+        }
+      })
+    } catch {
+      await this.safeSend(route.chatId, this.text.projectBusy, deliveryOptions)
+      return
+    }
+
+    let result: ProjectSwitchMaintenanceResult
+    try {
+      result = await maintenance
+    } catch (error) {
+      if (error instanceof BindingConfirmationInterruptedError) throw error
+      this.ctx.logger.error('[lark] project switch maintenance failed: %s', messageOf(error))
+      await this.safeSend(route.chatId, this.text.projectSwitchFailed, deliveryOptions)
+      return
+    }
+    switch (result.kind) {
+      case 'committed':
+        this.retireHandleAfterIdle(result.previousSessionId, result.previousHandle, 'project')
+        await this.safeSend(route.chatId, this.text.projectSwitched(result.workspace), deliveryOptions)
+        return
+      case 'busy':
+        await this.safeSend(route.chatId, this.text.projectBusy, deliveryOptions)
+        return
+      case 'history-failed':
+        await this.safeSend(route.chatId, this.text.projectHistoryCheckpointFailed, deliveryOptions)
+        return
+      case 'unavailable':
+        await this.safeSend(route.chatId, this.text.projectUnavailable, deliveryOptions)
+        return
+      case 'unknown':
+        await this.safeSend(route.chatId, this.text.projectUnknown, deliveryOptions)
+        return
+      case 'missing':
+        await this.safeSend(route.chatId, this.text.projectMissingDirectory(selected), deliveryOptions)
+        return
+      case 'failed':
+        await this.safeSend(route.chatId, this.text.projectSwitchFailed, deliveryOptions)
+    }
+  }
+
+  private async recordCurrentProjectMutation(
+    route: MessageRoute,
+    conversation: ConversationSession,
+  ): Promise<CurrentProjectMutationResult> {
+    if (route.mutationHash === undefined) return 'recorded'
+    const store = this.conversationBindings
+    if (store === undefined) return 'failed'
+    try {
+      const committed = store.read(conversation.baseId)
+      if (committed !== undefined) {
+        if (String(boundSessionId(conversation.baseId, committed)) !== conversation.sessionId) {
+          this.ctx.logger.error('[lark] current project binding does not match the live conversation')
+          return 'failed'
+        }
+        await this.putConversationBinding(
+          conversation.baseId,
+          this.mutatedConversationBinding(
+            conversation.baseId,
+            conversation.sessionId,
+            route.mutationHash,
+          ),
+        )
+        return 'recorded'
+      }
+    } catch (error) {
+      if (error instanceof BindingConfirmationInterruptedError) throw error
+      this.ctx.logger.error('[lark] current project mutation lookup failed: %s', messageOf(error))
+      return 'failed'
+    }
+
+    let maintenance: Promise<CurrentProjectMutationResult>
+    try {
+      maintenance = conversation.handle.agent.runMaintenance(async (signal) => {
+        if (signal.aborted || conversation.handle.agent.inbox.hasPending) return 'busy'
+        try {
+          if (sessionPersistenceOf(this.ctx) === undefined) return 'failed'
+          const durable = await this.ctx.sessions.flush(conversation.handle.agent.session)
+          if (durable !== true) return 'failed'
+          if (signal.aborted || conversation.handle.agent.inbox.hasPending) return 'busy'
+          await this.putConversationBinding(
+            conversation.baseId,
+            this.mutatedConversationBinding(
+              conversation.baseId,
+              conversation.sessionId,
+              route.mutationHash,
+            ),
+          )
+          return 'recorded'
+        } catch (error) {
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          this.ctx.logger.error('[lark] current project mutation checkpoint failed: %s', messageOf(error))
+          return 'failed'
+        }
+      })
+    } catch {
+      return 'busy'
+    }
+    try {
+      return await maintenance
+    } catch (error) {
+      if (error instanceof BindingConfirmationInterruptedError) throw error
+      this.ctx.logger.error('[lark] current project mutation maintenance failed: %s', messageOf(error))
+      return 'failed'
     }
   }
 
@@ -866,9 +1561,8 @@ export class LarkBridge {
   }
 
   private executeRuntimeCommand(route: MessageRoute, text: string, command: string): Promise<void> {
-    let operation: Promise<void> = Promise.resolve()
-    const admission = this.resetBarrier.then(() => {
-      operation = this.enqueueSessionOperation(
+    return this.enqueueConversationOperation(route.sessionBaseId, async () => {
+      await this.enqueueSessionOperation(
         route.sessionBaseId,
         () => this.withConversation(
           route.sessionBaseId,
@@ -876,8 +1570,6 @@ export class LarkBridge {
         ),
       )
     })
-    this.resetBarrier = admission.catch(() => {})
-    return admission.then(() => operation)
   }
 
   private async executeRuntimeCommandNow(
@@ -928,53 +1620,263 @@ export class LarkBridge {
     return operation
   }
 
+  private enqueueConversationBarrier<T>(baseId: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.conversationBarriers.get(baseId)
+    let operation: Promise<T>
+    if (previous === undefined) {
+      try {
+        operation = task()
+      } catch (error) {
+        operation = Promise.reject(error)
+      }
+    } else {
+      operation = previous.then(task)
+    }
+    const tail = operation.then(() => {}, () => {})
+    this.conversationBarriers.set(baseId, tail)
+    void tail.then(() => {
+      if (this.conversationBarriers.get(baseId) === tail) this.conversationBarriers.delete(baseId)
+    })
+    return operation
+  }
+
+  private enqueueConversationOperation<T>(baseId: string, task: () => Promise<T>): Promise<T> {
+    return this.enqueueConversationBarrier(baseId, task)
+  }
+
   private scheduleReset(route: MessageRoute): Promise<void> {
-    const reset = this.resetBarrier.then(async () => {
-      await this.withConversation(route.sessionBaseId, async (conversation) => {
+    return this.enqueueConversationBarrier(route.sessionBaseId, () => (
+      this.withConversation(route.sessionBaseId, async (conversation) => {
         await this.sessionOperations.get(conversation.baseId)
         await this.resetConversation(route, conversation)
       })
-    })
-    this.resetBarrier = reset.catch(() => {})
-    return reset
+    ))
   }
 
   private async resetConversation(
     route: MessageRoute,
     conversation: ConversationSession,
   ): Promise<void> {
-    const chatId = route.chatId
+    if (this.conversationBindings === undefined) {
+      await this.safeSend(route.chatId, this.text.freshSessionFailed, routeDeliveryOptions(route))
+      return
+    }
+    if (route.mutationHash !== undefined
+      && this.conversationBindings.read(conversation.baseId)?.mutationHashes.includes(route.mutationHash)) {
+      await this.safeSend(route.chatId, this.text.freshSession, routeDeliveryOptions(route))
+      return
+    }
+    await this.resetConversationDurably(route, conversation)
+  }
+
+  private async resetConversationDurably(
+    route: MessageRoute,
+    conversation: ConversationSession,
+  ): Promise<void> {
+    await this.restoreConversationWorkspace(conversation)
     const previousSessionId = conversation.sessionId
     const previousHandle = conversation.handle
     const baseId = conversation.baseId
-    const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
-    this.lastSessionGenerations.set(baseId, generation)
-    const sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
-    const handle = await this.ensureHandle(sessionId, false, true)
+    let maintenance: Promise<ResetMaintenanceResult>
     try {
-      await this.ctx.sessions.flush(handle.agent.session)
-    } catch (flushError) {
-      try {
-        await handle.dispose()
-        this.handles.delete(String(sessionId))
-      } catch (disposeError) {
-        throw new AggregateError(
-          [flushError, disposeError],
-          'lark: fresh session durability and cleanup failed',
-        )
-      }
-      throw flushError
-    }
-    conversation.handle = handle
-    conversation.sessionId = String(sessionId)
-    this.clearSessionState(previousSessionId)
-    try {
-      await previousHandle.dispose()
-      this.handles.delete(previousSessionId)
+      maintenance = previousHandle.agent.runMaintenance(async (signal) => {
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'failed' }
+        try {
+          if (sessionPersistenceOf(this.ctx) === undefined) throw new Error('session persistence unavailable')
+          const durable = await this.ctx.sessions.flush(previousHandle.agent.session)
+          if (durable !== true) throw new Error('no durability listener participated')
+          await this.putConversationBinding(
+            baseId,
+            this.currentConversationBinding(baseId, previousSessionId),
+          )
+        } catch (error) {
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          this.ctx.logger.error('[lark] previous reset session checkpoint failed: %s', messageOf(error))
+          return { kind: 'failed' }
+        }
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'failed' }
+
+        let sessionId: ReturnType<typeof SessionId>
+        let handle: AgentHandle
+        try {
+          const composition = activeSessionComposition(previousHandle.agent.session)
+          const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
+          this.lastSessionGenerations.set(baseId, generation)
+          sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
+          handle = await this.ensureHandle(
+            sessionId,
+            false,
+            false,
+            composition.agentPreset,
+            composition.cwd ?? this.cwd,
+          )
+        } catch (error) {
+          this.ctx.logger.error('[lark] fresh session creation failed: %s', messageOf(error))
+          return { kind: 'failed' }
+        }
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) {
+          await this.abandonFreshHandle(String(sessionId), handle)
+          return { kind: 'failed' }
+        }
+        try {
+          this.materializeFreshHandle(handle)
+          const durable = await this.ctx.sessions.flush(handle.agent.session)
+          if (durable !== true) throw new Error('no durability listener participated')
+        } catch (error) {
+          this.ctx.logger.error('[lark] fresh session checkpoint failed: %s', messageOf(error))
+          await this.abandonFreshHandle(String(sessionId), handle)
+          return { kind: 'failed' }
+        }
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) {
+          await this.abandonFreshHandle(String(sessionId), handle)
+          return { kind: 'failed' }
+        }
+        try {
+          await this.putConversationBinding(
+            baseId,
+            this.mutatedConversationBinding(baseId, String(sessionId), route.mutationHash),
+          )
+        } catch (error) {
+          this.ctx.logger.error('[lark] fresh session binding commit failed: %s', messageOf(error))
+          await this.abandonFreshHandle(String(sessionId), handle)
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          return { kind: 'failed' }
+        }
+
+        conversation.handle = handle
+        conversation.sessionId = String(sessionId)
+        this.clearSessionState(previousSessionId)
+        return {
+          kind: 'committed',
+          previousSessionId,
+          previousHandle,
+        }
+      })
     } catch (error) {
-      this.ctx.logger.error('[lark] previous session disposal failed: %s', messageOf(error))
+      this.ctx.logger.warn('[lark] reset could not claim the active session: %s', messageOf(error))
+      await this.safeSend(route.chatId, this.text.freshSessionFailed, routeDeliveryOptions(route))
+      return
     }
-    await this.safeSend(chatId, this.text.freshSession, routeDeliveryOptions(route))
+
+    let result: ResetMaintenanceResult
+    try {
+      result = await maintenance
+    } catch (error) {
+      if (error instanceof BindingConfirmationInterruptedError) throw error
+      this.ctx.logger.error('[lark] reset maintenance failed: %s', messageOf(error))
+      await this.safeSend(route.chatId, this.text.freshSessionFailed, routeDeliveryOptions(route))
+      return
+    }
+    if (result.kind !== 'committed') {
+      await this.safeSend(route.chatId, this.text.freshSessionFailed, routeDeliveryOptions(route))
+      return
+    }
+    this.retireHandleAfterIdle(result.previousSessionId, result.previousHandle, 'reset')
+    await this.safeSend(route.chatId, this.text.freshSession, routeDeliveryOptions(route))
+  }
+
+  private async restoreConversationWorkspace(conversation: ConversationSession): Promise<void> {
+    if (conversation.workspaceId !== undefined) return
+    try {
+      const registry = workspaceRegistryOf(this.ctx)
+      if (registry === undefined) return
+      await this.currentWorkspace(conversation, registry, listedWorkspaces(registry))
+    } catch (error) {
+      this.ctx.logger.warn('[lark] fresh session project resolution failed: %s', messageOf(error))
+    }
+  }
+
+  private deferWorkspaceAttachment(
+    sessionId: string,
+    workspaceId: string | undefined,
+    workspacePath: string,
+  ): void {
+    if (workspaceId === undefined) return
+    const pending = this.pendingWorkspaceAttachments.get(sessionId)
+    if (pending?.workspaceId === workspaceId && pending.workspacePath === workspacePath) return
+    this.pendingWorkspaceAttachments.set(sessionId, { workspaceId, workspacePath })
+  }
+
+  private prepareWorkspaceAttachment(conversation: ConversationSession): void {
+    try {
+      const registry = workspaceRegistryOf(this.ctx)
+      if (registry === undefined) return
+      const workspaces = listedWorkspaces(registry)
+      const sessionId = conversation.sessionId
+      const cwd = conversation.handle.agent.session.header.cwd
+      const cached = conversation.workspaceId === undefined
+        ? undefined
+        : workspaces.find((workspace) => workspace.id === conversation.workspaceId)
+      const sessionMatches = cached === undefined
+        ? workspaces.filter((workspace) => (
+            workspace.sessionIds?.some((id) => String(id) === sessionId) === true
+          ))
+        : []
+      const pathMatches = cached === undefined && sessionMatches.length !== 1 && cwd !== undefined
+        ? workspaces.filter((workspace) => workspace.path === cwd)
+        : []
+      const workspace = cached
+        ?? (sessionMatches.length === 1 ? sessionMatches[0] : undefined)
+        ?? (pathMatches.length === 1 ? pathMatches[0] : undefined)
+      if (workspace === undefined) return
+      conversation.workspaceId = workspace.id
+      this.deferWorkspaceAttachment(conversation.sessionId, workspace.id, workspace.path)
+    } catch (error) {
+      this.ctx.logger.warn('[lark] workspace attachment preparation failed: %s', messageOf(error))
+    }
+  }
+
+  private scheduleWorkspaceAttachment(session: Session): void {
+    if (this.stopping) return
+    const sessionId = String(session.id)
+    const pending = this.pendingWorkspaceAttachments.get(sessionId)
+    if (pending === undefined) return
+    if (this.workspaceAttachmentTasks.has(sessionId)) {
+      this.workspaceAttachmentRetries.add(sessionId)
+      return
+    }
+    let task: Promise<void>
+    task = Promise.resolve().then(() => this.attachWorkspaceSession(session, pending)).finally(() => {
+      if (this.workspaceAttachmentTasks.get(sessionId) === task) {
+        this.workspaceAttachmentTasks.delete(sessionId)
+      }
+      const retry = this.workspaceAttachmentRetries.delete(sessionId)
+      if (retry && this.pendingWorkspaceAttachments.has(sessionId)) {
+        this.scheduleWorkspaceAttachment(session)
+      }
+      this.requestConversationEviction()
+    })
+    this.workspaceAttachmentTasks.set(sessionId, task)
+  }
+
+  private async attachWorkspaceSession(
+    session: Session,
+    pending: PendingWorkspaceAttachment,
+  ): Promise<void> {
+    const sessionId = String(session.id)
+    try {
+      const durable = await this.ctx.sessions.flush(session)
+      if (durable !== true) {
+        throw new Error('no durability listener participated')
+      }
+      if (this.stopping || this.pendingWorkspaceAttachments.get(sessionId) !== pending) return
+      const registry = workspaceRegistryOf(this.ctx)
+      const resolved = registry?.get(pending.workspaceId)
+      if (resolved === undefined) return
+      const workspace = registeredWorkspace(resolved)
+      if (workspace.id !== pending.workspaceId || workspace.path !== pending.workspacePath) return
+      if (await workspace.status() !== 'ok') return
+      if (this.stopping || this.pendingWorkspaceAttachments.get(sessionId) !== pending) return
+      await workspace.attachSession(session.id)
+      if (this.pendingWorkspaceAttachments.get(sessionId) === pending) {
+        this.pendingWorkspaceAttachments.delete(sessionId)
+      }
+    } catch (error) {
+      this.ctx.logger.warn(
+        '[lark] durable workspace session attachment failed; leaving it unindexed: %s',
+        messageOf(error),
+      )
+    }
   }
 
   private async withConversation<T>(
@@ -1101,6 +2003,7 @@ export class LarkBridge {
       && this.conversationLru.get(baseId) === conversation
       && conversation.lastAccess === lastAccess
       && (this.conversationLeases.get(baseId) ?? 0) === 0
+      && !this.workspaceAttachmentTasks.has(conversation.sessionId)
       && this.handles.has(conversation.sessionId)
   }
 
@@ -1262,7 +2165,25 @@ export class LarkBridge {
   }
 
   private async resolveSessionBinding(baseId: string): Promise<SessionBinding> {
-    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    const persistence = sessionPersistenceOf(this.ctx)
+    const committed = this.conversationBindings?.read(baseId)
+    if (committed !== undefined) {
+      if (persistence === undefined) {
+        throw new Error('lark: committed conversation binding requires session persistence')
+      }
+      const sessionId = boundSessionId(baseId, committed)
+      const matches = (await persistence.list()).filter((header) => String(header.id) === String(sessionId))
+      if (matches.length !== 1) {
+        throw new Error(`lark: committed session "${String(sessionId)}" is not uniquely persisted`)
+      }
+      const agentPreset = optionalAgentPreset(matches[0]?.agentPreset)
+      return {
+        sessionId,
+        persisted: true,
+        generation: committed.generation,
+        ...(agentPreset === undefined ? {} : { agentPreset }),
+      }
+    }
     if (persistence === undefined) {
       return { sessionId: SessionId(baseId), persisted: false, generation: 0 }
     }
@@ -1273,16 +2194,90 @@ export class LarkBridge {
       ?? { sessionId: SessionId(baseId), persisted: false, generation: 0 }
   }
 
+  private async putConversationBinding(
+    baseId: string,
+    binding: ConversationBinding,
+  ): Promise<void> {
+    const store = this.conversationBindings
+    if (store === undefined) throw new Error('lark: conversation binding store is unavailable')
+    const stopSignal = this.commandAbort.signal
+    let attempt = 0
+    while (true) {
+      this.throwIfBindingConfirmationInterrupted(stopSignal.reason)
+      attempt += 1
+      try {
+        await store.put(baseId, binding)
+        const confirmed = store.read(baseId)
+        if (!sameConversationBinding(confirmed, binding)) {
+          throw new Error('conversation binding read-after-write confirmation failed')
+        }
+        return
+      } catch (writeError) {
+        const readBack = bindingReadBackAfterError(store, baseId, binding, writeError)
+        if (readBack.confirmed) return
+        const error = readBack.error
+        this.throwIfBindingConfirmationInterrupted(error)
+        if (attempt <= 3 || (attempt & (attempt - 1)) === 0) {
+          this.ctx.logger.warn(
+            '[lark] conversation binding write is unconfirmed; fail-stopping this conversation and retrying the same atomic value (attempt %s): %s',
+            attempt,
+            messageOf(error),
+          )
+        }
+        await this.waitForBindingRetry(attempt, stopSignal)
+      }
+    }
+  }
+
+  private throwIfBindingConfirmationInterrupted(cause?: unknown): void {
+    if (!this.stopping && !this.commandAbort.signal.aborted) return
+    this.bindingRecoveryRequired = true
+    throw new BindingConfirmationInterruptedError(cause)
+  }
+
+  private async waitForBindingRetry(attempt: number, signal: AbortSignal): Promise<void> {
+    if (attempt <= 3) return
+    const retryDelay = Math.min(1_000, 25 * (2 ** Math.min(attempt - 4, 6)))
+    try {
+      await delay(retryDelay, undefined, { signal })
+    } catch (error) {
+      this.throwIfBindingConfirmationInterrupted(error)
+      throw error
+    }
+  }
+
+  private currentConversationBinding(baseId: string, sessionId: string): ConversationBinding {
+    const binding = conversationBinding(baseId, sessionId)
+    const current = this.conversationBindings?.read(baseId)
+    if (current?.generation === binding.generation && current.suffix === binding.suffix) {
+      return { ...binding, mutationHashes: current.mutationHashes }
+    }
+    return binding
+  }
+
+  private mutatedConversationBinding(
+    baseId: string,
+    sessionId: string,
+    mutationHash: string | undefined,
+  ): ConversationBinding {
+    const mutationHashes = appendMutationHash(
+      this.conversationBindings?.read(baseId)?.mutationHashes ?? [],
+      mutationHash,
+    )
+    return conversationBinding(baseId, sessionId, mutationHashes)
+  }
+
   private async ensureHandle(
     sessionId: ReturnType<typeof SessionId>,
     persisted = false,
     materialize = false,
     persistedAgentPreset?: string,
+    cwd = this.cwd,
   ): Promise<AgentHandle> {
     const key = String(sessionId)
     const existing = this.handles.get(key)
     if (existing !== undefined) return existing
-    const opened = this.openHandle(sessionId, persisted, materialize, persistedAgentPreset)
+    const opened = this.openHandle(sessionId, persisted, materialize, persistedAgentPreset, cwd)
     this.handles.set(key, opened)
     try {
       const handle = await opened
@@ -1301,12 +2296,15 @@ export class LarkBridge {
     persisted: boolean,
     materialize: boolean,
     persistedAgentPreset?: string,
+    cwd = this.cwd,
   ): Promise<AgentHandle> {
     const agentOptions = { provider: this.provider, model: this.model }
     const presets = agentPresetsOf(this.ctx)
-    const requestedPreset = presets !== undefined && persisted
-      ? await this.persistedAgentPreset(sessionId, persistedAgentPreset)
-      : undefined
+    const requestedPreset = persisted
+      ? (presets === undefined
+          ? undefined
+          : await this.persistedAgentPreset(sessionId, persistedAgentPreset))
+      : optionalAgentPreset(persistedAgentPreset)
     const composition = await this.agentComposition(presets, requestedPreset)
     if (persisted) {
       return this.ctx.agents.resume({
@@ -1315,15 +2313,96 @@ export class LarkBridge {
         ...(composition.setup === undefined ? {} : { setup: composition.setup }),
       })
     }
-    return this.ctx.agents.create({
+    const handle = await this.ctx.agents.create({
       sessionId,
       meta: {
-        cwd: this.cwd,
+        cwd,
         ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
       },
       agentOptions,
       ...(composition.setup === undefined ? {} : { setup: composition.setup }),
-      ...(materialize ? { seed: [] } : {}),
+    })
+    if (!materialize) return handle
+    try {
+      this.materializeFreshHandle(handle)
+      return handle
+    } catch (error) {
+      try {
+        await handle.dispose()
+      } catch (disposeError) {
+        throw new AggregateError(
+          [error, disposeError],
+          'lark: fresh session materialization and cleanup failed',
+        )
+      }
+      throw error
+    }
+  }
+
+  private materializeFreshHandle(handle: AgentHandle): void {
+    if (handle.agent.session.events.length === 0) {
+      handle.agent.session.append('todo/write', { todos: [] })
+    }
+  }
+
+  private async abandonFreshHandle(sessionId: string, handle: AgentHandle): Promise<void> {
+    this.clearSessionState(sessionId)
+    try {
+      await handle.dispose()
+    } catch (error) {
+      this.ctx.logger.error('[lark] abandoned fresh session disposal failed: %s', messageOf(error))
+    } finally {
+      this.handles.delete(sessionId)
+    }
+  }
+
+  private async disposeReplacedHandle(
+    sessionId: string,
+    handle: AgentHandle,
+    reason: 'project' | 'reset',
+  ): Promise<void> {
+    try {
+      await handle.dispose()
+    } catch (error) {
+      this.ctx.logger.error(`[lark] previous ${reason} session disposal failed: %s`, messageOf(error))
+    } finally {
+      this.handles.delete(sessionId)
+    }
+  }
+
+  private retireHandleAfterIdle(
+    sessionId: string,
+    handle: AgentHandle,
+    reason: 'project' | 'reset',
+  ): void {
+    let retirement: Promise<void>
+    try {
+      retirement = handle.agent.whenIdle().then(async () => {
+        if (this.stopping) return
+        if (handle.agent.status !== 'idle') {
+          this.retireHandleAfterIdle(sessionId, handle, reason)
+          return
+        }
+        if (handle.agent.inbox.hasPending) {
+          this.ctx.logger.warn(
+            `[lark] previous ${reason} session still has non-waking inbox work; retaining its handle`,
+          )
+          return
+        }
+        this.handles.delete(sessionId)
+        await this.disposeReplacedHandle(sessionId, handle, reason)
+      })
+    } catch (error) {
+      this.ctx.logger.error(`[lark] previous ${reason} session retirement failed: %s`, messageOf(error))
+      return
+    }
+    this.handleRetirements.add(retirement)
+    const cleanup = (): void => {
+      this.handleRetirements.delete(retirement)
+    }
+    void retirement.then(cleanup, (error: unknown) => {
+      cleanup()
+      this.ctx.logger.error(`[lark] previous ${reason} session retirement failed: %s`, messageOf(error))
     })
   }
 
@@ -1331,7 +2410,7 @@ export class LarkBridge {
     sessionId: ReturnType<typeof SessionId>,
     headerPreset?: string,
   ): Promise<string | undefined> {
-    const persistence = this.ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+    const persistence = sessionPersistenceOf(this.ctx)
     if (persistence?.inspect === undefined) return optionalAgentPreset(headerPreset)
     const inspected = await persistence.inspect(sessionId)
     return selectedAgentPreset(inspected.meta.agentPreset ?? headerPreset, inspected.events)
@@ -1341,7 +2420,12 @@ export class LarkBridge {
     presets: AgentPresetsLike | undefined,
     requestedPreset?: string,
   ): Promise<AgentComposition> {
-    if (presets === undefined) return {}
+    if (presets === undefined) {
+      if (requestedPreset !== undefined) {
+        throw new Error(`lark: cannot preserve agent preset "${requestedPreset}" without agentPresets`)
+      }
+      return {}
+    }
     const resolved = await presets.resolve(requestedPreset)
     const agentPreset = optionalAgentPreset(resolved.id)
     if (agentPreset === undefined) throw new TypeError('lark: resolved agent preset id is invalid')
@@ -1363,9 +2447,11 @@ export class LarkBridge {
     }
     switch (event.type) {
       case 'turn/start':
-        this.bindTurn(session.id, event.data.turn, event.time)
+        this.recordTurnStart(String(session.id), event.data.turn, event.time)
+        this.scheduleWorkspaceAttachment(session)
         return
       case 'turn/end':
+        this.removeTurnStart(String(session.id), event.data.turn)
         this.finishTurn(session.id, event)
         return
       case 'assistant/chunk':
@@ -1391,35 +2477,55 @@ export class LarkBridge {
     }
   }
 
-  private enqueueRoute(sessionId: string, route: MessageRoute): void {
-    const queue = this.queuedRoutes.get(sessionId)
-    if (queue !== undefined) {
-      queue.items.push(route)
+  private enqueueMessageRoute(sessionId: string, messageId: string, route: MessageRoute): void {
+    if (this.messageRoutes.has(messageId)) {
+      throw new Error(`lark: duplicate pending message id "${messageId}"`)
+    }
+    this.messageRoutes.set(messageId, { sessionId, route })
+  }
+
+  private removeMessageRoute(messageId: string, route: MessageRoute): void {
+    if (this.messageRoutes.get(messageId)?.route === route) this.messageRoutes.delete(messageId)
+  }
+
+  private recordTurnStart(sessionId: string, turn: number, time: number): void {
+    const turns = this.turnStarts.get(sessionId) ?? new Map<number, number>()
+    turns.set(turn, eventTime(time))
+    this.turnStarts.set(sessionId, turns)
+  }
+
+  private removeTurnStart(sessionId: string, turn: number): void {
+    const starts = this.turnStarts.get(sessionId)
+    if (starts === undefined) return
+    starts.delete(turn)
+    if (starts.size === 0) this.turnStarts.delete(sessionId)
+  }
+
+  private claimMessageRoute(sessionId: string, messageId: string, turn: number): void {
+    const pending = this.messageRoutes.get(messageId)
+    if (pending === undefined) return
+    this.messageRoutes.delete(messageId)
+    if (pending.sessionId !== sessionId) {
+      this.ctx.logger.warn(
+        '[lark] claimed message route session mismatch; dropping route for message %s',
+        messageId,
+      )
       return
     }
-    this.queuedRoutes.set(sessionId, { items: [route], head: 0 })
+    const startedAt = this.turnStarts.get(sessionId)?.get(turn) ?? Date.now()
+    this.bindTurn(sessionId, turn, startedAt, pending.route)
   }
 
-  private removeQueuedRoute(sessionId: string, route: MessageRoute): void {
-    const queue = this.queuedRoutes.get(sessionId)
-    if (queue === undefined || queue.items.at(-1) !== route) return
-    queue.items.pop()
-    if (queue.head === queue.items.length) this.queuedRoutes.delete(sessionId)
+  private discardMessageRoute(sessionId: string, messageId: string): void {
+    const pending = this.messageRoutes.get(messageId)
+    if (pending?.sessionId === sessionId) this.messageRoutes.delete(messageId)
   }
 
-  private dequeueRoute(sessionId: string): MessageRoute | undefined {
-    const queue = this.queuedRoutes.get(sessionId)
-    if (queue === undefined) return undefined
-    const route = queue.items[queue.head]
-    queue.head += 1
-    if (queue.head === queue.items.length) this.queuedRoutes.delete(sessionId)
-    return route
-  }
-
-  private bindTurn(sessionId: string, turn: number, time: number): void {
-    const route = this.dequeueRoute(sessionId)
-    if (route === undefined) return
-    const startedAt = eventTime(time)
+  private bindTurn(sessionId: string, turn: number, startedAt: number, route: MessageRoute): void {
+    if (this.turns.get(sessionId)?.has(turn) === true) {
+      this.ctx.logger.warn('[lark] duplicate Lark route claimed for session %s turn %s', sessionId, turn)
+      return
+    }
     const stopRequestId = randomUUID()
     const state: TurnState = {
       route,
@@ -1439,6 +2545,7 @@ export class LarkBridge {
     this.turns.set(sessionId, turns)
     this.pendingStops.set(stopRequestId, {
       sessionId,
+      baseId: route.sessionBaseId,
       chatId: route.chatId,
       openId: route.openId,
       stopping: false,
@@ -1794,14 +2901,16 @@ export class LarkBridge {
   }
 
   private approvalRoute(sessionId: string): MessageRoute | undefined {
-    const active = this.activeRoutes.get(sessionId)
-    if (active !== undefined) return active
-    const queued = this.queuedRoutes.get(sessionId)
-    return queued?.items[queued.head]
+    return this.activeRoutes.get(sessionId)
   }
 
   private clearSessionState(sessionId: string): void {
-    this.queuedRoutes.delete(sessionId)
+    this.pendingWorkspaceAttachments.delete(sessionId)
+    this.workspaceAttachmentRetries.delete(sessionId)
+    for (const [messageId, pending] of this.messageRoutes) {
+      if (pending.sessionId === sessionId) this.messageRoutes.delete(messageId)
+    }
+    this.turnStarts.delete(sessionId)
     for (const state of this.turns.get(sessionId)?.values() ?? []) this.clearStreamTimer(state)
     this.turns.delete(sessionId)
     this.activeRoutes.delete(sessionId)
@@ -1816,7 +2925,8 @@ export class LarkBridge {
   }
 
   private clearRoutes(): void {
-    this.queuedRoutes.clear()
+    this.messageRoutes.clear()
+    this.turnStarts.clear()
     this.turns.clear()
     this.activeRoutes.clear()
     this.contextWindows.clear()

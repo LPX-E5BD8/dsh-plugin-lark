@@ -9,6 +9,7 @@ import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import * as Lark from '@larksuiteoapi/node-sdk'
 import { LarkBridge } from '../src/bridge.ts'
+import type { ConversationBinding } from '../src/conversation-binding.ts'
 import { LARK_HEALTH_PATH } from '../src/health.ts'
 import type { WebServerLike } from '../src/health.ts'
 import { apply } from '../src/index.ts'
@@ -78,7 +79,15 @@ function fakeCtx(
   onFollowup?: (message: unknown) => void,
 ) {
   let creates = 0
+  const persisted = new Set<string>()
+  const bindings = new Map<string, ConversationBinding>()
   const sessionListeners: Array<(s: { id: string }, e: unknown) => void> = []
+  const claimedListeners: Array<(payload: {
+    agent: { id: string }
+    message: unknown
+    turn: number
+  }) => void> = []
+  const pendingMessages = new Map<string, unknown[]>()
   const approvalListeners: Array<(
     req: unknown,
     next: () => Promise<string>,
@@ -90,11 +99,30 @@ function fakeCtx(
       if (name === 'approval/request') {
         approvalListeners.push(fn as (req: unknown, next: () => Promise<string>) => Promise<string>)
       }
+      if (name === 'agent/inbox/claimed') {
+        claimedListeners.push(fn as unknown as (payload: {
+          agent: { id: string }
+          message: unknown
+          turn: number
+        }) => void)
+      }
       return () => {}
     },
     get(name: string) {
       if (name === 'approval') return { present: true }
       if (name === 'commands') return commands
+      if (name === 'sessionPersistence') {
+        return { list: async () => [...persisted].map((id) => ({ id })) }
+      }
+      if (name === 'larkConversationBindings') {
+        return {
+          read: (baseId: string) => bindings.get(baseId),
+          async put(baseId: string, binding: ConversationBinding) {
+            bindings.set(baseId, { ...binding })
+          },
+          async close() {},
+        }
+      }
       return undefined
     },
     approval: { present: true },
@@ -106,20 +134,42 @@ function fakeCtx(
           sessionId: id,
           dispose: async () => {},
           agent: {
-            session: { id, requestContext: () => undefined },
+            session: { id, events: [], append() {}, requestContext: () => undefined },
+            status: 'idle',
+            inbox: { hasPending: false },
             followup(msg: unknown) {
+              persisted.add(id)
+              const pending = pendingMessages.get(id) ?? []
+              pending.push(msg)
+              pendingMessages.set(id, pending)
               if (onFollowup === undefined) followups.push(msg)
               else onFollowup(msg)
             },
+            runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+              return task(new AbortController().signal)
+            },
+            whenIdle() { return Promise.resolve() },
           },
         }
       },
     },
     sessions: {
-      async flush() { return true },
+      async flush(session: { id: string }) {
+        persisted.add(session.id)
+        return true
+      },
     },
     emit(sessionId: string, event: unknown) {
       for (const fn of sessionListeners) fn({ id: sessionId }, event)
+      const turn = (event as { type?: unknown; data?: { turn?: unknown } }).type === 'turn/start'
+        ? (event as { data?: { turn?: unknown } }).data?.turn
+        : undefined
+      if (typeof turn !== 'number') return
+      const message = pendingMessages.get(sessionId)?.shift()
+      if (message === undefined) return
+      for (const listener of claimedListeners) {
+        listener({ agent: { id: sessionId }, message, turn })
+      }
     },
     async requestApproval(req: unknown) {
       const next = async () => 'unavailable'
@@ -723,6 +773,7 @@ test('Cordis plugin loading rejects a failed WebSocket connection', async (t) =>
     assert.equal(activeRoute, undefined)
     assert.equal(healthDisposals, 1)
     assert.equal(ctx.storageDomain.get('lark_inbound'), undefined)
+    assert.equal(ctx.storageDomain.get('lark_conversations'), undefined)
   } finally {
     failWs.resolve()
     await fiber.dispose()
@@ -736,7 +787,7 @@ test('Cordis plugin loading rejects a failed WebSocket connection', async (t) =>
   }
 })
 
-test('plugin construction failure releases its inbound domain', async (t) => {
+test('plugin construction failure releases its durable Lark domains', async (t) => {
   const previousAppId = process.env.DSH_LARK_APP_ID
   const previousAppSecret = process.env.DSH_LARK_APP_SECRET
   process.env.DSH_LARK_APP_ID = ['cli', '1'.repeat(16)].join('_')
@@ -751,6 +802,7 @@ test('plugin construction failure releases its inbound domain', async (t) => {
 
     await assert.rejects(apply(ctx, { streamUpdateIntervalMs: 99 }), /streamUpdateIntervalMs/)
     assert.equal(ctx.storageDomain.get('lark_inbound'), undefined)
+    assert.equal(ctx.storageDomain.get('lark_conversations'), undefined)
   } finally {
     await ctx.fiber.dispose()
     if (previousAppId === undefined) delete process.env.DSH_LARK_APP_ID
@@ -1046,19 +1098,23 @@ test('approval card approve', async () => {
   const bridge = new LarkBridge(ctx as never, { client, allowAllUsers: true })
   bridge.start()
   await bridge.handleInbound(inbound({ chatId: 'oc_1', text: 'do a thing' }))
+  ctx.emit('lark:oc_1', { type: 'turn/start', data: { turn: 1 } })
   const outcomeP = ctx.requestApproval({
     agent: { session: { id: 'lark:oc_1' } },
     toolName: 'bash',
     reason: 'run a command',
   })
   await Promise.resolve()
-  assert.equal(client.cards.length, 1)
-  const requestId = requestIdOf(client.cards[0]?.card)
+  const approvalCards = client.cards.filter(({ card }) => requestIdOf(card) !== '')
+  assert.equal(approvalCards.length, 1)
+  const approvalCard = approvalCards[0]
+  assert.ok(approvalCard !== undefined)
+  const requestId = requestIdOf(approvalCard.card)
   assert.ok(requestId !== '')
   await bridge.handleCardAction({
     openId: 'ou_ok',
     chatId: 'oc_1',
-    messageId: client.cards[0]?.messageId ?? '',
+    messageId: approvalCard.messageId,
     value: { decision: 'allowed-once', request_id: requestId },
   })
   assert.equal(await outcomeP, 'allowed-once')
@@ -1073,17 +1129,20 @@ test('approval card deny', async () => {
   const bridge = new LarkBridge(ctx as never, { client, allowFrom: ['ou_ok'] })
   bridge.start()
   await bridge.handleInbound(inbound({ chatId: 'oc_1', text: 'do a thing' }))
+  ctx.emit('lark:oc_1', { type: 'turn/start', data: { turn: 1 } })
   const outcomeP = ctx.requestApproval({
     agent: { session: { id: 'lark:oc_1' } },
     toolName: 'bash',
     reason: 'run a command',
   })
   await Promise.resolve()
-  const requestId = requestIdOf(client.cards[0]?.card)
+  const approvalCard = client.cards.find(({ card }) => requestIdOf(card) !== '')
+  assert.ok(approvalCard !== undefined)
+  const requestId = requestIdOf(approvalCard.card)
   await bridge.handleCardAction({
     openId: 'ou_ok',
     chatId: 'oc_1',
-    messageId: client.cards[0]?.messageId ?? '',
+    messageId: approvalCard.messageId,
     value: { decision: 'rejected', request_id: requestId },
   })
   assert.equal(await outcomeP, 'rejected')
@@ -1180,6 +1239,41 @@ test('runtime slash commands block only their own concurrent session reset', asy
   release.resolve()
   await Promise.all([command, reset])
   assert.equal(ctx.createCount(), 3)
+  await bridge.stop()
+})
+
+test('/new fails closed when a direct bridge embedding omits conversation bindings', async () => {
+  const followups: unknown[] = []
+  const ctx = fakeCtx(followups)
+  const get = ctx.get.bind(ctx)
+  ctx.get = (name: string) => (
+    name === 'larkConversationBindings' ? undefined : get(name)
+  )
+  const client = fakeClient()
+  const bridge = new LarkBridge(ctx as never, { client, allowAllUsers: true })
+  await bridge.start()
+
+  await bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/new', messageId: 'new-without-sidecar' }))
+  assert.equal(ctx.createCount(), 1)
+  assert.equal(followups.length, 0)
+  assert.match(client.sent.at(-1) ?? '', /当前会话保持不变/)
+  await bridge.stop()
+})
+
+test('/new fails closed when conversation bindings exist without session persistence', async () => {
+  const client = fakeClient()
+  const followups: unknown[] = []
+  const ctx = fakeCtx(followups)
+  const get = ctx.get.bind(ctx)
+  ctx.get = (name: string) => name === 'sessionPersistence' ? undefined : get(name)
+  const bridge = new LarkBridge(ctx as never, { client, allowAllUsers: true })
+  await bridge.start()
+
+  await bridge.handleInbound(inbound({ chatId: 'oc_1', text: '/new' }))
+
+  assert.equal(ctx.createCount(), 1)
+  assert.equal(followups.length, 0)
+  assert.match(client.sent.at(-1) ?? '', /新会话|fresh session/i)
   await bridge.stop()
 })
 
