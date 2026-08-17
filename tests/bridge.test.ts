@@ -212,6 +212,8 @@ function setSdkMessageApi(
   api: {
     create: (call: SdkMessageCall) => Promise<SdkMessageResponse>
     reply: (call: SdkMessageCall) => Promise<SdkMessageResponse>
+    patch?: (call: SdkMessageCall) => Promise<SdkMessageResponse>
+    update?: (call: SdkMessageCall) => Promise<SdkMessageResponse>
   },
 ): void {
   const internals = client as unknown as { rest: unknown }
@@ -350,7 +352,7 @@ test('SDK reply failures do not fall back to chat delivery', async () => {
 
   await assert.rejects(
     client.sendText('oc_chat', 'answer', { replyToMessageId: 'om_inbound' }),
-    /reply unavailable/,
+    /message\.reply transport failure/,
   )
   assert.equal(creates, 0)
 })
@@ -369,7 +371,7 @@ test('SDK resolved delivery errors and missing message ids reject without fallba
 
   await assert.rejects(
     client.sendText('oc_chat', 'answer', { replyToMessageId: 'om_inbound' }),
-    /230071.*reply target unavailable/,
+    /message\.reply business failure \(code 230071\)/,
   )
   response = { code: 0, data: {} }
   await assert.rejects(
@@ -377,6 +379,104 @@ test('SDK resolved delivery errors and missing message ids reject without fallba
     /missing message_id/,
   )
   assert.equal(creates, 0)
+})
+
+test('SDK card updates validate patch responses and never retry an ambiguous failure', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const patches: SdkMessageCall[] = []
+  let updates = 0
+  let response: SdkMessageResponse = { code: 0 }
+  setSdkMessageApi(client, {
+    async create() { return { data: { message_id: 'om_created' } } },
+    async reply() { return { data: { message_id: 'om_reply' } } },
+    async patch(call) {
+      patches.push(call)
+      return response
+    },
+    async update() {
+      updates += 1
+      return { code: 0 }
+    },
+  })
+
+  await client.updateCard('om_card', { schema: '2.0' })
+  assert.deepEqual(patches, [{
+    path: { message_id: 'om_card' },
+    data: { content: JSON.stringify({ schema: '2.0' }) },
+  }])
+  response = { code: 230_099, msg: 'private payload must not escape' }
+  await assert.rejects(
+    client.updateCard('om_card', { schema: '2.0' }),
+    /message\.patch business failure \(code 230099\)/,
+  )
+  assert.equal(updates, 0)
+})
+
+test('SDK card updates fall back only when patch is absent and sanitize HTTP failures', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  const updates: SdkMessageCall[] = []
+  setSdkMessageApi(client, {
+    async create() { return { data: { message_id: 'om_created' } } },
+    async reply() { return { data: { message_id: 'om_reply' } } },
+    async update(call) {
+      updates.push(call)
+      return { code: 0 }
+    },
+  })
+
+  await client.updateCard('om_card', { schema: '2.0' })
+  assert.equal(updates.length, 1)
+  setSdkMessageApi(client, {
+    async create() { return { data: { message_id: 'om_created' } } },
+    async reply() { return { data: { message_id: 'om_reply' } } },
+    async update() { return { code: 230_099, msg: 'private payload must not escape' } },
+  })
+  await assert.rejects(
+    client.updateCard('om_card', { schema: '2.0' }),
+    /message\.update business failure \(code 230099\)/,
+  )
+  setSdkMessageApi(client, {
+    async create() { return { data: { message_id: 'om_created' } } },
+    async reply() { return { data: { message_id: 'om_reply' } } },
+    async patch() {
+      throw {
+        response: { status: 400, data: { code: 230_099, msg: 'secret-card-payload' } },
+        config: { headers: { authorization: 'test-secret' } },
+      }
+    },
+    async update() {
+      assert.fail('update must not retry a rejected patch')
+    },
+  })
+
+  const error = await client.updateCard('om_card', { secret: 'card-payload' }).catch((reason: unknown) => reason)
+  assert.match(String(error), /message\.patch http failure \(status 400, code 230099\)/)
+  assert.doesNotMatch(String(error), /secret|payload|authorization/u)
+})
+
+test('SDK message creation sanitizes HTTP failures and rejects malformed responses', async () => {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  setSdkMessageApi(client, {
+    async create() {
+      throw {
+        response: { status: 503, data: { code: 230_099, msg: 'secret-card-payload' } },
+        config: { headers: { authorization: 'test-secret' } },
+      }
+    },
+    async reply() { return { data: { message_id: 'om_reply' } } },
+  })
+
+  const failure = await client.sendText('oc_chat', 'answer').catch((reason: unknown) => reason)
+  assert.match(String(failure), /message\.create http failure \(status 503, code 230099\)/)
+  assert.doesNotMatch(String(failure), /secret|payload|authorization/u)
+  setSdkMessageApi(client, {
+    async create() { return { code: '0' } as never },
+    async reply() { return { data: { message_id: 'om_reply' } } },
+  })
+  await assert.rejects(
+    client.sendCard('oc_chat', { schema: '2.0' }),
+    /message\.create returned a malformed response code/,
+  )
 })
 
 test('SDK stopReceiving closes WebSocket but preserves REST sending until stop', async () => {
@@ -502,13 +602,16 @@ test('SDK inbound maps text and keeps unsupported content metadata-only', async 
   const request = prototype.request
   const start = Lark.WSClient.prototype.start
   let receiveMessage: ((data: unknown) => Promise<void>) | undefined
+  let dispatcherLogger: unknown
   const received: LarkInbound[] = []
   prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
   Lark.WSClient.prototype.start = async function captureDispatcher({ eventDispatcher }) {
     const dispatcher = eventDispatcher as unknown as {
       handles: Map<string, (data: unknown) => Promise<void>>
+      logger?: { logger?: unknown }
     }
     receiveMessage = dispatcher.handles.get('im.message.receive_v1')
+    dispatcherLogger = dispatcher.logger?.logger
     const client = this as unknown as { onReady?: () => void }
     client.onReady?.()
   }
@@ -518,6 +621,15 @@ test('SDK inbound maps text and keeps unsupported content metadata-only', async 
   client.onMessage(async (message) => { received.push(message) })
   try {
     await client.start()
+    const sdkInternals = client as unknown as {
+      rest?: { logger?: { logger?: unknown } }
+      ws?: { logger?: { logger?: unknown } }
+    }
+    const privateLogger = sdkInternals.rest?.logger?.logger
+    assert.ok(privateLogger !== undefined)
+    assert.equal(sdkInternals.ws?.logger?.logger, privateLogger)
+    assert.equal(dispatcherLogger, privateLogger)
+    assert.notEqual(privateLogger, Lark.defaultLogger)
     assert.ok(receiveMessage)
     await receiveMessage({
       message: {
@@ -665,6 +777,37 @@ test('SDK startup failures reject client startup', async () => {
   } finally {
     prototype.request = request
     Lark.WSClient.prototype.start = start
+  }
+})
+
+test('SDK bot identity failures discard raw credentials before startup rejects', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  prototype.request = async () => {
+    throw {
+      response: { status: 503, data: { code: 99_999, msg: 'private identity response' } },
+      config: {
+        data: { app_secret: 'test-private-secret' },
+        headers: { authorization: 'Bearer test-private-token' },
+      },
+    }
+  }
+  try {
+    const client = new LarkSdkClient({
+      appId: 'test-app-id',
+      appSecret: 'test-only-secret',
+    })
+    const error = await client.start().catch((reason: unknown) => reason)
+    assert.match(String(error), /bot\.info http failure \(status 503, code 99999\)/)
+    assert.doesNotMatch(
+      `${String(error)} ${JSON.stringify(error)}`,
+      /identity response|app_secret|private-secret|authorization|private-token/u,
+    )
+    await client.stop()
+  } finally {
+    prototype.request = request
   }
 })
 

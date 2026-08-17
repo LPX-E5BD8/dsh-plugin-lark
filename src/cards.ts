@@ -56,7 +56,6 @@ const CARD_STYLE = {
   buttonPrimary: 'primary',
   buttonDefault: 'default',
   behaviorCallback: 'callback',
-  approvalBackground: 'orange-50',
 } as const
 
 const CARD_ELEMENT = {
@@ -255,7 +254,7 @@ function markdownElement(
 ): Record<string, unknown> {
   return {
     tag: CARD_STYLE.tagMarkdown,
-    element_id: elementId,
+    ...(elementId === '' ? {} : { element_id: elementId }),
     content,
     text_align: CARD_STYLE.alignLeft,
     text_size: textSize,
@@ -598,8 +597,6 @@ function approvalElements(card: ApprovalCard): Record<string, unknown>[] {
       tag: CARD_STYLE.tagColumnSet,
       element_id: CARD_ELEMENT.approval,
       flex_mode: CARD_STYLE.flexNone,
-      background_color: CARD_STYLE.approvalBackground,
-      padding: CARD_STYLE.panelPadding,
       columns: [{
         tag: CARD_STYLE.tagColumn,
         width: CARD_STYLE.widthWeighted,
