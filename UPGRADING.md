@@ -40,6 +40,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.1` | Keeps the same schemas while materializing a first-command Session before committing its project-registry mutation binding. | State remains compatible with v0.9.0. Rolling code back reintroduces the project-registry service-dependency defect and removes the first-command checkpoint materializer; keep a complete cold snapshot and prefer rolling forward. |
 | `0.9.2` | Keeps every durable schema unchanged while correcting Card 2.0 payload fields and sanitizing SDK message-delivery failures. | State remains compatible with v0.9.1. Rolling code back can make protected-tool approval cards unavailable again; the older path fails closed and does not grant the tool call. |
 | `0.9.3` | Keeps conversation binding schema v2 and Workspace domain v2 unchanged. `/session resume` checkpoints the current transcript, then atomically points the existing binding at an already persisted, scope-visible Session while carrying the existing mutation-hash window forward. Opaque references are derived rather than stored, and the command does not write archive state or copy/delete a transcript. | v0.9.2 reads the same binding and continues the Session selected by v0.9.3, but it has no `/session` list/resume command. Rolling back does not undo the selection; archive state and Session logs require no conversion. |
+| `0.9.4` | Adds no plugin-owned durable schema. A structured question uses the existing tool-call/result Session vocabulary and checkpoints the pending call before Card delivery; pending request tokens and answers are never stored in plugin sidecars. | v0.9.3 reads the same binding, Workspace, and Session logs but does not intercept structured questions in Lark. Pending Cards are process-local and become stale across any restart. An answer acknowledged before its `tool/result` commit is not crash-durable and may require the question to be asked again. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -56,7 +57,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.3'
+target_tag='v0.9.4'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -185,8 +186,9 @@ Then:
 1. Start the same Harness `0.1.0-rc.6` profile from the same workspace with the same app ID, `defaultSessionId`, storage roots, JSONL compression, canonical Workspace paths, config overlays, and inherited credentials. DSH rc.6 rejects `DSH_*` application credentials in `.env`; use the launch/service environment described in the README.
 2. Require `/api/lark/health` to report HTTP 200 and `state: connected` when `webServer` is mounted.
 3. Check `/help`, then list `/project`, `/session`, and `/model`. In a disposable registered Workspace, resume one listed historical Session by its full opaque reference and verify the expected transcript, project, model, preset, and tools. The list may expose a bounded stored title derived from the first human prompt, so use non-sensitive test content.
-4. Verify an unrelated direct conversation and group reply root cannot use that reference. Restart once, list again, and repeat the resume check before accepting the migration.
-5. Run the relevant credential-backed checks in `SMOKE_TESTS.md`, including `/new`, session navigation, project/model inheritance, restart, and LRU cold resume, then retain the snapshot and old checkout until the rollback window closes.
+4. From a direct Native `ask_user_question` call, complete disposable single-choice, multiple-choice, free-text, and Cancel interactions in a real client. Verify the answer resumes the same turn and terminal Cards contain no answer or controls. A pending pre-upgrade Card is expected to be stale after restart; never put credentials in a question or answer.
+5. Verify an unrelated direct conversation and group reply root cannot use that reference. Restart once, list again, and repeat the resume check before accepting the migration.
+6. Run the relevant credential-backed checks in `SMOKE_TESTS.md`, including `/new`, structured input, session navigation, project/model inheritance, restart, and LRU cold resume, then retain the snapshot and old checkout until the rollback window closes.
 
 Every handled validation message advances the inbound receipt state. A later snapshot restore rewinds those receipts and can allow redelivery; use disposable checks and reconcile external side effects.
 
@@ -200,8 +202,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.3 | State handling |
+| Rollback target from v0.9.4 | State handling |
 | --- | --- |
+| v0.9.3 | Uses the same v2 conversation binding, Workspace domain, and Session logs. Structured Card handling and its process-local pending state disappear; stop cleanly first. Already-sent Cards remain terminal or stale in chat, and every outstanding action is rejected. Completed answers already committed as ordinary tool results remain in the transcript. |
 | v0.9.2 | Uses the same v2 conversation binding, Workspace domain, and Session logs. A Session selected through v0.9.3 remains active because v0.9.2 follows that committed binding, but the `/session` list/resume command disappears and rollback does not restore the previously active Session. No archive, unarchive, delete, or search state was introduced by v0.9.3. |
 | v0.9.1 | No durable-state conversion is required. The older Card payload can be rejected by Feishu, so approvals may become unavailable while remaining fail-closed; retain the full snapshot and prefer roll-forward recovery. |
 | v0.9.0 | Same v2 binding and Workspace schemas. The already materialized v0.9.1 Session remains readable, but v0.9.0 reintroduces failed project-registry checkpoints and lacks safe first-command materialization; retain the full snapshot and prefer roll-forward recovery. |

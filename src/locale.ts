@@ -150,6 +150,13 @@ interface LocaleCopy {
     readonly approvalWrongContext: string
     readonly approvalAllowed: string
     readonly approvalRejected: string
+    readonly humanInputUnauthorized: string
+    readonly humanInputMalformed: string
+    readonly humanInputExpired: string
+    readonly humanInputWrongContext: string
+    readonly humanInputSubmitted: string
+    readonly humanInputCancelled: string
+    readonly humanInputIncomplete: string
     readonly interrupted: string
     readonly maxTokens: string
     readonly blocked: string
@@ -249,6 +256,18 @@ interface LocaleCopy {
     readonly rejected: string
     readonly approvalCancelled: string
     readonly approvalUnavailable: string
+    readonly humanInputTitle: string
+    readonly humanInputSummary: string
+    readonly humanInputSafety: string
+    readonly humanInputSubmit: string
+    readonly humanInputCancel: string
+    readonly humanInputSelectPlaceholder: string
+    readonly humanInputCustomPlaceholder: string
+    readonly humanInputTextPlaceholder: string
+    readonly humanInputSubmitted: string
+    readonly humanInputCancelled: string
+    readonly humanInputTimedOut: string
+    readonly humanInputUnavailable: string
     readonly planTitle: string
     readonly earlierTodos: string
   }
@@ -288,6 +307,13 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       approvalWrongContext: '只能由发起用户在原会话中处理。',
       approvalAllowed: '已允许一次。',
       approvalRejected: '已拒绝。',
+      humanInputUnauthorized: '无权提交这份回答。',
+      humanInputMalformed: '回答格式无效，请检查后重试。',
+      humanInputExpired: '这份问题已处理或过期。',
+      humanInputWrongContext: '只能由发起用户在原会话中回答。',
+      humanInputSubmitted: '回答已接收。',
+      humanInputCancelled: '已取消回答。',
+      humanInputIncomplete: '请完成每个问题后再提交。',
       interrupted: '执行被运行时中断。',
       maxTokens: '模型达到输出上限。',
       blocked: '执行被阻塞。',
@@ -417,6 +443,18 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       rejected: '已拒绝',
       approvalCancelled: '审批已取消',
       approvalUnavailable: '审批不可用',
+      humanInputTitle: '需要你的输入',
+      humanInputSummary: '等待回答',
+      humanInputSafety: '不要在此输入凭据、密钥、Token 或其他秘密。',
+      humanInputSubmit: '提交回答',
+      humanInputCancel: '取消',
+      humanInputSelectPlaceholder: '请选择',
+      humanInputCustomPlaceholder: '其他回答（会覆盖已选项）',
+      humanInputTextPlaceholder: '请输入回答',
+      humanInputSubmitted: '回答已接收',
+      humanInputCancelled: '问题已取消',
+      humanInputTimedOut: '问题已超时',
+      humanInputUnavailable: '问题不可用',
       planTitle: '📋 **计划**',
       earlierTodos: '个更早的计划项已折叠',
     },
@@ -454,6 +492,13 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       approvalWrongContext: 'Only the initiating user can decide in the original chat.',
       approvalAllowed: 'Allowed once.',
       approvalRejected: 'Denied.',
+      humanInputUnauthorized: 'You cannot submit this answer.',
+      humanInputMalformed: 'The answer format is invalid. Check it and try again.',
+      humanInputExpired: 'This question was already handled or expired.',
+      humanInputWrongContext: 'Only the initiating user can answer in the original chat.',
+      humanInputSubmitted: 'Answer received.',
+      humanInputCancelled: 'Answer cancelled.',
+      humanInputIncomplete: 'Complete every question before submitting.',
       interrupted: 'Execution was interrupted by the runtime.',
       maxTokens: 'The model reached its output limit.',
       blocked: 'Execution was blocked.',
@@ -578,6 +623,18 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       rejected: 'Denied',
       approvalCancelled: 'Approval cancelled',
       approvalUnavailable: 'Approval unavailable',
+      humanInputTitle: 'Your input is needed',
+      humanInputSummary: 'Waiting for an answer',
+      humanInputSafety: 'Do not enter credentials, keys, tokens, or other secrets.',
+      humanInputSubmit: 'Submit answer',
+      humanInputCancel: 'Cancel',
+      humanInputSelectPlaceholder: 'Select an option',
+      humanInputCustomPlaceholder: 'Other answer (overrides the selection)',
+      humanInputTextPlaceholder: 'Enter your answer',
+      humanInputSubmitted: 'Answer received',
+      humanInputCancelled: 'Question cancelled',
+      humanInputTimedOut: 'Question timed out',
+      humanInputUnavailable: 'Question unavailable',
       planTitle: '📋 **Plan**',
       earlierTodos: 'earlier plan items folded',
     },

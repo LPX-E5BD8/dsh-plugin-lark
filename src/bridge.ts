@@ -10,9 +10,28 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, LlmCallConfig, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import { foldRequestHeader, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
+import type { ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
-import { CARD_ACTIONS, CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCardWithMeta } from './cards.ts'
-import type { ToolCardItem, TurnCard, TurnCardStatus, TurnCardTodo, TurnCardUsage } from './cards.ts'
+import {
+  CARD_ACTIONS,
+  CARD_LIMITS,
+  HUMAN_INPUT_CARD_FIELDS,
+  humanInputCustomFieldName,
+  humanInputSelectionFieldName,
+  renderApprovalCard,
+  renderApprovalDecisionCard,
+  renderHumanInputCard,
+  renderHumanInputTerminalCard,
+  renderTurnCardWithMeta,
+} from './cards.ts'
+import type {
+  HumanInputCardOutcome,
+  ToolCardItem,
+  TurnCard,
+  TurnCardStatus,
+  TurnCardTodo,
+  TurnCardUsage,
+} from './cards.ts'
 import { DEFAULT_CONFIG, MIN_STREAM_UPDATE_INTERVAL_MS } from './config.ts'
 import { CONVERSATION_MUTATION_HISTORY_LIMIT } from './conversation-binding.ts'
 import type {
@@ -22,6 +41,14 @@ import type {
 } from './conversation-binding.ts'
 import { projectActivity, sessionEventPolicy } from './events.ts'
 import type { ActivityProjection, CatalogSessionEvent } from './events.ts'
+import {
+  ASK_USER_QUESTION_NAME,
+  HUMAN_INPUT_LIMITS,
+  isCompatibleAskUserQuestionDefinition,
+  normalizeHumanInputRequest,
+  validateHumanInputAnswer,
+} from './human-input.ts'
+import type { HumanInputAnswer, HumanInputRequest } from './human-input.ts'
 import type { InboundDeduplicator } from './inbound-dedup.ts'
 import type {
   LarkCardAction,
@@ -43,6 +70,8 @@ export interface LarkBridgeOptions {
   model?: string
   streamUpdateIntervalMs?: number
   maxConversationHandles?: number
+  humanInputTimeoutMs?: number
+  humanInputCardCloseTimeoutMs?: number
   cwd?: string
   sessionReferenceNamespace?: string
   client: LarkClientLike
@@ -352,6 +381,32 @@ interface PendingApproval {
   readonly openId: string
 }
 
+type HumanInputSettlement = {
+  readonly kind: 'answered'
+  readonly answer: HumanInputAnswer
+  readonly immediateCard: true
+} | {
+  readonly kind: 'cancelled'
+  readonly immediateCard: boolean
+} | {
+  readonly kind: 'timed-out' | 'unavailable'
+  readonly immediateCard: false
+}
+
+interface PendingHumanInput {
+  readonly requestId: string
+  readonly sessionId: string
+  readonly baseId: string
+  readonly chatId: string
+  readonly openId: string
+  readonly agent: Agent
+  readonly turnState: TurnState
+  readonly request: HumanInputRequest
+  state: 'sending' | 'awaiting' | 'settled'
+  messageId?: string
+  claim(settlement: HumanInputSettlement): boolean
+}
+
 interface PendingStop {
   readonly sessionId: string
   readonly baseId: string
@@ -387,6 +442,18 @@ const SESSION_WORKSPACE_INDEX_LIMIT = 1_000
 const SESSION_CREATED_AT_MAX = 8_640_000_000_000_000
 const SESSION_TITLE_SOURCE_CODE_UNIT_LIMIT = 4_096
 const WORKSPACE_REGISTRIES_REQUIRING_REMOUNT = new WeakSet<object>()
+const HUMAN_INPUT_CARD_CLOSE_TIMEOUT_MS = 15_000
+const HUMAN_INPUT_CARD_REPAIR_DELAY_MS = 250
+
+type HumanInputFailureCode =
+  | 'LARK_HUMAN_INPUT_INVALID_REQUEST'
+  | 'LARK_HUMAN_INPUT_UNAVAILABLE'
+  | 'LARK_HUMAN_INPUT_BUSY'
+  | 'LARK_HUMAN_INPUT_CANCELLED'
+  | 'LARK_HUMAN_INPUT_TIMEOUT'
+  | 'LARK_HUMAN_INPUT_STALE'
+  | 'LARK_HUMAN_INPUT_CODE_MODE_UNSUPPORTED'
+  | 'LARK_HUMAN_INPUT_INTERNAL'
 
 const APPROVAL_DECISION = {
   allowOnce: 'allowed-once',
@@ -404,6 +471,24 @@ class BindingConfirmationInterruptedError extends Error {
   constructor(cause?: unknown) {
     super('lark: conversation binding confirmation was interrupted by shutdown', { cause })
     this.name = 'BindingConfirmationInterruptedError'
+  }
+}
+
+class HumanInputExpectedError extends Error {
+  constructor(readonly code: HumanInputFailureCode, message: string) {
+    super(message)
+    this.name = 'HumanInputExpectedError'
+  }
+}
+
+function humanInputFailure(code: HumanInputFailureCode, message: string): ToolExecutionResult {
+  return {
+    isError: true,
+    error: {
+      message,
+      info: { name: 'LarkHumanInputError', code },
+    },
+    content: [{ type: 'text', text: `Error: ${message}` }],
   }
 }
 
@@ -547,6 +632,14 @@ function approvalOutcome(decision: string): ApprovalOutcome | undefined {
 
 function actionToast(type: 'success' | 'error' | 'info', content: string): LarkCardActionResult {
   return { toast: { type, content } }
+}
+
+function actionCard(
+  type: 'success' | 'error' | 'info',
+  content: string,
+  card: Record<string, unknown>,
+): LarkCardActionResult {
+  return { toast: { type, content }, card: { type: 'raw', data: card } }
 }
 
 function routeDeliveryOptions(route: MessageRoute): LarkDeliveryOptions {
@@ -1114,6 +1207,8 @@ export class LarkBridge {
   private readonly model: string
   private readonly streamUpdateIntervalMs: number
   private readonly maxConversationHandles: number
+  private readonly humanInputTimeoutMs: number
+  private readonly humanInputCardCloseTimeoutMs: number
   private readonly cwd: string
   private readonly sessionReferenceNamespace: string
   private readonly conversations = new Map<string, ConversationSession>()
@@ -1131,6 +1226,9 @@ export class LarkBridge {
   private readonly activeRoutes = new Map<string, MessageRoute>()
   private readonly contextWindows = new Map<string, number>()
   private readonly pending = new Map<string, PendingApproval>()
+  private readonly pendingHumanInputs = new Map<string, PendingHumanInput>()
+  private readonly pendingHumanInputMessages = new Map<string, PendingHumanInput>()
+  private readonly pendingHumanInputSessions = new Map<string, PendingHumanInput>()
   private readonly pendingStops = new Map<string, PendingStop>()
   private readonly deliveryTasks = new Set<Promise<void>>()
   private readonly warnedEventTypes = new Set<string>()
@@ -1192,6 +1290,19 @@ export class LarkBridge {
     this.maxConversationHandles = options.maxConversationHandles ?? DEFAULT_CONFIG.maxConversationHandles
     if (!Number.isSafeInteger(this.maxConversationHandles) || this.maxConversationHandles < 0) {
       throw new RangeError('lark: maxConversationHandles must be a non-negative safe integer')
+    }
+    this.humanInputTimeoutMs = options.humanInputTimeoutMs ?? HUMAN_INPUT_LIMITS.timeoutMs
+    if (!Number.isSafeInteger(this.humanInputTimeoutMs)
+      || this.humanInputTimeoutMs <= 0
+      || this.humanInputTimeoutMs > HUMAN_INPUT_LIMITS.timeoutMs) {
+      throw new RangeError('lark: humanInputTimeoutMs must be a positive bounded safe integer')
+    }
+    this.humanInputCardCloseTimeoutMs = options.humanInputCardCloseTimeoutMs
+      ?? HUMAN_INPUT_CARD_CLOSE_TIMEOUT_MS
+    if (!Number.isSafeInteger(this.humanInputCardCloseTimeoutMs)
+      || this.humanInputCardCloseTimeoutMs <= 0
+      || this.humanInputCardCloseTimeoutMs > HUMAN_INPUT_CARD_CLOSE_TIMEOUT_MS) {
+      throw new RangeError('lark: humanInputCardCloseTimeoutMs must be a positive bounded safe integer')
     }
     this.cwd = options.cwd ?? process.cwd()
     this.sessionReferenceNamespace = options.sessionReferenceNamespace ?? 'direct-bridge'
@@ -1278,6 +1389,13 @@ export class LarkBridge {
     this.approvalWaterfallBound = false
     for (const pending of this.pending.values()) void pending.settle(APPROVAL_OUTCOME.cancelled)
     this.pending.clear()
+    for (const pending of [...this.pendingHumanInputs.values()]) {
+      pending.agent.cancel({ kind: 'disposed' })
+      pending.claim({ kind: 'cancelled', immediateCard: false })
+    }
+    this.pendingHumanInputs.clear()
+    this.pendingHumanInputMessages.clear()
+    this.pendingHumanInputSessions.clear()
     this.pendingStops.clear()
     const start = this.startPromise
     this.startPromise = undefined
@@ -1428,6 +1546,10 @@ export class LarkBridge {
       return actionToast('error', this.text.approvalUnauthorized)
     }
     if (action.value.action === CARD_ACTIONS.turnStop) return this.handleStopAction(action)
+    if (action.value.action === CARD_ACTIONS.humanInputCancel
+      || (action.tag === 'button' && action.name === HUMAN_INPUT_CARD_FIELDS.submit)) {
+      return this.handleHumanInputAction(action)
+    }
     const requestId = String(action.value.request_id ?? '')
     const decision = String(action.value.decision ?? '')
     const outcome = approvalOutcome(decision)
@@ -1460,6 +1582,22 @@ export class LarkBridge {
       this.ctx.logger.warn('[lark] rejected stop from a different chat or user')
       return actionToast('error', this.text.stopWrongContext)
     }
+    const activeConversation = this.conversations.get(candidate.baseId)
+    if (activeConversation?.sessionId === candidate.sessionId
+      && this.pendingStops.get(requestId) === candidate) {
+      if (candidate.stopping) return actionToast('info', this.text.stopRequested)
+      if (activeConversation.handle.agent.status !== 'running') {
+        this.pendingStops.delete(requestId)
+        return actionToast('info', this.text.stopExpired)
+      }
+      candidate.stopping = true
+      this.pendingHumanInputSessions.get(candidate.sessionId)?.claim({
+        kind: 'cancelled',
+        immediateCard: false,
+      })
+      activeConversation.handle.agent.cancel({ kind: 'user' }, { keepInbox: true })
+      return actionToast('success', this.text.stopRequested)
+    }
     await this.conversationBarriers.get(candidate.baseId)
     const pending = this.pendingStops.get(requestId)
     if (pending !== candidate) return actionToast('info', this.text.stopExpired)
@@ -1470,6 +1608,16 @@ export class LarkBridge {
       return actionToast('info', this.text.stopExpired)
     }
     pending.stopping = true
+    const conversation = this.conversations.get(pending.baseId)
+    if (conversation?.sessionId === pending.sessionId) {
+      if (conversation.handle.agent.status !== 'running') {
+        this.pendingStops.delete(requestId)
+        return actionToast('info', this.text.stopExpired)
+      }
+      conversation.handle.agent.cancel({ kind: 'user' }, { keepInbox: true })
+      return actionToast('success', this.text.stopRequested)
+    }
+    this.pendingHumanInputSessions.get(pending.sessionId)?.claim({ kind: 'cancelled', immediateCard: false })
     try {
       const resolved = await handle
       if (resolved.agent.status !== 'running') {
@@ -1619,6 +1767,429 @@ export class LarkBridge {
       await this.client.updateCard(messageId, renderApprovalDecisionCard(outcome, toolName, this.locale))
     } catch (error) {
       this.ctx.logger.error('[lark] approval card update failed: %s', messageOf(error))
+    }
+  }
+
+  private humanInputPendingIsCurrent(pending: PendingHumanInput): boolean {
+    const sessionId = pending.sessionId
+    const route = this.activeRoutes.get(sessionId)
+    const conversation = this.conversations.get(pending.baseId)
+    return !this.stopping
+      && this.ctx.agents.get(pending.agent.id) === pending.agent
+      && this.ctx.agents.roots().some((agent) => agent === pending.agent)
+      && conversation?.sessionId === sessionId
+      && conversation.handle.agent === pending.agent
+      && this.activeTurnState(sessionId) === pending.turnState
+      && route?.sessionBaseId === pending.baseId
+      && route.chatId === pending.chatId
+      && route.openId === pending.openId
+  }
+
+  private humanInputAnswerFromAction(
+    pending: PendingHumanInput,
+    action: LarkCardAction,
+  ): { readonly kind: 'valid'; readonly answer: HumanInputAnswer } | { readonly kind: 'incomplete' | 'invalid' } {
+    const formValue = action.formValue ?? {}
+    const expectedFields = new Set<string>()
+    for (const [index, question] of pending.request.questions.entries()) {
+      expectedFields.add(humanInputCustomFieldName(index))
+      if (question.options.length > 0) expectedFields.add(humanInputSelectionFieldName(index))
+    }
+    if (Object.keys(formValue).some((key) => !expectedFields.has(key))) return { kind: 'invalid' }
+    const answers = pending.request.questions.map((question, index) => {
+      const selectionValue = formValue[humanInputSelectionFieldName(index)]
+      const customValue = formValue[humanInputCustomFieldName(index)]
+      let selectedTokens: string[] = []
+      if (question.options.length > 0) {
+        if (question.multiSelect) {
+          if (selectionValue !== undefined
+            && (!Array.isArray(selectionValue)
+              || selectionValue.some((value) => typeof value !== 'string'))) return undefined
+          selectedTokens = selectionValue === undefined ? [] : [...selectionValue] as string[]
+        } else {
+          if (selectionValue !== undefined && typeof selectionValue !== 'string') return undefined
+          selectedTokens = selectionValue === undefined || selectionValue === '' ? [] : [selectionValue]
+        }
+      } else if (selectionValue !== undefined) return undefined
+      const selected: string[] = []
+      const tokenIndexes = new Set<number>()
+      for (const token of selectedTokens) {
+        const match = new RegExp(`^q${index}_o(0|[1-9]\\d*)$`, 'u').exec(token)
+        const optionIndex = match === null ? -1 : Number(match[1])
+        const option = question.options[optionIndex]
+        if (option === undefined || tokenIndexes.has(optionIndex)) return undefined
+        tokenIndexes.add(optionIndex)
+        selected.push(option.label)
+      }
+      if (!question.multiSelect && selected.length > 1) return undefined
+      if (customValue !== undefined && typeof customValue !== 'string') return undefined
+      const custom = typeof customValue === 'string' && customValue.trim() !== ''
+        ? customValue
+        : undefined
+      return {
+        id: question.id,
+        selected: !question.multiSelect && custom !== undefined ? [] : selected,
+        ...(custom === undefined ? {} : { custom }),
+      }
+    })
+    if (answers.some((answer) => answer === undefined)) return { kind: 'invalid' }
+    try {
+      return {
+        kind: 'valid',
+        answer: validateHumanInputAnswer(
+          pending.request,
+          { answers },
+          { requireEveryAnswer: true },
+        ),
+      }
+    } catch (error) {
+      return error instanceof TypeError && /requires an answer/u.test(error.message)
+        ? { kind: 'incomplete' }
+        : { kind: 'invalid' }
+    }
+  }
+
+  private async handleHumanInputAction(action: LarkCardAction): Promise<LarkCardActionResult> {
+    const cancelRequestId = action.value.action === CARD_ACTIONS.humanInputCancel
+      && typeof action.value.request_id === 'string'
+      ? action.value.request_id
+      : undefined
+    const candidate = cancelRequestId === undefined
+      ? this.pendingHumanInputMessages.get(action.messageId)
+      : this.pendingHumanInputs.get(cancelRequestId)
+    if (candidate === undefined) return actionToast('info', this.text.humanInputExpired)
+    if (candidate.state !== 'awaiting'
+      || candidate.messageId !== action.messageId
+      || candidate.chatId !== action.chatId
+      || candidate.openId !== action.openId) {
+      this.ctx.logger.warn('[lark] rejected human input from a different card, chat, or user')
+      return actionToast('error', this.text.humanInputWrongContext)
+    }
+    const pending = cancelRequestId === undefined
+      ? this.pendingHumanInputMessages.get(action.messageId)
+      : this.pendingHumanInputs.get(cancelRequestId)
+    if (pending !== candidate || !this.humanInputPendingIsCurrent(candidate)) {
+      return actionToast('info', this.text.humanInputExpired)
+    }
+    if (cancelRequestId !== undefined) {
+      if (!candidate.claim({ kind: 'cancelled', immediateCard: true })) {
+        return actionToast('info', this.text.humanInputExpired)
+      }
+      return actionCard(
+        'success',
+        this.text.humanInputCancelled,
+        renderHumanInputTerminalCard('cancelled', this.locale),
+      )
+    }
+    if (action.tag !== 'button' || action.name !== HUMAN_INPUT_CARD_FIELDS.submit) {
+      return actionToast('error', this.text.humanInputMalformed)
+    }
+    const parsed = this.humanInputAnswerFromAction(candidate, action)
+    if (parsed.kind !== 'valid') {
+      return actionToast(
+        'error',
+        parsed.kind === 'incomplete' ? this.text.humanInputIncomplete : this.text.humanInputMalformed,
+      )
+    }
+    if (!candidate.claim({ kind: 'answered', answer: parsed.answer, immediateCard: true })) {
+      return actionToast('info', this.text.humanInputExpired)
+    }
+    return actionCard(
+      'success',
+      this.text.humanInputSubmitted,
+      renderHumanInputTerminalCard('answered', this.locale),
+    )
+  }
+
+  private trackHumanInputCardClose(
+    messageId: string,
+    outcome: HumanInputCardOutcome,
+    delayMs = 0,
+  ): void {
+    if (this.client.updateCard === undefined) return
+    const closing = (async () => {
+      if (delayMs > 0) await delay(delayMs)
+      const deadline = new AbortController()
+      let rejectAbort: ((error: Error) => void) | undefined
+      const aborted = new Promise<never>((_resolve, reject) => {
+        rejectAbort = reject
+      })
+      const onAbort = (): void => {
+        rejectAbort?.(new Error('lark: human-input card update timed out'))
+      }
+      deadline.signal.addEventListener('abort', onAbort, { once: true })
+      const timer = setTimeout(() => {
+        deadline.abort(new Error('lark: human-input card update timed out'))
+      }, this.humanInputCardCloseTimeoutMs)
+      const updating = Promise.resolve().then(() => this.client.updateCard!(
+        messageId,
+        renderHumanInputTerminalCard(outcome, this.locale),
+        { signal: deadline.signal },
+      ))
+      try {
+        await Promise.race([updating, aborted])
+      } finally {
+        clearTimeout(timer)
+        deadline.signal.removeEventListener('abort', onAbort)
+      }
+    })()
+      .catch(() => { this.ctx.logger.error('[lark] human-input card update failed') })
+    this.trackDelivery(closing)
+  }
+
+  private closeHumanInputCard(
+    messageId: string,
+    settlement: HumanInputSettlement,
+  ): void {
+    if (settlement.immediateCard === false) {
+      this.trackHumanInputCardClose(messageId, settlement.kind)
+      return
+    }
+    // The callback response replaces the Card immediately. One delayed,
+    // tracked PATCH repairs a response lost between the callback server and
+    // Lark without racing the platform's action-response lock or retrying it.
+    this.trackHumanInputCardClose(
+      messageId,
+      settlement.kind,
+      HUMAN_INPUT_CARD_REPAIR_DELAY_MS,
+    )
+  }
+
+  private async askLarkUser(
+    request: HumanInputRequest,
+    exec: ToolDispatchExecution,
+    agent: Agent,
+    route: MessageRoute,
+    turnState: TurnState,
+  ): Promise<HumanInputAnswer> {
+    if (this.client.sendCard === undefined || this.client.updateCard === undefined) {
+      throw new HumanInputExpectedError(
+        'LARK_HUMAN_INPUT_UNAVAILABLE',
+        'ask_user_question is unavailable on this Lark client',
+      )
+    }
+    const sessionId = String(agent.id)
+    if (this.pendingHumanInputSessions.has(sessionId)) {
+      throw new HumanInputExpectedError(
+        'LARK_HUMAN_INPUT_BUSY',
+        'ask_user_question already has a pending question in this session',
+      )
+    }
+    const requestId = randomUUID()
+    let card: Record<string, unknown>
+    try {
+      card = renderHumanInputCard({ requestId, request, locale: this.locale })
+    } catch {
+      throw new HumanInputExpectedError(
+        'LARK_HUMAN_INPUT_INVALID_REQUEST',
+        'ask_user_question exceeds the supported Lark Card limits',
+      )
+    }
+    const settled = Promise.withResolvers<HumanInputSettlement>()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const onAbort = (): void => {
+      pending.claim({ kind: 'cancelled', immediateCard: false })
+    }
+    const pending: PendingHumanInput = {
+      requestId,
+      sessionId,
+      baseId: route.sessionBaseId,
+      chatId: route.chatId,
+      openId: route.openId,
+      agent,
+      turnState,
+      request,
+      state: 'sending',
+      claim: (settlement) => {
+        if (pending.state === 'settled') return false
+        pending.state = 'settled'
+        if (timer !== undefined) clearTimeout(timer)
+        exec.signal.removeEventListener('abort', onAbort)
+        this.pendingHumanInputs.delete(requestId)
+        this.pendingHumanInputSessions.delete(sessionId)
+        if (pending.messageId !== undefined) this.pendingHumanInputMessages.delete(pending.messageId)
+        settled.resolve(settlement)
+        return true
+      },
+    }
+    this.pendingHumanInputs.set(requestId, pending)
+    this.pendingHumanInputSessions.set(sessionId, pending)
+    exec.signal.addEventListener('abort', onAbort, { once: true })
+    if (exec.signal.aborted) onAbort()
+
+    let messageId: string | undefined
+    const acceptDelivery = (delivered: string | void): void => {
+      if (typeof delivered !== 'string' || delivered === '') {
+        pending.claim({ kind: 'unavailable', immediateCard: false })
+        return
+      }
+      messageId = delivered
+      pending.messageId = delivered
+      if (pending.state !== 'sending') return
+      pending.state = 'awaiting'
+      this.pendingHumanInputMessages.set(delivered, pending)
+      timer = setTimeout(() => {
+        pending.claim({ kind: 'timed-out', immediateCard: false })
+      }, this.humanInputTimeoutMs)
+    }
+    if (pending.state === 'sending') {
+      let sending: Promise<string | void> | undefined
+      try {
+        sending = Promise.resolve(this.client.sendCard(
+          route.chatId,
+          card,
+          { ...routeDeliveryOptions(route), signal: exec.signal },
+        ))
+      } catch {
+        pending.claim({ kind: 'unavailable', immediateCard: false })
+      }
+      if (sending !== undefined) {
+        this.trackDelivery(sending.then(() => {}, () => {}))
+        try {
+          acceptDelivery(await sending)
+        } catch {
+          pending.claim({ kind: 'unavailable', immediateCard: false })
+        }
+      }
+    }
+    const settlement = await settled.promise
+    if (messageId !== undefined) this.closeHumanInputCard(messageId, settlement)
+    switch (settlement.kind) {
+      case 'answered': return settlement.answer
+      case 'cancelled': throw new HumanInputExpectedError(
+        'LARK_HUMAN_INPUT_CANCELLED',
+        'ask_user_question was cancelled before the user answered',
+      )
+      case 'timed-out': throw new HumanInputExpectedError(
+        'LARK_HUMAN_INPUT_TIMEOUT',
+        'ask_user_question timed out before the user answered',
+      )
+      case 'unavailable': throw new HumanInputExpectedError(
+        'LARK_HUMAN_INPUT_UNAVAILABLE',
+        'ask_user_question is unavailable in this Lark conversation',
+      )
+    }
+  }
+
+  private async handleAskUserQuestionTool(
+    sessionId: ReturnType<typeof SessionId>,
+    exec: ToolDispatchExecution,
+    next: () => Promise<ToolExecutionResult>,
+  ): Promise<ToolExecutionResult> {
+    if (exec.name !== ASK_USER_QUESTION_NAME) return next()
+    const definition = this.ctx.tools.get(exec.name, exec.agent)
+    if (!isCompatibleAskUserQuestionDefinition(definition)) return next()
+    const key = String(sessionId)
+    const route = this.activeRoutes.get(key)
+    const turnState = this.activeTurnState(key)
+    if (route === undefined || turnState === undefined) return next()
+    const activityId = exec.parent === undefined ? String(exec.callId) : `code:${String(exec.callId)}`
+    const activityIndex = turnState.toolIndexes.get(activityId)
+    const activity = activityIndex === undefined ? undefined : turnState.tools[activityIndex]
+    if (activity?.name !== ASK_USER_QUESTION_NAME || activity.status !== 'running') return next()
+    if (exec.agent === undefined) return next()
+    let initiator: Agent | undefined
+    try {
+      initiator = this.ctx.agents.currentInitiator()
+    } catch {
+      return next()
+    }
+    if (initiator !== exec.agent) return next()
+    if (exec.parent !== undefined) {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_CODE_MODE_UNSUPPORTED',
+        'ask_user_question is not supported inside run_code on this Harness runtime',
+      )
+    }
+    if (exec.signal.aborted) {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_STALE',
+        'ask_user_question Lark turn is no longer active',
+      )
+    }
+    const handle = await this.handles.get(key)
+    if (handle === undefined
+      || handle.agent !== exec.agent
+      || this.ctx.agents.get(sessionId) !== exec.agent
+      || !this.ctx.agents.roots().some((agent) => agent === exec.agent)
+      || this.activeRoutes.get(key) !== route
+      || this.activeTurnState(key) !== turnState
+      || exec.signal.aborted) {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_STALE',
+        'ask_user_question Lark ownership changed before presentation',
+      )
+    }
+    let request: HumanInputRequest
+    try {
+      request = normalizeHumanInputRequest(
+        (exec.arguments as { questions?: unknown } | undefined)?.questions,
+      )
+    } catch {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_INVALID_REQUEST',
+        'ask_user_question arguments exceed the supported Lark input limits',
+      )
+    }
+    if (sessionPersistenceOf(this.ctx) === undefined) {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_UNAVAILABLE',
+        'ask_user_question requires durable Session persistence before presenting a Lark Card',
+      )
+    }
+    let durable = false
+    try {
+      durable = await this.ctx.sessions.flush(exec.agent.session)
+    } catch {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_UNAVAILABLE',
+        'ask_user_question could not durably checkpoint the pending call',
+      )
+    }
+    if (!durable) {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_UNAVAILABLE',
+        'ask_user_question has no active Session durability participant',
+      )
+    }
+    let currentInitiator: Agent | undefined
+    try {
+      currentInitiator = this.ctx.agents.currentInitiator()
+    } catch {
+      currentInitiator = undefined
+    }
+    if (currentInitiator !== exec.agent
+      || this.ctx.agents.get(sessionId) !== exec.agent
+      || this.activeRoutes.get(key) !== route
+      || this.activeTurnState(key) !== turnState
+      || exec.signal.aborted) {
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_STALE',
+        'ask_user_question Lark ownership changed before presentation',
+      )
+    }
+    let answer: HumanInputAnswer
+    try {
+      answer = await this.askLarkUser(request, exec, exec.agent, route, turnState)
+    } catch (error) {
+      if (error instanceof HumanInputExpectedError) {
+        return humanInputFailure(error.code, error.message)
+      }
+      return humanInputFailure(
+        'LARK_HUMAN_INPUT_INTERNAL',
+        'ask_user_question could not complete in Lark',
+      )
+    }
+    return {
+      isError: false,
+      value: {
+        answers: answer.answers.map((item) => ({
+          id: item.id,
+          selected: [...item.selected],
+          ...(item.custom === undefined ? {} : { custom: item.custom }),
+        })),
+      },
+      content: [],
     }
   }
 
@@ -4215,6 +4786,20 @@ export class LarkBridge {
     const setup = async (agentCtx: Context): Promise<void> => {
       installModelSelection(agentCtx, modelSelectionRef)
       await composition.setup?.(agentCtx)
+      const scopedTools = (agentCtx as unknown as { tools?: {
+        get?: Context['tools']['get']
+      } }).tools
+      const askDefinition = typeof scopedTools?.get === 'function'
+        ? scopedTools.get.call(scopedTools, ASK_USER_QUESTION_NAME, agentCtx.agent)
+        : undefined
+      if (!isCompatibleAskUserQuestionDefinition(askDefinition)) {
+        this.ctx.logger.warn(
+          '[lark] structured human input unavailable for Agent: compatible ask_user_question tool missing or restricted',
+        )
+      }
+      agentCtx.on('tools/execute', (exec, next) => (
+        this.handleAskUserQuestionTool(sessionId, exec, next)
+      ))
     }
     const handle = persisted
       ? await this.ctx.agents.resume({
@@ -4881,6 +5466,10 @@ export class LarkBridge {
       if (pending.sessionId !== sessionId) continue
       void pending.settle(APPROVAL_OUTCOME.cancelled)
     }
+    this.pendingHumanInputSessions.get(sessionId)?.claim({
+      kind: 'cancelled',
+      immediateCard: false,
+    })
   }
 
   private clearRoutes(): void {
@@ -4890,6 +5479,9 @@ export class LarkBridge {
     this.activeRoutes.clear()
     this.contextWindows.clear()
     this.pendingStops.clear()
+    this.pendingHumanInputs.clear()
+    this.pendingHumanInputMessages.clear()
+    this.pendingHumanInputSessions.clear()
     this.sessionOperations.clear()
   }
 

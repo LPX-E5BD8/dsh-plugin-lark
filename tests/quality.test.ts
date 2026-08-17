@@ -63,7 +63,7 @@ function assertControlDepth(source: ts.SourceFile): void {
 
 test('quality: public defaults fail closed', () => {
   assert.equal(DEFAULT_CONFIG.allowAllUsers, false)
-  assert.deepEqual(inject, ['agents', 'storageDomain', 'sessions'])
+  assert.deepEqual(inject, ['agents', 'storageDomain', 'sessions', 'tools'])
 })
 
 test('quality: project management configuration stays fail-closed through the bundle seam', () => {
@@ -152,11 +152,14 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
     '@deepseek-ai/dsh-llm': harnessVersion,
     '@deepseek-ai/dsh-session': harnessVersion,
     '@deepseek-ai/dsh-storage-domain': harnessVersion,
+    '@deepseek-ai/dsh-tools': harnessVersion,
     '@deepseek-ai/dsh-user-approval': harnessVersion,
     '@deepseek-ai/schemastery': schemasteryVersion,
   }
   const expectedHarnessDevDependencies = {
     '@deepseek-ai/dsh-agent-loop': harnessVersion,
+    '@deepseek-ai/dsh-code-runtime': harnessVersion,
+    '@deepseek-ai/dsh-session-checkpoint-policy': harnessVersion,
     '@deepseek-ai/dsh-session-persistence': harnessVersion,
     '@deepseek-ai/dsh-session-persistence-jsonl': harnessVersion,
     '@deepseek-ai/dsh-session-projection': harnessVersion,
@@ -166,8 +169,11 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
     '@deepseek-ai/dsh-storage': harnessVersion,
     '@deepseek-ai/dsh-storage-domain': harnessVersion,
     '@deepseek-ai/dsh-storage-json': harnessVersion,
+    '@deepseek-ai/dsh-system-prompt': harnessVersion,
+    '@deepseek-ai/dsh-tool-ask-user': harnessVersion,
     '@deepseek-ai/dsh-tools': harnessVersion,
     '@deepseek-ai/dsh-user-approval': harnessVersion,
+    '@deepseek-ai/dsh-user-questions': harnessVersion,
     '@deepseek-ai/dsh-workspace': harnessVersion,
   }
   assert.ok(root !== undefined)
@@ -345,7 +351,7 @@ test('quality: upgrade guides track durable schemas and ship with the package', 
   assert.match(roadmap, /## 0\.8\.2 — Upgrade and rollback/u)
 })
 
-test('quality: rendered cards stay within the Lark byte limit', () => {
+test('quality: rendered cards stay within the conservative plugin byte budget', () => {
   const payload = renderTurnCard({
     status: 'completed',
     answer: '"\\长内容'.repeat(10_000),

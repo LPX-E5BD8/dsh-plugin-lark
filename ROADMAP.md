@@ -16,7 +16,7 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 ## 0.1.3 — Inbound durability
 
 - Persist a bounded inbound-message receipt window across restarts.
-- Finish each platform callback only after its successful handling receipt is durable.
+- Finish each inbound-message event callback only after its successful handling receipt is durable; interactive Card action responses follow their feature-specific settlement boundary.
 
 ## 0.2.0 — Reply delivery
 
@@ -149,9 +149,10 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 
 ## 0.9.4 — Structured human input
 
-- Expose an Agent tool for single-choice, multiple-choice, and bounded free-text questions that renders a native interactive card and returns the answer to the same running turn.
-- Bind each question to its Agent session, conversation scope, chat, message, and eligible user so stale, duplicate, or cross-chat answers fail closed.
-- Define explicit timeout, cancellation, reset, shutdown, delivery-failure, and restart behavior; pause the run timeout only while an admitted question is awaiting its authorized answer.
+- Intercept the compatible rc.6 `ask_user_question` definition for a claimed Lark direct Native call, render up to three single-choice, multiple-choice, or bounded free-text questions in one native Card, and return the authorized answer to the same running turn without registering a competing User Questions provider.
+- Bind every question to the exact live Agent, turn, Session, conversation scope, chat, Card message, and initiating user; use internal option tokens, literal model-authored UI text, atomic batch validation, and first-wins settlement so stale, duplicate, malformed, replayed, or cross-context answers fail closed.
+- Require an explicit successful Session checkpoint before Card creation, start the 30-minute answer window only after delivery, and define bounded cancellation, Stop, reset, shutdown, delivery-failure, callback-repair, hard-crash, and restart behavior. A callback acknowledges process-local acceptance; durability begins only when the Harness commits the tool result.
+- Support direct Native calls in `native` and `both` modes. Fail nested Code Mode calls quickly without creating a Card because the rc.6 Code Runtime has no public API for pausing its worker wall-clock budget during human wait; revisit Code Mode only after that runtime capability exists.
 
 ## 0.9.5 — Secure attachment and artifact exchange
 

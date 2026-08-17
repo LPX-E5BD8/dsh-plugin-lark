@@ -23,6 +23,12 @@ export interface LarkCardAction {
   chatId: string
   messageId: string
   value: Record<string, unknown>
+  tag?: string
+  name?: string
+  formValue?: Record<string, unknown>
+  inputValue?: string
+  option?: string
+  options?: readonly string[]
 }
 
 export type LarkToastType = 'success' | 'error' | 'warning' | 'info'
@@ -32,11 +38,16 @@ export interface LarkCardActionResult {
     type: LarkToastType
     content: string
   }
+  card?: {
+    type: 'raw'
+    data: Record<string, unknown>
+  }
 }
 
 export interface LarkDeliveryOptions {
   replyToMessageId?: string
   replyInThread?: boolean
+  signal?: AbortSignal
 }
 
 export type LarkConnectionState =
@@ -65,7 +76,7 @@ export interface LarkClientLike {
   sendText(chatId: string, text: string, options?: LarkDeliveryOptions): Promise<void>
   onMessage(handler: (msg: LarkInbound) => Promise<void>): void
   sendCard?(chatId: string, card: unknown, options?: LarkDeliveryOptions): Promise<string | void>
-  updateCard?(messageId: string, card: unknown): Promise<void>
+  updateCard?(messageId: string, card: unknown, options?: Pick<LarkDeliveryOptions, 'signal'>): Promise<void>
   onCardAction?(handler: (action: LarkCardAction) => Promise<LarkCardActionResult>): void
 }
 
@@ -79,6 +90,7 @@ export interface LarkSdkOptions {
 
 const TEXT_LIMIT = 4000
 const START_TIMEOUT_MS = 15_000
+const REST_REQUEST_TIMEOUT_MS = 15_000
 
 const discardSdkLog = (..._messages: unknown[]): void => {}
 const PRIVATE_SDK_LOGGER = Object.freeze({
@@ -164,6 +176,18 @@ function parseActionValue(value: unknown): Record<string, unknown> {
   return asRecord(value)
 }
 
+function optionalActionString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function parseActionOptions(value: unknown): readonly string[] | undefined {
+  if (Array.isArray(value) && value.every((item) => typeof item === 'string')) {
+    return Object.freeze([...value] as string[])
+  }
+  if (typeof value !== 'string' || value === '') return undefined
+  return Object.freeze(value.split(',').filter((item) => item !== ''))
+}
+
 /** Normalize card.action.trigger payloads (wrapped or SDK-unwrapped). */
 export function unwrapCardAction(data: unknown): LarkCardAction {
   const root = asRecord(data)
@@ -171,16 +195,28 @@ export function unwrapCardAction(data: unknown): LarkCardAction {
   const operator = asRecord(event.operator)
   const action = asRecord(event.action)
   const context = asRecord(event.context)
+  const openId = optionalActionString(operator.open_id) ?? ''
+  const chatId = optionalActionString(context.open_chat_id) ?? ''
+  const messageId = optionalActionString(context.open_message_id) ?? ''
+  const inputValue = optionalActionString(action.input_value)
+  const option = optionalActionString(action.option)
+  const options = parseActionOptions(action.options)
   return {
-    openId: String(operator.open_id ?? ''),
-    chatId: String(context.open_chat_id ?? ''),
-    messageId: String(context.open_message_id ?? ''),
+    openId,
+    chatId,
+    messageId,
     value: parseActionValue(action.value),
+    tag: optionalActionString(action.tag) ?? '',
+    name: optionalActionString(action.name) ?? '',
+    formValue: parseActionValue(action.form_value),
+    ...(inputValue === undefined ? {} : { inputValue }),
+    ...(option === undefined ? {} : { option }),
+    ...(options === undefined ? {} : { options }),
   }
 }
 
 type LarkRest = {
-  request: (opts: unknown) => Promise<{ bot?: { open_id?: string } }>
+  request: (opts: unknown) => Promise<unknown>
   im: {
     v1: {
       message: {
@@ -247,6 +283,38 @@ async function callLarkApi(
     throw new Error(`lark: ${operation} business failure (code ${code})`)
   }
   return record
+}
+
+async function callSignalBoundLarkApi(
+  operation: LarkApiOperation,
+  callerSignal: AbortSignal,
+  call: (signal: AbortSignal) => Promise<unknown>,
+): Promise<Record<string, unknown>> {
+  const deadline = new AbortController()
+  const signal = AbortSignal.any([callerSignal, deadline.signal])
+  let rejectAbort: ((error: Error) => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject
+  })
+  const onAbort = (): void => {
+    rejectAbort?.(new Error(`lark: ${operation} request aborted`))
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  const timer = setTimeout(() => {
+    deadline.abort(new Error(`lark: ${operation} request timed out`))
+  }, REST_REQUEST_TIMEOUT_MS)
+  const request = signal.aborted
+    ? Promise.reject(new Error(`lark: ${operation} request aborted`))
+    : Promise.resolve().then(() => call(signal))
+  try {
+    // The outer race also bounds SDK token acquisition, which happens before
+    // Axios observes its own signal/timeout. A late SDK continuation sees the
+    // already-aborted combined signal and cannot issue the message write.
+    return await callLarkApi(operation, () => Promise.race([request, aborted]))
+  } finally {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', onAbort)
+  }
 }
 
 interface LarkConnectionStatus {
@@ -494,6 +562,35 @@ export class LarkSdkClient implements LarkClientLike {
     const operation: LarkApiOperation = replyToMessageId !== undefined && replyToMessageId !== ''
       ? 'message.reply'
       : 'message.create'
+    if (options?.signal !== undefined) {
+      const res = asRecord(await callSignalBoundLarkApi(operation, options.signal, (signal) => this.rest!.request(
+        replyToMessageId !== undefined && replyToMessageId !== ''
+          ? {
+              url: `/open-apis/im/v1/messages/${encodeURIComponent(replyToMessageId)}/reply`,
+              method: 'POST',
+              data: {
+                msg_type: msgType,
+                content,
+                ...(options.replyInThread === true ? { reply_in_thread: true } : {}),
+              },
+              signal,
+              timeout: REST_REQUEST_TIMEOUT_MS,
+            }
+          : {
+              url: '/open-apis/im/v1/messages',
+              method: 'POST',
+              params: { receive_id_type: 'chat_id' },
+              data: { receive_id: chatId, msg_type: msgType, content },
+              signal,
+              timeout: REST_REQUEST_TIMEOUT_MS,
+            },
+      )))
+      const id = asRecord(res.data).message_id
+      if (typeof id !== 'string' || id === '') {
+        throw new Error('lark: message delivery response is missing message_id')
+      }
+      return id
+    }
     const message = this.rest.im.v1.message
     const res = await callLarkApi(operation, () => (
       replyToMessageId !== undefined && replyToMessageId !== ''
@@ -517,8 +614,22 @@ export class LarkSdkClient implements LarkClientLike {
     return id
   }
 
-  async updateCard(messageId: string, card: unknown): Promise<void> {
+  async updateCard(
+    messageId: string,
+    card: unknown,
+    options?: Pick<LarkDeliveryOptions, 'signal'>,
+  ): Promise<void> {
     if (this.rest === undefined) throw new Error('lark client not started')
+    if (options?.signal !== undefined) {
+      await callSignalBoundLarkApi('message.patch', options.signal, (signal) => this.rest!.request({
+        url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`,
+        method: 'PATCH',
+        data: { content: JSON.stringify(card) },
+        signal,
+        timeout: REST_REQUEST_TIMEOUT_MS,
+      }))
+      return
+    }
     const patch = this.rest.im.v1.message.patch
     if (patch !== undefined) {
       await callLarkApi('message.patch', () => patch({

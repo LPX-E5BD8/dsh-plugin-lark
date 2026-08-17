@@ -40,6 +40,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.1` | Schema 保持不变；在提交项目 Registry mutation binding 前，先实体化首条命令对应的 Session。 | 状态与 v0.9.0 兼容。回滚代码会重新引入项目 Registry 服务依赖缺陷，并移除首条命令所需的检查点实体化；应保留完整冷快照并优先前滚。 |
 | `0.9.2` | 所有持久化 schema 保持不变；修正 Card 2.0 payload 字段，并对 SDK 消息投递失败进行脱敏分类。 | 状态与 v0.9.1 兼容。回滚代码可能再次让受保护工具的审批卡不可用；旧路径仍默认拒绝，绝不会授权工具调用。 |
 | `0.9.3` | Conversation binding schema v2 与 Workspace domain v2 均保持不变。`/session resume` 会先检查点当前 transcript，再把现有 binding 原子指向一条已持久化且在当前作用域可见的 Session，并沿用现有 mutation-hash 窗口。不透明引用由运行时派生而非持久化；命令不会写入归档状态，也不会复制或删除 transcript。 | v0.9.2 会读取同一 binding，并继续使用 v0.9.3 选中的 Session，但没有 `/session` 列出/恢复命令。回滚不会撤销这次选择；归档状态与 Session log 均无需转换。 |
+| `0.9.4` | 不新增插件自有持久化 schema。结构化问题使用现有工具调用/结果 Session 事件，并在投递卡片前检查点待处理调用；pending request token 与答案都不会进入插件 sidecar。 | v0.9.3 会读取相同 binding、Workspace 与 Session log，但不会在 Lark 中拦截结构化问题。pending 卡片状态只存在于进程内，任何重启都会让旧卡片失效。在 `tool/result` 提交前已确认接收的答案不具备跨崩溃耐久性，可能需要重新提问。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -56,7 +57,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.3'
+target_tag='v0.9.4'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -185,8 +186,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 1. 使用相同的 app ID、`defaultSessionId`、存储 root、JSONL 压缩格式、canonical Workspace 路径、配置 overlay 与继承凭据，从相同 workspace 启动同一个 Harness `0.1.0-rc.6` profile。DSH rc.6 会拒绝 `.env` 中的 `DSH_*` 应用凭据；请按 README 使用启动进程/服务环境。
 2. 挂载 `webServer` 时，必须确认 `/api/lark/health` 返回 HTTP 200 且 `state: connected`。
 3. 先检查 `/help`，再列出 `/project`、`/session` 和 `/model`。在可丢弃的已注册 Workspace 中，用完整不透明引用恢复一条列表中的历史 Session，并核对预期 transcript、项目、模型、preset 与工具。列表可能显示由首条人类 prompt 派生的有界持久标题，因此只能使用非敏感测试内容。
-4. 验证无关私聊和群回复根无法使用该引用。再重启一次、重新列出并重复恢复检查，确认后才能接受迁移。
-5. 执行 `SMOKE_TESTS.md` 中与此次变更相关的真实凭据检查，包括 `/new`、会话导航、项目/模型继承、重启和 LRU 冷恢复；回滚窗口关闭前持续保留快照和旧检出目录。
+4. 在真实客户端中，通过直接 Native `ask_user_question` 完成可丢弃的单选、多选、自由文本与取消交互；确认答案恢复同一个 turn，终态卡片不包含答案或控件。升级前仍在等待的卡片重启后应失效；问题和答案中绝不能包含凭据。
+5. 验证无关私聊和群回复根无法使用该引用。再重启一次、重新列出并重复恢复检查，确认后才能接受迁移。
+6. 执行 `SMOKE_TESTS.md` 中与此次变更相关的真实凭据检查，包括 `/new`、结构化输入、会话导航、项目/模型继承、重启和 LRU 冷恢复；回滚窗口关闭前持续保留快照和旧检出目录。
 
 每条已处理的验证消息都会推进入站回执。之后若恢复旧快照，这些回执会倒退并可能允许平台重投；请使用可丢弃的检查并核对外部副作用。
 
@@ -200,8 +202,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.3 回滚到 | 状态处理方式 |
+| 从 v0.9.4 回滚到 | 状态处理方式 |
 | --- | --- |
+| v0.9.3 | 使用相同的 v2 conversation binding、Workspace domain 与 Session log。结构化卡片处理能力及其进程内 pending 状态会消失；必须先优雅停机。已发送卡片会留在聊天中并处于终态或 stale，所有未完成操作都会被拒绝。已经作为普通工具结果提交的答案仍保留在 transcript 中。 |
 | v0.9.2 | 使用相同的 v2 conversation binding、Workspace domain 与 Session log。v0.9.3 选中的 Session 会继续保持 active，因为 v0.9.2 会遵循该已提交 binding；但 `/session` 列出/恢复命令会消失，回滚也不会恢复先前 active 的 Session。v0.9.3 没有引入归档、取消归档、删除或搜索状态。 |
 | v0.9.1 | 无需转换持久化状态。旧版 Card payload 可能被飞书拒绝，因此审批可能不可用，但仍保持默认拒绝；必须保留完整快照，并优先通过前滚恢复。 |
 | v0.9.0 | 使用相同的 v2 binding 与 Workspace schema；v0.9.1 已实体化的 Session 仍可读取，但 v0.9.0 会重新引入项目 Registry 检查点失败，并缺少安全的首条命令实体化。必须保留完整快照，并优先通过前滚恢复。 |
