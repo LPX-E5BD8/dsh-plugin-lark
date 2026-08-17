@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.9.1'
-const BASELINE_COMMIT = 'bea0aff12a95538fd6666e8efc9e360704306e0a'
-const BASELINE_DIGEST = 'sha256:0d06188ab70bcfd935cf843402fa273ee737ad486b4d8982bf58e7f69db6331c'
+const BASELINE_TAG = 'v0.9.2'
+const BASELINE_COMMIT = 'fd867909c007cbc3307d803a6549a8be99890a31'
+const BASELINE_DIGEST = 'sha256:6a17ce1eb920e7e6d8051d3f030a9075d8d9ce5e245d3ac4006b507ddb1c064d'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 
@@ -228,7 +228,15 @@ test('profile smoke proves clean install and in-place upgrade composition', () =
 
   assert.match(profileSmoke, /const deepseekScope = join\(home, 'profiles', 'node_modules', '@deepseek-ai'\)/u)
   assert.match(profileSmoke, /filter\(\(entry\) => entry\.name\.startsWith\('dsh-'\)\)/u)
-  assert.match(profileSmoke, /packageDirectories\.includes\('dsh-workspace'\)/u)
+  for (const required of [
+    'dsh-session-projection',
+    'dsh-session-query',
+    'dsh-session-query-sqlite',
+    'dsh-session-title',
+    'dsh-workspace',
+  ]) {
+    assert.match(profileSmoke, new RegExp(`'${required}'`, 'u'))
+  }
   assert.match(profileSmoke, /manifest\.version,[\s\S]*expectedDshVersion,[\s\S]*drifted outside the supported Harness cohort/u)
   assert.match(profileSmoke, /\['cordis', '4\.0\.1'\],[\s\S]*\['schemastery', '3\.18\.1'\]/u)
   assert.equal([...profileSmoke.matchAll(/await assertHarnessFallback\(/gu)].length, 3)

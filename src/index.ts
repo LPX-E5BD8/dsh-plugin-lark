@@ -130,6 +130,7 @@ export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<v
         model: config.model,
         streamUpdateIntervalMs: config.streamUpdateIntervalMs,
         maxConversationHandles: config.maxConversationHandles,
+        sessionReferenceNamespace: appId,
       })
       await bridge.start()
     } catch (error) {

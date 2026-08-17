@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { renameSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
@@ -104,6 +105,9 @@ async function settleSend(client: ProjectClient, chatId: string, text: string): 
 interface ProjectSession {
   readonly id: string
   readonly header: {
+    readonly version: number
+    readonly id: string
+    readonly createdAt: number
     readonly cwd?: string
     readonly agentPreset?: string
   }
@@ -265,9 +269,18 @@ class ProjectHost {
   readonly workspaceResolveCalls: string[] = []
   readonly workspaceCreateCalls: Array<{ readonly path: string; readonly title: string }> = []
   readonly workspaceDeleteCalls: string[] = []
+  readonly sessionTitles = new Map<string, string>()
+  readonly archivedSessionIds: string[] = []
+  archivedSessionIdsReads = 0
+  archivedSessionIdsReadHandler?: (read: number) => void
+  sessionQueryListCalls = 0
+  sessionQueryListHandler?: (call: number) => Promise<void> | void
+  sessionTitleHeaderOverride?: Partial<ProjectSession['header']>
+  resumeHandler?: (sessionId: string, signal: AbortSignal | undefined) => Promise<void>
   workspaceRegistryAvailable = true
   workspaceRegistryMutable = true
   sessionPersistenceAvailable = true
+  sessionQueryAvailable = true
   defaultPreset = 'coding'
   createError?: Error
   bindingPutError?: Error
@@ -305,9 +318,15 @@ class ProjectHost {
     get: (name: string) => {
       if (name === 'approval') return {}
       if (name === 'workspaceRegistry' && this.workspaceRegistryAvailable) {
+        const host = this
         this.workspaceRegistryService ??= {
           list: () => [...this.workspaces],
           get: (id: unknown) => this.workspaces.find((workspace) => workspace.id === String(id)),
+          get archivedSessionIds() {
+            host.archivedSessionIdsReads += 1
+            host.archivedSessionIdsReadHandler?.(host.archivedSessionIdsReads)
+            return host.archivedSessionIds
+          },
           resolveByPath: async (path: string) => {
             this.workspaceResolveCalls.push(path)
             return this.workspaceResolveHandler === undefined
@@ -337,6 +356,37 @@ class ProjectHost {
           },
         }
       }
+      if (name === 'sessionQuery' && this.sessionQueryAvailable) {
+        return {
+          listSessions: async () => {
+            this.sessionQueryListCalls += 1
+            await this.sessionQueryListHandler?.(this.sessionQueryListCalls)
+            const ids = new Set([...this.persisted.keys(), ...this.liveSessions.keys()])
+            return [...ids].map((id) => {
+              const session = this.liveSessions.get(id) ?? this.persisted.get(id)
+              assert.ok(session !== undefined)
+              return {
+                header: { id, ...session.header },
+                live: this.liveSessions.has(id),
+                persisted: this.persisted.has(id),
+              }
+            }).sort((left, right) => right.header.createdAt - left.header.createdAt)
+          },
+          readTitleSnapshots: async (ids: readonly string[]) => ids.map((id) => {
+            const session = this.liveSessions.get(id) ?? this.persisted.get(id)
+            if (session === undefined) return { sessionId: id, status: 'rejected' as const, reason: new Error('missing') }
+            const title = this.sessionTitles.get(id)
+            return {
+              sessionId: id,
+              status: 'fulfilled' as const,
+              value: {
+                session: { id, ...session.header, ...this.sessionTitleHeaderOverride },
+                ...(title === undefined ? {} : { title: { title } }),
+              },
+            }
+          }),
+        }
+      }
       if (name === 'agentPresets') {
         return {
           resolve: async (id?: string) => ({ id: id ?? this.defaultPreset }),
@@ -364,12 +414,13 @@ class ProjectHost {
     agents: {
       create: (options: {
         sessionId: unknown
-        meta?: { cwd?: string; agentPreset?: string }
+        meta?: { cwd?: string; agentPreset?: string; createdAt?: number }
         seed?: readonly unknown[]
         setup?: (agentCtx: unknown) => Promise<unknown> | unknown
       }) => this.create(options),
       resume: (options: {
         resumeSessionId: unknown
+        signal?: AbortSignal
         setup?: (agentCtx: unknown) => Promise<unknown> | unknown
       }) => this.resume(options),
       get: (id: unknown) => this.liveAgents.get(String(id)),
@@ -389,6 +440,39 @@ class ProjectHost {
 
   planBindingPut(plan: BindingPutPlan): void {
     this.bindingPutPlans.push(plan)
+  }
+
+  seedPersisted(
+    sessionId: string,
+    options: {
+      readonly cwd: string
+      readonly createdAt: number
+      readonly title?: string
+      readonly agentPreset?: string
+      readonly events?: readonly unknown[]
+    },
+  ): ProjectSession {
+    const events = [...(options.events ?? [{ type: 'todo/write', data: { todos: [] } }])]
+    const session: ProjectSession = {
+      id: sessionId,
+      header: {
+        version: 0,
+        id: sessionId,
+        createdAt: options.createdAt,
+        cwd: options.cwd,
+        ...(options.agentPreset === undefined ? {} : { agentPreset: options.agentPreset }),
+      },
+      events,
+      append(type, data) {
+        const event = { type, data }
+        events.push(event)
+        return event
+      },
+      requestContext: () => undefined,
+    }
+    this.persisted.set(sessionId, session)
+    if (options.title !== undefined) this.sessionTitles.set(sessionId, options.title)
+    return session
   }
 
   private async createWorkspace(path: string, title: string): Promise<TestWorkspace> {
@@ -450,7 +534,7 @@ class ProjectHost {
 
   private async create(options: {
     sessionId: unknown
-    meta?: { cwd?: string; agentPreset?: string }
+    meta?: { cwd?: string; agentPreset?: string; createdAt?: number }
     seed?: readonly unknown[]
     setup?: (agentCtx: unknown) => Promise<unknown> | unknown
   }) {
@@ -470,6 +554,9 @@ class ProjectHost {
     const session: ProjectSession = {
       id: sessionId,
       header: {
+        version: 0,
+        id: sessionId,
+        createdAt: options.meta?.createdAt ?? Date.now(),
         ...(options.meta?.cwd === undefined ? {} : { cwd: options.meta.cwd }),
         ...(options.meta?.agentPreset === undefined ? {} : { agentPreset: options.meta.agentPreset }),
       },
@@ -516,11 +603,13 @@ class ProjectHost {
 
   private async resume(options: {
     resumeSessionId: unknown
+    signal?: AbortSignal
     setup?: (agentCtx: unknown) => Promise<unknown> | unknown
   }) {
     const sessionId = String(options.resumeSessionId)
     const stored = this.persisted.get(sessionId)
     if (stored === undefined) throw new Error(`session "${sessionId}" not found`)
+    await this.resumeHandler?.(sessionId, options.signal)
     this.resumes.push(sessionId)
     return this.create({
       sessionId,
@@ -551,6 +640,21 @@ function standardWorkspaces(): TestWorkspace[] {
   ]
 }
 
+async function navigableWorkspaces(
+  t: { after(callback: () => void | Promise<void>): void },
+): Promise<TestWorkspace[]> {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-session-workspaces-'))
+  const alpha = join(root, 'alpha')
+  const beta = join(root, 'beta')
+  await mkdir(alpha)
+  await mkdir(beta)
+  t.after(() => rm(root, { recursive: true, force: true }))
+  return [
+    new TestWorkspace(WORKSPACE_IDS.alpha, 'Alpha Repo', await realpath(alpha)),
+    new TestWorkspace(WORKSPACE_IDS.beta, 'Beta Repo', await realpath(beta)),
+  ]
+}
+
 function mount(
   t: { after(callback: () => void | Promise<void>): void },
   workspaces: readonly TestWorkspace[] = standardWorkspaces(),
@@ -559,6 +663,8 @@ function mount(
     workspaceRegistryAvailable?: boolean
     workspaceRegistryMutable?: boolean
     sessionPersistenceAvailable?: boolean
+    sessionQueryAvailable?: boolean
+    sessionReferenceNamespace?: string
     projectManageFrom?: string[]
     allowFrom?: string[]
     allowAllUsers?: boolean
@@ -569,6 +675,7 @@ function mount(
   host.workspaceRegistryAvailable = options.workspaceRegistryAvailable ?? true
   host.workspaceRegistryMutable = options.workspaceRegistryMutable ?? true
   host.sessionPersistenceAvailable = options.sessionPersistenceAvailable ?? true
+  host.sessionQueryAvailable = options.sessionQueryAvailable ?? true
   const client = createClient()
   const bridge = new LarkBridge(host.ctx as never, {
     client,
@@ -586,11 +693,854 @@ function mount(
     projectManageFrom: options.projectManageFrom ?? ['owner'],
     cwd: options.cwd ?? '/srv/default-repo',
     defaultSessionId: options.defaultSessionId,
+    sessionReferenceNamespace: options.sessionReferenceNamespace ?? 'test-app',
   })
   void bridge.start()
   t.after(() => bridge.stop())
   return { host, client, bridge }
 }
+
+function seedSessionNavigation(host: ProjectHost, workspace: TestWorkspace, chatId: string): {
+  readonly baseId: string
+  readonly historicalId: string
+  readonly currentId: string
+} {
+  const baseId = `lark:${chatId}`
+  const historicalId = baseId
+  const currentId = `${baseId}:1-00000000-0000-4000-8000-000000000001`
+  host.seedPersisted(historicalId, {
+    cwd: workspace.path,
+    createdAt: 1_000,
+    title: 'Old <at user_id="all"> session\nline',
+    agentPreset: 'coding',
+  })
+  host.seedPersisted(currentId, {
+    cwd: workspace.path,
+    createdAt: 2_000,
+    title: 'Current session',
+    agentPreset: 'coding',
+  })
+  workspace.sessionIds.push(currentId, historicalId)
+  host.bindings.set(baseId, {
+    generation: 1,
+    suffix: '1-00000000-0000-4000-8000-000000000001',
+    modelSelection: null,
+    mutationHashes: [],
+  })
+  return { baseId, historicalId, currentId }
+}
+
+test('/session lists only scoped opaque references and resumes committed history', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-nav')
+
+  await send(client, 'session-nav', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  assert.equal(host.creates.length, 0, 'session listing unexpectedly opened an Agent')
+  const references = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)].map(([reference]) => reference)
+  assert.equal(references.length, 2)
+  assert.equal(new Set(references).size, 2)
+  assert.doesNotMatch(catalog, /<at|[\r\n]line/u)
+  assert.equal(catalog.includes(workspaces[0]!.path), false)
+  assert.equal(catalog.includes(seeded.historicalId), false)
+  assert.equal(catalog.includes(seeded.currentId), false)
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  assert.ok(currentLine !== undefined)
+  const historicalReference = references.find((reference) => !currentLine.includes(reference))
+  assert.ok(historicalReference !== undefined)
+
+  await send(client, 'other-session-nav', `/session resume ${historicalReference}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+
+  await send(client, 'session-nav', `/session resume ${historicalReference}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /已恢复所选会话/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 0)
+  assert.equal(host.resumes.includes(seeded.historicalId), true)
+
+  t.mock.method(Date, 'now', () => 0)
+  await send(client, 'session-nav', '/new')
+  const resetGeneration = Number(/^.+:(\d+)-/u.exec(host.latestCreate().sessionId)?.[1])
+  assert.equal(resetGeneration, 2)
+})
+
+test('/session hides archived or externally live history and keeps failures on the current binding', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-guard')
+
+  await send(client, 'session-guard', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+
+  host.planFlush({ result: false })
+  await send(client, 'session-guard', `/session resume ${reference}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /无法确认当前会话历史/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.deepEqual(host.resumes, [seeded.currentId])
+
+  const external = await host.ctx.agents.resume({ resumeSessionId: seeded.historicalId })
+  await send(client, 'session-guard', `/session resume ${reference}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  await external.dispose()
+
+  host.archivedSessionIds.push(seeded.historicalId)
+  await send(client, 'session-guard', '/session list')
+  assert.equal(([...(client.sent.at(-1)?.text ?? '').matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 1)
+})
+
+test('/session disposes a resumed candidate whose durability checkpoint fails', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-candidate-failure')
+  await send(client, 'session-candidate-failure', '/help')
+  await send(client, 'session-candidate-failure', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  host.planFlush({ result: true })
+  host.planFlush({ result: false })
+
+  await send(client, 'session-candidate-failure', `/session resume ${reference}`)
+
+  assert.match(client.sent.at(-1)?.text ?? '', /会话恢复失败/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.resumes.includes(seeded.historicalId), true)
+  assert.equal(host.disposals.includes(seeded.historicalId), true)
+  assert.equal(host.liveAgents.has(seeded.historicalId), false)
+})
+
+test('/session preserves target work admitted during the candidate checkpoint', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-candidate-work')
+  await send(client, 'session-candidate-work', '/help')
+  await send(client, 'session-candidate-work', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const candidateCheckpoint = deferred<void>()
+  host.planFlush({ result: true })
+  host.planFlush({ result: true, wait: candidateCheckpoint.promise })
+
+  const resuming = send(client, 'session-candidate-work', `/session resume ${reference}`)
+  await waitFor(
+    () => host.flushCalls.filter((id) => id === seeded.historicalId).length === 1,
+    'candidate durability checkpoint did not start',
+  )
+  const targetAgent = host.liveAgents.get(seeded.historicalId)
+  assert.ok(targetAgent !== undefined)
+  t.after(() => targetAgent.finishPending())
+  targetAgent.followup({ kind: 'checkpoint-target-work' })
+  candidateCheckpoint.resolve()
+  await resuming
+
+  assert.match(client.sent.at(-1)?.text ?? '', /仍有执行或待处理消息/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.liveAgents.has(seeded.historicalId), true)
+  assert.equal(host.disposals.includes(seeded.historicalId), false)
+  targetAgent.finishPending()
+  await waitFor(
+    () => !host.liveAgents.has(seeded.historicalId),
+    'checkpoint-raced candidate did not retire after admitted work became durable',
+  )
+  assert.equal(host.persisted.get(seeded.historicalId)?.events.some((event) => (
+    (event as { data?: { kind?: string } }).data?.kind === 'checkpoint-target-work'
+  )), true)
+})
+
+test('/session retains a rolled-back candidate without spinning when retirement is not durable', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-retirement-failure')
+  await send(client, 'session-retirement-failure', '/help')
+  await send(client, 'session-retirement-failure', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const finalValidationCall = host.sessionQueryListCalls + 3
+  host.sessionQueryListHandler = (call) => {
+    if (call === finalValidationCall) host.archivedSessionIds.push(seeded.historicalId)
+  }
+  host.planFlush({ result: true })
+  host.planFlush({ result: true })
+  host.planFlush({ error: new Error('retirement persistence unavailable') })
+
+  await send(client, 'session-retirement-failure', `/session resume ${reference}`)
+  await yieldTurn()
+  const targetFlushes = (): number => host.flushCalls.filter((id) => id === seeded.historicalId).length
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.liveAgents.has(seeded.historicalId), true)
+  assert.equal(targetFlushes(), 2)
+  await delay(20)
+  assert.equal(targetFlushes(), 2)
+  await send(client, 'session-retirement-unrelated', '/help')
+  assert.match(client.sent.at(-1)?.text ?? '', /\/session resume/u)
+})
+
+test('/session disposes a candidate when the historical Agent cannot be resumed', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-resume-failure')
+  await send(client, 'session-resume-failure', '/help')
+  await send(client, 'session-resume-failure', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  host.createError = new Error('candidate resume failed')
+
+  await send(client, 'session-resume-failure', `/session resume ${reference}`)
+
+  assert.match(client.sent.at(-1)?.text ?? '', /会话恢复失败/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.liveAgents.has(seeded.historicalId), false)
+})
+
+test('/session cancels a pre-publication historical resume during shutdown', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client, bridge } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-resume-cancel')
+  await send(client, 'session-resume-cancel', '/help')
+  await send(client, 'session-resume-cancel', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const resumeEntered = deferred<void>()
+  let observedSignal: AbortSignal | undefined
+  host.resumeHandler = async (sessionId, signal) => {
+    if (sessionId !== seeded.historicalId) return
+    observedSignal = signal
+    resumeEntered.resolve()
+    if (signal === undefined) await new Promise<never>(() => {})
+    if (signal.aborted) throw signal.reason
+    await new Promise<void>((_resolve, reject) => {
+      signal.addEventListener('abort', () => { reject(signal.reason) }, { once: true })
+    })
+  }
+
+  const resuming = settleSend(client, 'session-resume-cancel', `/session resume ${reference}`)
+  await resumeEntered.promise
+  const stopping = bridge.stop()
+  await Promise.race([
+    stopping,
+    delay(500).then(() => { throw new Error('bridge stop did not cancel candidate resume') }),
+  ])
+  await resuming
+
+  assert.equal(observedSignal?.aborted, true)
+  assert.equal(host.liveAgents.has(seeded.historicalId), false)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+})
+
+test('/session rechecks pending work after final target validation', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-final-race')
+  await send(client, 'session-final-race', '/help')
+  await send(client, 'session-final-race', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const oldAgent = host.liveAgents.get(seeded.currentId)
+  assert.ok(oldAgent !== undefined)
+  const finalValidationEntered = deferred<void>()
+  const releaseFinalValidation = deferred<void>()
+  const finalValidationCall = host.sessionQueryListCalls + 3
+  host.sessionQueryListHandler = async (call) => {
+    if (call !== finalValidationCall) return
+    finalValidationEntered.resolve()
+    await releaseFinalValidation.promise
+  }
+
+  const resuming = send(client, 'session-final-race', `/session resume ${reference}`)
+  await finalValidationEntered.promise
+  assert.equal(host.liveAgents.has(seeded.historicalId), true)
+  oldAgent.followup({ kind: 'external-work' })
+  releaseFinalValidation.resolve()
+  await resuming
+
+  assert.match(client.sent.at(-1)?.text ?? '', /仍有执行或待处理消息/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.disposals.includes(seeded.historicalId), true)
+  assert.equal(host.liveAgents.has(seeded.historicalId), false)
+  oldAgent.finishPending()
+})
+
+test('/session rolls back when the target is archived during final validation', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-archive-race')
+  await send(client, 'session-archive-race', '/help')
+  await send(client, 'session-archive-race', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const finalValidationEntered = deferred<void>()
+  const releaseFinalValidation = deferred<void>()
+  const finalValidationCall = host.sessionQueryListCalls + 3
+  host.sessionQueryListHandler = async (call) => {
+    if (call !== finalValidationCall) return
+    finalValidationEntered.resolve()
+    await releaseFinalValidation.promise
+  }
+
+  const resuming = send(client, 'session-archive-race', `/session resume ${reference}`)
+  await finalValidationEntered.promise
+  const targetAgent = host.liveAgents.get(seeded.historicalId)
+  assert.ok(targetAgent !== undefined)
+  t.after(() => targetAgent.finishPending())
+  targetAgent.followup({ kind: 'external-target-work' })
+  host.archivedSessionIds.push(seeded.historicalId)
+  releaseFinalValidation.resolve()
+  await resuming
+
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.disposals.includes(seeded.historicalId), false)
+  assert.equal(host.liveAgents.has(seeded.historicalId), true)
+  targetAgent.finishPending()
+  await waitFor(
+    () => !host.liveAgents.has(seeded.historicalId),
+    'rolled-back target was not retired after admitted work became durable',
+  )
+  assert.equal(host.persisted.get(seeded.historicalId)?.events.some((event) => (
+    (event as { data?: { kind?: string } }).data?.kind === 'external-target-work'
+  )), true)
+})
+
+test('/session rolls back when the target Workspace is removed after the async status snapshot', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-workspace-race')
+  await send(client, 'session-workspace-race', '/help')
+  await send(client, 'session-workspace-race', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const finalQueryEntered = deferred<void>()
+  const releaseStatus = deferred<void>()
+  const finalValidationCall = host.sessionQueryListCalls + 3
+  const finalStatusCall = workspaces[0]!.statusCalls.length + 3
+  host.sessionQueryListHandler = (call) => {
+    if (call !== finalValidationCall) return
+    workspaces[0]!.statusWait = releaseStatus.promise
+    finalQueryEntered.resolve()
+  }
+
+  const resuming = send(client, 'session-workspace-race', `/session resume ${reference}`)
+  await finalQueryEntered.promise
+  await waitFor(
+    () => workspaces[0]!.statusCalls.length === finalStatusCall,
+    'final session validation did not enter the deferred Workspace status check',
+  )
+  const removed = host.workspaces.splice(
+    host.workspaces.findIndex((workspace) => workspace.id === workspaces[0]!.id),
+    1,
+  )
+  assert.equal(removed.length, 1)
+  releaseStatus.resolve()
+  await resuming
+
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.disposals.includes(seeded.historicalId), true)
+  assert.equal(host.liveAgents.has(seeded.historicalId), false)
+})
+
+test('/session closes the async-return authority window before committing a resumed target', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-authority-return-race')
+  await send(client, 'session-authority-return-race', '/help')
+  await send(client, 'session-authority-return-race', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const finalValidationCall = host.sessionQueryListCalls + 3
+  let finalAuthorityReads = 0
+  let archiveScheduled = false
+  host.archivedSessionIdsReadHandler = () => {
+    if (host.sessionQueryListCalls !== finalValidationCall) return
+    finalAuthorityReads += 1
+    if (finalAuthorityReads !== 2 || archiveScheduled) return
+    archiveScheduled = true
+    queueMicrotask(() => { host.archivedSessionIds.push(seeded.historicalId) })
+  }
+
+  await send(client, 'session-authority-return-race', `/session resume ${reference}`)
+
+  assert.equal(archiveScheduled, true)
+  assert.equal(finalAuthorityReads >= 3, true)
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.disposals.includes(seeded.historicalId), true)
+  assert.equal(host.liveAgents.has(seeded.historicalId), false)
+})
+
+test('/session rechecks exact Workspace availability after the async candidate returns', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-directory-return-race')
+  await send(client, 'session-directory-return-race', '/help')
+  await send(client, 'session-directory-return-race', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const finalValidationCall = host.sessionQueryListCalls + 3
+  let finalAuthorityReads = 0
+  let directoryMoved = false
+  const movedPath = `${workspaces[0]!.path}-removed`
+  host.archivedSessionIdsReadHandler = () => {
+    if (host.sessionQueryListCalls !== finalValidationCall) return
+    finalAuthorityReads += 1
+    if (finalAuthorityReads !== 2 || directoryMoved) return
+    directoryMoved = true
+    queueMicrotask(() => { renameSync(workspaces[0]!.path, movedPath) })
+  }
+
+  await send(client, 'session-directory-return-race', `/session resume ${reference}`)
+
+  assert.equal(directoryMoved, true)
+  assert.equal(finalAuthorityReads >= 3, true)
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(host.disposals.includes(seeded.historicalId), true)
+})
+
+test('/session commits a target binding confirmed by read-back after a published write error', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-binding-confirmation')
+  await send(client, 'session-binding-confirmation', '/help')
+  await send(client, 'session-binding-confirmation', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  host.planBindingPut({})
+  host.planBindingPut({
+    error: new Error('published receipt was lost'),
+    published: true,
+    visible: true,
+  })
+  const bindingCount = host.bindingPuts.length
+
+  await send(client, 'session-binding-confirmation', `/session resume ${reference}`)
+
+  assert.match(client.sent.at(-1)?.text ?? '', /已恢复所选会话/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 0)
+  assert.equal(host.bindingPuts.length, bindingCount + 2)
+  assert.equal(host.disposals.includes(seeded.historicalId), false)
+})
+
+test('/session hides a non-current live Handle retained by commit-forward work', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-owned-live')
+  await send(client, 'session-owned-live', '/help')
+  await send(client, 'session-owned-live', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const references = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)].map(([value]) => value)
+  const previousCurrentReference = references.find((value) => currentLine?.includes(value) === true)
+  const oldReference = references.find((value) => currentLine?.includes(value) !== true)
+  assert.ok(previousCurrentReference !== undefined)
+  assert.ok(oldReference !== undefined)
+  const oldAgent = host.liveAgents.get(seeded.currentId)
+  assert.ok(oldAgent !== undefined)
+  t.after(() => oldAgent.finishPending())
+  const targetBinding = deferred<void>()
+  host.planBindingPut({})
+  host.planBindingPut({ wait: targetBinding.promise })
+  const bindingCount = host.bindingPuts.length
+
+  const resuming = send(client, 'session-owned-live', `/session resume ${oldReference}`)
+  await waitFor(
+    () => host.bindingPuts.length === bindingCount + 2,
+    'session resume did not reach its final binding commit',
+  )
+  const targetAgent = host.liveAgents.get(seeded.historicalId)
+  assert.ok(targetAgent !== undefined)
+  t.after(() => targetAgent.finishPending())
+  oldAgent.followup({ kind: 'accepted-during-commit' })
+  targetAgent.followup({ kind: 'target-work-during-commit' })
+  targetBinding.resolve()
+  await resuming
+  assert.match(client.sent.at(-1)?.text ?? '', /已恢复所选会话/u)
+  assert.equal(host.liveAgents.has(seeded.currentId), true)
+  assert.equal(host.disposals.includes(seeded.historicalId), false)
+
+  await send(client, 'session-owned-live', '/session')
+  const after = client.sent.at(-1)?.text ?? ''
+  assert.equal(([...after.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 1)
+  assert.equal(after.includes(oldReference), true)
+  assert.equal(after.includes(previousCurrentReference), false)
+  await send(client, 'session-owned-live', `/session resume ${previousCurrentReference}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+
+  oldAgent.finishPending()
+  targetAgent.finishPending()
+  await waitFor(
+    () => !host.liveAgents.has(seeded.currentId),
+    'retained old session was not retired after pending work settled',
+  )
+})
+
+test('/session keeps a stale current generation visible within the bounded catalog', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const baseId = 'lark:session-current-cap'
+  host.seedPersisted(baseId, {
+    cwd: workspaces[0]!.path,
+    createdAt: 1,
+    title: 'Old current session',
+  })
+  const ids = [baseId]
+  for (let generation = 1; generation <= 201; generation += 1) {
+    const id = `${baseId}:${generation}-${String(generation).padStart(8, '0')}-0000-4000-8000-000000000001`
+    ids.push(id)
+    host.seedPersisted(id, {
+      cwd: workspaces[0]!.path,
+      createdAt: 1_000 + generation,
+      title: `Newer session ${generation}`,
+    })
+  }
+  workspaces[0]!.sessionIds.push(...ids)
+  host.bindings.set(baseId, {
+    generation: 0,
+    suffix: null,
+    modelSelection: null,
+    mutationHashes: [],
+  })
+
+  await send(client, 'session-current-cap', '/session')
+
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLines = catalog.split('\n').filter((line) => line.includes('[当前]'))
+  assert.equal(currentLines.length, 1)
+  assert.match(currentLines[0] ?? '', /Old current session/u)
+  assert.match(catalog, /可恢复会话 1\/20/u)
+  assert.match(catalog, /还有更多会话未显示/u)
+  assert.equal(([...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 10)
+})
+
+test('/session fails historical authority closed when the Workspace index exceeds its scan bound', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-index-cap')
+  await send(client, 'session-index-cap', '/session')
+  const initial = client.sent.at(-1)?.text ?? ''
+  const currentLine = initial.split('\n').find((line) => line.includes('[当前]'))
+  const historicalReference = [...initial.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(historicalReference !== undefined)
+
+  for (let generation = 2; generation < 1_000; generation += 1) {
+    const id = `${seeded.baseId}:${generation}-${generation.toString(16).padStart(8, '0')}-0000-4000-8000-000000000001`
+    host.seedPersisted(id, {
+      cwd: workspaces[0]!.path,
+      createdAt: 2_000 + generation,
+      title: `Indexed session ${generation}`,
+    })
+    workspaces[0]!.sessionIds.push(id)
+  }
+  assert.equal(workspaces[0]!.sessionIds.length, 1_000)
+  const beyondId = `${seeded.baseId}:1000-000003e8-0000-4000-8000-000000000001`
+  host.seedPersisted(beyondId, {
+    cwd: workspaces[1]!.path,
+    createdAt: 10_000,
+    title: 'Beyond index bound',
+  })
+  workspaces[1]!.sessionIds.push(seeded.historicalId, beyondId)
+
+  await send(client, 'session-index-cap', '/session')
+  const bounded = client.sent.at(-1)?.text ?? ''
+  assert.equal(([...bounded.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 1)
+  assert.match(bounded, /还有更多会话未显示/u)
+  await send(client, 'session-index-cap', `/session resume ${historicalReference}`)
+
+  assert.match(client.sent.at(-1)?.text ?? '', /没有该可恢复会话引用/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+})
+
+test('/session ignores an oversized missing Workspace when authorizing available history', async (t) => {
+  const available = await navigableWorkspaces(t)
+  const missing = new TestWorkspace(
+    WORKSPACE_IDS.missing,
+    'Missing oversized Workspace',
+    `${available[0]!.path}-missing`,
+    Array.from({ length: 16 }, () => 'missing-dir' as const),
+  )
+  for (let index = 0; index <= 1_000; index += 1) {
+    missing.sessionIds.push(`missing-session-${index}`)
+  }
+  const { host, client } = mount(t, [missing, ...available])
+  const seeded = seedSessionNavigation(host, available[0]!, 'session-missing-index')
+
+  await send(client, 'session-missing-index', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  assert.equal(([...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 2)
+  await send(client, 'session-missing-index', `/session resume ${reference}`)
+
+  assert.match(client.sent.at(-1)?.text ?? '', /已恢复所选会话/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 0)
+})
+
+test('/session displays valid out-of-Date-range timestamps safely and rejects changed title sources', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-title-source')
+  const historical = host.persisted.get(seeded.historicalId)
+  assert.ok(historical !== undefined)
+  ;(historical.header as { createdAt: number }).createdAt = Number.MAX_SAFE_INTEGER
+
+  await send(client, 'session-title-source', '/session')
+  assert.match(client.sent.at(-1)?.text ?? '', /创建：时间未知/u)
+  assert.doesNotMatch(client.sent.at(-1)?.text ?? '', /会话导航暂不可用/u)
+
+  host.sessionTitleHeaderOverride = { agentPreset: 'changed-preset' }
+  await send(client, 'session-title-source', '/session')
+  assert.match(client.sent.at(-1)?.text ?? '', /会话导航暂不可用/u)
+})
+
+test('/session rejects a future Session format before it can poison the generation high-water mark', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-format-version')
+  const poisonId = `${seeded.baseId}:${Number.MAX_SAFE_INTEGER}-ffffffff-ffff-4fff-8fff-ffffffffffff`
+  const poison = host.seedPersisted(poisonId, {
+    cwd: workspaces[0]!.path,
+    createdAt: 3_000,
+  })
+  ;(poison.header as { version: number }).version = 1
+  host.persisted.delete(poisonId)
+  host.liveSessions.set(poisonId, poison)
+
+  await send(client, 'session-format-version', '/session')
+  assert.match(client.sent.at(-1)?.text ?? '', /会话导航暂不可用/u)
+  host.liveSessions.delete(poisonId)
+  t.mock.method(Date, 'now', () => 0)
+  await send(client, 'session-format-version', '/new')
+
+  assert.match(client.sent.at(-1)?.text ?? '', /已开始新会话/u)
+  const generation = Number(/^.+:(\d+)-/u.exec(host.latestCreate().sessionId)?.[1])
+  assert.equal(generation, 2)
+})
+
+test('/session resumes a Workspace-indexed history whose cwd uses a canonical alias', async (t) => {
+  const project = await temporaryProject(t)
+  const alias = join(project.root, 'project-alias')
+  await symlink(project.path, alias, 'dir')
+  const workspace = new TestWorkspace(WORKSPACE_IDS.alpha, 'Aliased Repo', project.path)
+  const { host, client } = mount(t, [workspace], { cwd: project.path })
+  const baseId = 'lark:session-cwd-alias'
+  const historicalId = baseId
+  const currentId = `${baseId}:1-00000000-0000-4000-8000-000000000001`
+  host.seedPersisted(historicalId, { cwd: alias, createdAt: 1_000, title: 'Aliased history' })
+  host.seedPersisted(currentId, { cwd: project.path, createdAt: 2_000, title: 'Current history' })
+  workspace.sessionIds.push(currentId, historicalId)
+  host.bindings.set(baseId, {
+    generation: 1,
+    suffix: '1-00000000-0000-4000-8000-000000000001',
+    modelSelection: null,
+    mutationHashes: [],
+  })
+
+  await send(client, 'session-cwd-alias', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  await send(client, 'session-cwd-alias', `/session resume ${reference}`)
+
+  assert.match(client.sent.at(-1)?.text ?? '', /已恢复所选会话/u)
+  assert.equal(host.bindings.get(baseId)?.generation, 0)
+})
+
+test('/session paginates a bounded catalog and never accepts a raw session id', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const baseId = 'lark:session-pages'
+  const ids: string[] = []
+  for (let generation = 0; generation < 13; generation += 1) {
+    const id = generation === 0
+      ? baseId
+      : `${baseId}:${generation}-${String(generation).padStart(8, '0')}-0000-4000-8000-000000000001`
+    ids.push(id)
+    host.seedPersisted(id, {
+      cwd: workspaces[0]!.path,
+      createdAt: 1_000 + generation,
+      title: `Session ${generation}`,
+    })
+  }
+  workspaces[0]!.sessionIds.push(...[...ids].reverse())
+  host.bindings.set(baseId, {
+    generation: 12,
+    suffix: '12-00000012-0000-4000-8000-000000000001',
+    modelSelection: null,
+    mutationHashes: [],
+  })
+
+  await send(client, 'session-pages', '/session')
+  assert.equal(([...(client.sent.at(-1)?.text ?? '').matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 10)
+  await send(client, 'session-pages', '/session list 2')
+  assert.equal(([...(client.sent.at(-1)?.text ?? '').matchAll(/s_[A-Za-z0-9_-]{43}/gu)]).length, 3)
+  await send(client, 'session-pages', '/session list 0')
+  assert.match(client.sent.at(-1)?.text ?? '', /用法：\/session/u)
+  await send(client, 'session-pages', `/session resume ${ids[0]}`)
+  assert.match(client.sent.at(-1)?.text ?? '', /用法：\/session/u)
+  assert.equal(host.bindings.get(baseId)?.generation, 12)
+})
+
+test('/session degrades without Session Query and does not create an Agent', async (t) => {
+  const { host, client } = mount(t, standardWorkspaces(), { sessionQueryAvailable: false })
+
+  await send(client, 'session-query-missing', '/session')
+
+  assert.match(client.sent.at(-1)?.text ?? '', /会话导航暂不可用/u)
+  assert.equal(host.creates.length, 0)
+})
+
+test('/session references are isolated by application namespace', async (t) => {
+  const firstWorkspaces = await navigableWorkspaces(t)
+  const secondWorkspaces = await navigableWorkspaces(t)
+  const first = mount(t, firstWorkspaces, { sessionReferenceNamespace: 'app-a' })
+  const second = mount(t, secondWorkspaces, { sessionReferenceNamespace: 'app-b' })
+  seedSessionNavigation(first.host, firstWorkspaces[0]!, 'session-app-scope')
+  seedSessionNavigation(second.host, secondWorkspaces[0]!, 'session-app-scope')
+
+  await send(first.client, 'session-app-scope', '/session')
+  await send(second.client, 'session-app-scope', '/session')
+  const firstReferences = [...(first.client.sent.at(-1)?.text ?? '').matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([reference]) => reference)
+  const secondReferences = new Set(
+    [...(second.client.sent.at(-1)?.text ?? '').matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+      .map(([reference]) => reference),
+  )
+
+  assert.equal(firstReferences.length, 2)
+  assert.equal(firstReferences.some((reference) => secondReferences.has(reference)), false)
+})
+
+test('/session resume replay cannot roll back a later reset', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client, bridge } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-replay')
+
+  await send(client, 'session-replay', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  const replay = { messageId: 'session-resume-replay' }
+  await send(client, 'session-replay', `/session resume ${reference}`, replay)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 0)
+
+  await send(client, 'session-replay', '/new')
+  const later = host.bindings.get(seeded.baseId)
+  assert.ok(later !== undefined && later.generation > 1)
+  await bridge.stop()
+  const hotReloaded = new LarkBridge(host.ctx as never, {
+    client,
+    inboundDeduplicator: {
+      has: () => false,
+      async complete(key) { host.completedInboundKeys.push(key) },
+    },
+    conversationBindings: {
+      read: (baseId) => host.bindings.get(baseId),
+      put: (baseId, binding) => host.putBinding(baseId, binding),
+      async close() {},
+    },
+    allowFrom: ['owner'],
+    projectManageFrom: ['owner'],
+    cwd: '/srv/default-repo',
+    sessionReferenceNamespace: 'test-app',
+  })
+  await hotReloaded.start()
+  t.after(() => hotReloaded.stop())
+  await send(client, 'session-replay', `/session resume ${reference}`, replay)
+
+  assert.deepEqual(host.bindings.get(seeded.baseId), later)
+  assert.match(client.sent.at(-1)?.text ?? '', /已处理/u)
+  assert.equal(host.resumes.filter((id) => id === seeded.historicalId).length, 1)
+})
+
+test('session generation exhaustion fails closed without replacing the current binding', async (t) => {
+  const workspaces = standardWorkspaces()
+  const { host, client } = mount(t, workspaces)
+  const baseId = 'lark:session-generation-limit'
+  const suffix = '9007199254740991-00000000-0000-4000-8000-000000000001'
+  const sessionId = `${baseId}:${suffix}`
+  host.seedPersisted(sessionId, {
+    cwd: workspaces[0]!.path,
+    createdAt: 1_000,
+  })
+  workspaces[0]!.sessionIds.push(sessionId)
+  const binding: ConversationBinding = {
+    generation: Number.MAX_SAFE_INTEGER,
+    suffix,
+    modelSelection: null,
+    mutationHashes: [],
+  }
+  host.bindings.set(baseId, binding)
+
+  await send(client, 'session-generation-limit', '/new')
+
+  assert.match(client.sent.at(-1)?.text ?? '', /无法安全开始新会话/u)
+  assert.equal(host.bindings.get(baseId)?.generation, binding.generation)
+  assert.equal(host.bindings.get(baseId)?.suffix, binding.suffix)
+  assert.deepEqual(host.bindings.get(baseId)?.mutationHashes, [])
+  assert.equal(host.creates.filter(({ sessionId: id }) => id !== sessionId).length, 0)
+})
 
 async function temporaryProject(
   t: { after(callback: () => void | Promise<void>): void },

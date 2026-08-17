@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { realpathSync, statSync } from 'node:fs'
 import { realpath, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -7,8 +8,8 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, LlmCallConfig, TokenUsage } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import { foldRequestHeader, SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
+import { foldRequestHeader, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import { CARD_ACTIONS, CARD_LIMITS, renderApprovalCard, renderApprovalDecisionCard, renderTurnCardWithMeta } from './cards.ts'
 import type { ToolCardItem, TurnCard, TurnCardStatus, TurnCardTodo, TurnCardUsage } from './cards.ts'
@@ -43,6 +44,7 @@ export interface LarkBridgeOptions {
   streamUpdateIntervalMs?: number
   maxConversationHandles?: number
   cwd?: string
+  sessionReferenceNamespace?: string
   client: LarkClientLike
   inboundDeduplicator?: InboundDeduplicator
   conversationBindings?: ConversationBindingStore
@@ -65,19 +67,47 @@ interface SessionBinding {
   readonly sessionId: ReturnType<typeof SessionId>
   readonly persisted: boolean
   readonly generation: number
+  readonly maxGeneration: number
   readonly agentPreset?: string
   readonly modelSelection: ConversationModelSelection | null
 }
 
 interface SessionPersistenceLike {
-  list(): Promise<ReadonlyArray<{
+  list(signal?: AbortSignal): Promise<ReadonlyArray<{
     id: ReturnType<typeof SessionId>
     agentPreset?: string
   }>>
-  inspect?(id: ReturnType<typeof SessionId>): Promise<{
+  inspect?(id: ReturnType<typeof SessionId>, signal?: AbortSignal): Promise<{
     readonly meta: { readonly agentPreset?: string }
     readonly events: ReadonlyArray<{ readonly type: string; readonly data: unknown }>
   }>
+}
+
+interface SessionQueryRecordLike {
+  readonly header: SessionHeader
+  readonly live: boolean
+  readonly persisted: boolean
+}
+
+type SessionTitleResultLike = {
+  readonly sessionId: ReturnType<typeof SessionId>
+  readonly status: 'fulfilled'
+  readonly value: {
+    readonly session: SessionQueryRecordLike['header']
+    readonly title?: { readonly title: string }
+  }
+} | {
+  readonly sessionId: ReturnType<typeof SessionId>
+  readonly status: 'rejected'
+  readonly reason: unknown
+}
+
+interface SessionQueryLike {
+  listSessions(signal?: AbortSignal): Promise<readonly SessionQueryRecordLike[]>
+  readTitleSnapshots(
+    sessionIds: readonly ReturnType<typeof SessionId>[],
+    signal?: AbortSignal,
+  ): Promise<readonly SessionTitleResultLike[]>
 }
 
 interface AgentPresetsLike {
@@ -143,6 +173,64 @@ interface WorkspaceRegistryLike {
   resolveByPath?(path: string): Promise<RegisteredWorkspace | undefined>
   create?(path: string, title: string): Promise<RegisteredWorkspace>
   delete?(id: string): Promise<boolean>
+  readonly archivedSessionIds?: ReadonlyArray<ReturnType<typeof SessionId>>
+}
+
+interface SessionWorkspaceIndex {
+  readonly workspaces: readonly RegisteredWorkspace[]
+  readonly bySession: ReadonlyMap<string, RegisteredWorkspace | null>
+  readonly archived: ReadonlySet<string>
+  readonly truncated: boolean
+}
+
+interface SynchronousSessionAuthority {
+  readonly registry: WorkspaceRegistryLike
+  readonly index: SessionWorkspaceIndex
+}
+
+interface ConversationSessionCandidate {
+  readonly sessionId: ReturnType<typeof SessionId>
+  readonly sourceHeader: SessionHeader
+  readonly generation: number
+  readonly reference: string
+  readonly createdAt: number
+  readonly cwd?: string
+  readonly agentPreset?: string
+  readonly workspace?: RegisteredWorkspace
+  readonly current: boolean
+}
+
+interface ListedConversationSession extends ConversationSessionCandidate {
+  readonly title?: string
+}
+
+interface ConversationSessionCandidates {
+  readonly items: readonly ConversationSessionCandidate[]
+  readonly truncated: boolean
+}
+
+type SessionSwitchCommandResult = {
+  readonly kind: 'resumed' | 'already-current'
+  readonly candidate: ConversationSessionCandidate
+} | {
+  readonly kind: 'busy' | 'history-failed' | 'unavailable' | 'unknown' | 'failed'
+}
+
+type SessionSwitchMaintenanceResult = {
+  readonly kind: 'committed'
+  readonly candidate: ConversationSessionCandidate
+  readonly previousSessionId: string
+  readonly previousHandle: AgentHandle
+} | {
+  readonly kind: 'busy' | 'history-failed' | 'unavailable' | 'unknown' | 'failed'
+}
+
+type SessionCandidateCommitResult = {
+  readonly kind: 'committed'
+  readonly candidate: ConversationSessionCandidate
+  readonly workspace: RegisteredWorkspace
+} | {
+  readonly kind: 'busy' | 'unavailable' | 'unknown' | 'failed'
 }
 
 interface ProjectSelection {
@@ -277,7 +365,7 @@ const GROUP_SESSION_SCOPE_VERSION = 'group-v1'
 const RECENT_INBOUND_LIMIT = 1024
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const INBOUND_MUTATION_HASH_DOMAIN = 'dsh-plugin-lark/conversation-mutation/v1'
-const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear', 'project', 'model'])
+const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear', 'project', 'session', 'model'])
 const UNSUPPORTED_RUNTIME_COMMANDS = new Set(['feedback', 'export'])
 const MODEL_CATALOG_PROVIDER_LIMIT = 32
 const MODEL_CATALOG_ENTRY_LIMIT = 128
@@ -291,6 +379,13 @@ const PROJECT_ID_LIMIT = 256
 const PROJECT_CONTROL_CHARACTER_TEST_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 const PROJECT_PATH_LIKE_TITLE_PATTERN = /^(?:[A-Za-z]:\S|file:(?:[/\\]|$)|[/\\]{1,2}|~(?:[/\\]|$)|\.{1,2}(?:[/\\]|$))/iu
 const PROJECT_PLATFORM_TAG_TEST_PATTERN = /<[^>]*>/u
+const SESSION_REFERENCE_HASH_DOMAIN = 'dsh-plugin-lark/session-reference/v1'
+const SESSION_REFERENCE_PATTERN = /^s_[A-Za-z0-9_-]{43}$/u
+const SESSION_LIST_PAGE_SIZE = 10
+const SESSION_CANDIDATE_LIMIT = 200
+const SESSION_WORKSPACE_INDEX_LIMIT = 1_000
+const SESSION_CREATED_AT_MAX = 8_640_000_000_000_000
+const SESSION_TITLE_SOURCE_CODE_UNIT_LIMIT = 4_096
 const WORKSPACE_REGISTRIES_REQUIRING_REMOUNT = new WeakSet<object>()
 
 const APPROVAL_DECISION = {
@@ -484,6 +579,38 @@ function sessionGeneration(baseId: string, sessionId: string): number | undefine
   return Number.isSafeInteger(generation) && generation > 0 ? generation : undefined
 }
 
+function sessionReference(namespace: string, baseId: string, sessionId: string): string {
+  const hash = createHash('sha256').update(SESSION_REFERENCE_HASH_DOMAIN)
+  for (const value of [namespace, baseId, sessionId]) {
+    hash.update('\0').update(String(Buffer.byteLength(value, 'utf8'))).update(':').update(value, 'utf8')
+  }
+  return `s_${hash.digest('base64url')}`
+}
+
+function sessionListPage(input: string): number | undefined {
+  if (input === '') return 1
+  if (!/^[1-9]\d{0,5}$/u.test(input)) return undefined
+  const page = Number(input)
+  return Number.isSafeInteger(page) ? page : undefined
+}
+
+function sessionCreatedAt(value: number): string | undefined {
+  if (value > SESSION_CREATED_AT_MAX) return undefined
+  return new Date(value).toISOString()
+}
+
+function maximumSessionGeneration(
+  baseId: string,
+  headers: ReadonlyArray<{ readonly id: ReturnType<typeof SessionId> }>,
+): number {
+  let maximum = 0
+  for (const header of headers) {
+    const generation = sessionGeneration(baseId, String(header.id))
+    if (generation !== undefined) maximum = Math.max(maximum, generation)
+  }
+  return maximum
+}
+
 function conversationBinding(
   baseId: string,
   sessionId: string,
@@ -602,6 +729,27 @@ async function canonicalProjectDirectory(value: unknown): Promise<string | undef
   }
 }
 
+async function workspaceContainsSessionCwd(
+  workspace: RegisteredWorkspace,
+  cwd: string | undefined,
+): Promise<boolean> {
+  if (cwd === workspace.path) return true
+  return await canonicalProjectDirectory(cwd) === workspace.path
+}
+
+function workspaceContainsSessionCwdNow(
+  workspace: RegisteredWorkspace,
+  cwd: string | undefined,
+): boolean {
+  if (typeof cwd !== 'string' || !isAbsolute(cwd) || !cwd.isWellFormed()) return false
+  try {
+    const canonical = realpathSync(cwd)
+    return canonical === workspace.path && statSync(canonical).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 function validProjectIdInput(input: string): boolean {
   return input !== ''
     && input.length <= PROJECT_ID_LIMIT
@@ -714,6 +862,20 @@ function sessionPersistenceOf(ctx: Context): SessionPersistenceLike | undefined 
   return candidate as SessionPersistenceLike
 }
 
+function sessionQueryOf(ctx: Context): SessionQueryLike | undefined {
+  const service = ctx.get('sessionQuery') as unknown
+  if (service === undefined) return undefined
+  if (service === null || typeof service !== 'object') {
+    throw new TypeError('lark: sessionQuery service is invalid')
+  }
+  const candidate = service as Partial<SessionQueryLike>
+  if (typeof candidate.listSessions !== 'function'
+    || typeof candidate.readTitleSnapshots !== 'function') {
+    throw new TypeError('lark: sessionQuery service is invalid')
+  }
+  return candidate as SessionQueryLike
+}
+
 function conversationBindingsOf(ctx: Context): ConversationBindingStore | undefined {
   if (typeof ctx.get !== 'function') return undefined
   const service = ctx.get('larkConversationBindings') as unknown
@@ -802,7 +964,10 @@ function workspaceRegistryOf(ctx: Context): WorkspaceRegistryLike | undefined {
     || typeof candidate.get !== 'function'
     || (candidate.resolveByPath !== undefined && typeof candidate.resolveByPath !== 'function')
     || (candidate.create !== undefined && typeof candidate.create !== 'function')
-    || (candidate.delete !== undefined && typeof candidate.delete !== 'function')) {
+    || (candidate.delete !== undefined && typeof candidate.delete !== 'function')
+    || (candidate.archivedSessionIds !== undefined
+      && (!Array.isArray(candidate.archivedSessionIds)
+        || candidate.archivedSessionIds.some((id) => typeof id !== 'string')))) {
     throw new TypeError('lark: workspaceRegistry service is invalid')
   }
   return candidate as WorkspaceRegistryLike
@@ -824,6 +989,93 @@ function listedWorkspaces(registry: WorkspaceRegistryLike): RegisteredWorkspace[
   })
 }
 
+function sessionWorkspaceIndex(
+  workspaces: readonly RegisteredWorkspace[],
+  archivedSessionIds: readonly ReturnType<typeof SessionId>[],
+): SessionWorkspaceIndex {
+  const bySession = new Map<string, RegisteredWorkspace | null>()
+  let indexed = 0
+  let truncated = false
+  for (const workspace of workspaces) {
+    const sessionIds = workspace.sessionIds ?? []
+    const available = Math.max(0, SESSION_WORKSPACE_INDEX_LIMIT - indexed)
+    const visible = sessionIds.slice(0, available)
+    if (visible.length < sessionIds.length) truncated = true
+    for (const rawId of visible) {
+      indexed += 1
+      const id = String(rawId)
+      const previous = bySession.get(id)
+      if (previous === undefined) bySession.set(id, workspace)
+      else if (previous !== null && previous.id !== workspace.id) bySession.set(id, null)
+    }
+  }
+  return {
+    workspaces,
+    bySession,
+    archived: new Set(archivedSessionIds.map(String)),
+    truncated,
+  }
+}
+
+function sessionQueryRecord(value: unknown): SessionQueryRecordLike {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('lark: sessionQuery returned an invalid record')
+  }
+  const candidate = value as Partial<SessionQueryRecordLike>
+  const header = candidate.header as Partial<SessionQueryRecordLike['header']> | undefined
+  if (header === undefined
+    || header.version !== SESSION_FORMAT_VERSION
+    || typeof header.id !== 'string'
+    || !header.id.isWellFormed()
+    || !Number.isSafeInteger(header.createdAt)
+    || (header.createdAt ?? -1) < 0
+    || (header.cwd !== undefined
+      && (typeof header.cwd !== 'string' || !header.cwd.isWellFormed() || !isAbsolute(header.cwd)))
+    || (header.parentSession !== undefined
+      && (typeof header.parentSession !== 'string' || !header.parentSession.isWellFormed()))
+    || (header.seedLength !== undefined
+      && (!Number.isSafeInteger(header.seedLength) || header.seedLength < 0))
+    || (header.origin !== undefined && header.origin !== 'subagent')
+    || (header.delegationDepth !== undefined
+      && (!Number.isSafeInteger(header.delegationDepth) || header.delegationDepth < 0))
+    || (header.agentPreset !== undefined
+      && (typeof header.agentPreset !== 'string' || !header.agentPreset.isWellFormed()))
+    || typeof candidate.live !== 'boolean'
+    || typeof candidate.persisted !== 'boolean') {
+    throw new TypeError('lark: sessionQuery returned an invalid record')
+  }
+  const snapshot: SessionHeader = Object.freeze({
+    version: header.version as number,
+    id: SessionId(header.id),
+    createdAt: header.createdAt as number,
+    ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+    ...(header.parentSession === undefined
+      ? {}
+      : { parentSession: SessionId(header.parentSession) }),
+    ...(header.seedLength === undefined ? {} : { seedLength: header.seedLength }),
+    ...(header.origin === undefined ? {} : { origin: header.origin }),
+    ...(header.delegationDepth === undefined ? {} : { delegationDepth: header.delegationDepth }),
+    ...(header.agentPreset === undefined ? {} : { agentPreset: header.agentPreset }),
+  })
+  return Object.freeze({
+    header: snapshot,
+    live: candidate.live as boolean,
+    persisted: candidate.persisted as boolean,
+  })
+}
+
+function sameSessionSourceHeader(left: SessionHeader, right: SessionHeader): boolean {
+  return left.version === right.version
+    && String(left.id) === String(right.id)
+    && left.createdAt === right.createdAt
+    && left.cwd === right.cwd
+    && left.parentSession === right.parentSession
+    && left.seedLength === right.seedLength
+    && left.origin === right.origin
+    && (left.delegationDepth ?? 0) === (right.delegationDepth ?? 0)
+    && left.agentPreset === right.agentPreset
+}
+
 function latestSessionBinding(
   baseId: string,
   headers: ReadonlyArray<{
@@ -841,6 +1093,7 @@ function latestSessionBinding(
       sessionId: SessionId(sessionId),
       persisted: true,
       generation,
+      maxGeneration: generation,
       modelSelection: null,
       ...(agentPreset === undefined ? {} : { agentPreset }),
     }
@@ -862,6 +1115,7 @@ export class LarkBridge {
   private readonly streamUpdateIntervalMs: number
   private readonly maxConversationHandles: number
   private readonly cwd: string
+  private readonly sessionReferenceNamespace: string
   private readonly conversations = new Map<string, ConversationSession>()
   private readonly conversationOpenings = new Map<string, Promise<ConversationSession>>()
   private readonly conversationLeases = new Map<string, number>()
@@ -940,6 +1194,10 @@ export class LarkBridge {
       throw new RangeError('lark: maxConversationHandles must be a non-negative safe integer')
     }
     this.cwd = options.cwd ?? process.cwd()
+    this.sessionReferenceNamespace = options.sessionReferenceNamespace ?? 'direct-bridge'
+    if (!validModelIdentifier(this.sessionReferenceNamespace, MODEL_PROVIDER_ID_LIMIT)) {
+      throw new TypeError('lark: sessionReferenceNamespace must be a bounded, trimmed identifier')
+    }
   }
 
   start(): Promise<void> {
@@ -1396,6 +1654,22 @@ export class LarkBridge {
           await this.scheduleProjectRemoval(route, actionInput)
         } else {
           await this.scheduleProjectSwitch(route, target)
+        }
+        break
+      }
+      case '/session': {
+        const target = text.slice(command.length).trim()
+        const [action = '', input = '', ...extra] = target.split(/\s+/u)
+        if (target === '') {
+          await this.showSessions(route, 1)
+        } else if (action === 'list' && extra.length === 0) {
+          const page = sessionListPage(input)
+          if (page === undefined) await this.safeSend(route.chatId, this.text.sessionUsage, routeDeliveryOptions(route))
+          else await this.showSessions(route, page)
+        } else if (action === 'resume' && SESSION_REFERENCE_PATTERN.test(input) && extra.length === 0) {
+          await this.scheduleSessionResume(route, input)
+        } else {
+          await this.safeSend(route.chatId, this.text.sessionUsage, routeDeliveryOptions(route))
         }
         break
       }
@@ -1993,7 +2267,7 @@ export class LarkBridge {
 
     const current = await this.currentWorkspace(conversation, registry, workspaces)
     if (current?.id === selected.id) {
-      const mutation = await this.recordCurrentProjectMutation(route, conversation)
+      const mutation = await this.recordCurrentConversationMutation(route, conversation)
       if (mutation === 'busy') return { kind: 'busy' }
       if (mutation === 'failed') return { kind: 'history-failed' }
       return { kind: 'already-current', workspace: selected }
@@ -2043,8 +2317,7 @@ export class LarkBridge {
         let modelSelectionRef: ModelSelectionRef
         try {
           const { agentPreset } = activeSessionComposition(previousHandle.agent.session)
-          const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
-          this.lastSessionGenerations.set(baseId, generation)
+          const generation = this.nextSessionGeneration(baseId)
           sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
           handle = await this.ensureHandle(
             sessionId,
@@ -2061,7 +2334,7 @@ export class LarkBridge {
         }
 
         if (signal.aborted || previousHandle.agent.inbox.hasPending) {
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           return { kind: 'busy' }
         }
         try {
@@ -2070,11 +2343,11 @@ export class LarkBridge {
           if (durable !== true) throw new Error('no durability listener participated')
         } catch {
           this.ctx.logger.error('[lark] project session checkpoint failed')
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           return { kind: 'failed' }
         }
         if (signal.aborted || previousHandle.agent.inbox.hasPending) {
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           return { kind: 'busy' }
         }
         try {
@@ -2089,7 +2362,7 @@ export class LarkBridge {
           )
         } catch (error) {
           this.ctx.logger.error('[lark] project binding commit failed')
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           if (error instanceof BindingConfirmationInterruptedError) throw error
           return { kind: 'failed' }
         }
@@ -2173,7 +2446,7 @@ export class LarkBridge {
     }
   }
 
-  private async recordCurrentProjectMutation(
+  private async recordCurrentConversationMutation(
     route: MessageRoute,
     conversation: ConversationSession,
   ): Promise<CurrentProjectMutationResult> {
@@ -2184,7 +2457,7 @@ export class LarkBridge {
       const committed = store.read(conversation.baseId)
       if (committed !== undefined) {
         if (String(boundSessionId(conversation.baseId, committed)) !== conversation.sessionId) {
-          this.ctx.logger.error('[lark] current project binding does not match the live conversation')
+          this.ctx.logger.error('[lark] current conversation binding does not match the live conversation')
           return 'failed'
         }
         await this.putConversationBinding(
@@ -2200,7 +2473,7 @@ export class LarkBridge {
       }
     } catch (error) {
       if (error instanceof BindingConfirmationInterruptedError) throw error
-      this.ctx.logger.error('[lark] current project mutation lookup failed: %s', messageOf(error))
+      this.ctx.logger.error('[lark] current conversation mutation lookup failed: %s', messageOf(error))
       return 'failed'
     }
 
@@ -2225,7 +2498,7 @@ export class LarkBridge {
           return 'recorded'
         } catch (error) {
           if (error instanceof BindingConfirmationInterruptedError) throw error
-          this.ctx.logger.error('[lark] current project mutation checkpoint failed: %s', messageOf(error))
+          this.ctx.logger.error('[lark] current conversation mutation checkpoint failed: %s', messageOf(error))
           return 'failed'
         }
       })
@@ -2236,8 +2509,568 @@ export class LarkBridge {
       return await maintenance
     } catch (error) {
       if (error instanceof BindingConfirmationInterruptedError) throw error
-      this.ctx.logger.error('[lark] current project mutation maintenance failed: %s', messageOf(error))
+      this.ctx.logger.error('[lark] current conversation mutation maintenance failed: %s', messageOf(error))
       return 'failed'
+    }
+  }
+
+  private synchronousSessionAuthority(): SynchronousSessionAuthority {
+    const registry = workspaceRegistryOf(this.ctx)
+    if (registry === undefined || this.workspaceMutationRecoveryRequired || this.stopping) {
+      throw new Error('lark: session navigation authority is unavailable')
+    }
+    const available = listedWorkspaces(registry).filter((workspace) => (
+      workspaceContainsSessionCwdNow(workspace, workspace.path)
+    ))
+    return {
+      registry,
+      index: sessionWorkspaceIndex(
+        available,
+        registry.archivedSessionIds ?? [],
+      ),
+    }
+  }
+
+  private authorizeSessionCandidateNow(
+    candidate: ConversationSessionCandidate,
+    currentSessionId: string,
+    allowedLiveSessionId: string | undefined,
+    authority: SynchronousSessionAuthority,
+  ): ConversationSessionCandidate | undefined {
+    const id = String(candidate.sessionId)
+    if (authority.index.archived.has(id)) return undefined
+    const current = id === currentSessionId
+    if (!current) {
+      if (authority.index.truncated) return undefined
+      if (id !== allowedLiveSessionId
+        && (this.ctx.sessions.get(candidate.sessionId) !== undefined
+          || this.ctx.agents.get(candidate.sessionId) !== undefined)) return undefined
+      const owner = authority.index.bySession.get(id)
+      if (owner === undefined
+        || owner === null
+        || candidate.workspace === undefined
+        || owner.id !== candidate.workspace.id
+        || owner.path !== candidate.workspace.path
+        || !workspaceContainsSessionCwdNow(owner, candidate.cwd)) return undefined
+      const currentOwnerRaw = authority.registry.get(owner.id)
+      if (currentOwnerRaw === undefined) return undefined
+      const currentOwner = registeredWorkspace(currentOwnerRaw)
+      if (currentOwner.id !== owner.id
+        || currentOwner.path !== owner.path
+        || !currentOwner.sessionIds?.some((sessionId) => String(sessionId) === id)) return undefined
+      return { ...candidate, workspace: currentOwner, current: false }
+    }
+    if (candidate.workspace === undefined) return { ...candidate, current: true }
+    const currentWorkspaceRaw = authority.registry.get(candidate.workspace.id)
+    if (currentWorkspaceRaw === undefined) {
+      const { workspace: _workspace, ...unregistered } = candidate
+      return { ...unregistered, current: true }
+    }
+    const currentWorkspace = registeredWorkspace(currentWorkspaceRaw)
+    if (currentWorkspace.path !== candidate.workspace.path
+      || !workspaceContainsSessionCwdNow(currentWorkspace, candidate.cwd)) {
+      const { workspace: _workspace, ...unregistered } = candidate
+      return { ...unregistered, current: true }
+    }
+    return { ...candidate, workspace: currentWorkspace, current: true }
+  }
+
+  private async indexedSessionWorkspaces(
+    registry: WorkspaceRegistryLike,
+  ): Promise<SessionWorkspaceIndex> {
+    const workspaces: RegisteredWorkspace[] = []
+    for (const workspace of listedWorkspaces(registry)) {
+      if (await workspace.status() === 'ok') workspaces.push(workspace)
+    }
+    return sessionWorkspaceIndex(workspaces, registry.archivedSessionIds ?? [])
+  }
+
+  private async conversationSessionCandidates(
+    baseId: string,
+    currentSessionId: string,
+    allowedLiveSessionId?: string,
+  ): Promise<ConversationSessionCandidates> {
+    const query = sessionQueryOf(this.ctx)
+    const registry = workspaceRegistryOf(this.ctx)
+    if (query === undefined || registry === undefined || this.workspaceMutationRecoveryRequired) {
+      throw new Error('lark: session navigation services are unavailable')
+    }
+    const recordsRaw = await query.listSessions(this.commandAbort.signal)
+    if (!Array.isArray(recordsRaw)) throw new TypeError('lark: sessionQuery.listSessions returned an invalid value')
+    const records = recordsRaw.map(sessionQueryRecord).sort((left, right) => (
+      right.header.createdAt - left.header.createdAt
+        || String(left.header.id).localeCompare(String(right.header.id))
+    ))
+    const index = await this.indexedSessionWorkspaces(registry)
+    const history: ConversationSessionCandidate[] = []
+    let currentItem: ConversationSessionCandidate | undefined
+    const references = new Set<string>()
+    let truncated = index.truncated
+    for (const record of records) {
+      const id = String(record.header.id)
+      const generation = sessionGeneration(baseId, id)
+      if (generation === undefined
+        || record.header.origin === 'subagent'
+        || record.header.parentSession !== undefined
+        || (record.header.delegationDepth ?? 0) !== 0
+        || !record.persisted) continue
+      const current = id === currentSessionId
+      const indexedWorkspace = index.bySession.get(id)
+      const currentWorkspaceMatches = indexedWorkspace === undefined && current
+        ? index.workspaces.filter((candidate) => candidate.path === record.header.cwd)
+        : []
+      const workspace = currentWorkspaceMatches.length === 1
+        ? currentWorkspaceMatches[0]
+        : indexedWorkspace ?? undefined
+      if (index.archived.has(id)) continue
+      if (!current && (workspace === undefined || workspace === null)) continue
+      if (!current && record.live && id !== allowedLiveSessionId) continue
+      if (!current && history.length >= SESSION_CANDIDATE_LIMIT) {
+        truncated = true
+        continue
+      }
+      if (workspace !== undefined
+        && workspace !== null
+        && !await workspaceContainsSessionCwd(workspace, record.header.cwd)) continue
+      const reference = sessionReference(this.sessionReferenceNamespace, baseId, id)
+      if (references.has(reference)) throw new Error('lark: session reference collision')
+      const candidate: ConversationSessionCandidate = {
+        sessionId: SessionId(id),
+        sourceHeader: record.header,
+        generation,
+        reference,
+        createdAt: record.header.createdAt,
+        ...(record.header.cwd === undefined ? {} : { cwd: record.header.cwd }),
+        ...(record.header.agentPreset === undefined ? {} : { agentPreset: record.header.agentPreset }),
+        ...(workspace === undefined || workspace === null ? {} : { workspace }),
+        current,
+      }
+      if (current) {
+        references.add(reference)
+        currentItem = candidate
+        continue
+      }
+      if (history.length >= SESSION_CANDIDATE_LIMIT) {
+        truncated = true
+        continue
+      }
+      references.add(reference)
+      history.push(candidate)
+    }
+    if (currentItem !== undefined && history.length === SESSION_CANDIDATE_LIMIT) {
+      const omitted = history.pop()
+      if (omitted !== undefined) references.delete(omitted.reference)
+      truncated = true
+    }
+    const bounded = currentItem === undefined ? history : [currentItem, ...history]
+    const authority = this.synchronousSessionAuthority()
+    const authorized: ConversationSessionCandidate[] = []
+    for (const candidate of bounded) {
+      const current = this.authorizeSessionCandidateNow(
+        candidate,
+        currentSessionId,
+        allowedLiveSessionId,
+        authority,
+      )
+      if (current !== undefined) authorized.push(current)
+    }
+    const maximum = maximumSessionGeneration(baseId, records.map((record) => record.header))
+    this.lastSessionGenerations.set(
+      baseId,
+      Math.max(this.lastSessionGenerations.get(baseId) ?? 0, maximum),
+    )
+    return { items: authorized, truncated: truncated || authority.index.truncated }
+  }
+
+  private showSessions(route: MessageRoute, page: number): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, async () => {
+      const deliveryOptions = routeDeliveryOptions(route)
+      try {
+        const live = this.conversations.get(route.sessionBaseId)
+        const currentSessionId = live?.sessionId
+          ?? String((await this.resolveSessionBinding(route.sessionBaseId)).sessionId)
+        const candidates = await this.conversationSessionCandidates(route.sessionBaseId, currentSessionId)
+        const totalPages = Math.max(1, Math.ceil(candidates.items.length / SESSION_LIST_PAGE_SIZE))
+        if (page > totalPages) {
+          await this.safeSend(route.chatId, this.text.sessionUsage, deliveryOptions)
+          return
+        }
+        const start = (page - 1) * SESSION_LIST_PAGE_SIZE
+        const visible = candidates.items.slice(start, start + SESSION_LIST_PAGE_SIZE)
+        const query = sessionQueryOf(this.ctx)
+        if (query === undefined) throw new Error('lark: sessionQuery is unavailable')
+        const titleResults = await query.readTitleSnapshots(
+          visible.map((candidate) => candidate.sessionId),
+          this.commandAbort.signal,
+        )
+        if (!Array.isArray(titleResults) || titleResults.length !== visible.length) {
+          throw new TypeError('lark: sessionQuery title results are invalid')
+        }
+        const listed: ListedConversationSession[] = visible.map((candidate, index) => {
+          const result = titleResults[index] as SessionTitleResultLike | undefined
+          if (result === undefined
+            || result === null
+            || typeof result !== 'object'
+            || typeof result.sessionId !== 'string'
+            || String(result.sessionId) !== String(candidate.sessionId)) {
+            throw new TypeError('lark: sessionQuery title result order is invalid')
+          }
+          if (result.status === 'rejected') return candidate
+          if (result.status !== 'fulfilled'
+            || result.value === null
+            || typeof result.value !== 'object') {
+            throw new TypeError('lark: sessionQuery title result is invalid')
+          }
+          const observed = sessionQueryRecord({
+            header: result.value.session,
+            live: false,
+            persisted: true,
+          }).header
+          if (!sameSessionSourceHeader(observed, candidate.sourceHeader)) {
+            throw new TypeError('lark: sessionQuery title observation changed its source header')
+          }
+          const titleSnapshot = result.value.title
+          if (titleSnapshot !== undefined
+            && (titleSnapshot === null
+              || typeof titleSnapshot !== 'object'
+              || typeof titleSnapshot.title !== 'string')) {
+            throw new TypeError('lark: sessionQuery title snapshot is invalid')
+          }
+          const title = titleSnapshot?.title
+          return typeof title === 'string'
+            && title.length <= SESSION_TITLE_SOURCE_CODE_UNIT_LIMIT
+            && title.isWellFormed()
+            ? { ...candidate, title }
+            : candidate
+        })
+        const revalidated = await this.conversationSessionCandidates(
+          route.sessionBaseId,
+          currentSessionId,
+        )
+        const finalAuthority = this.synchronousSessionAuthority()
+        for (const candidate of listed) {
+          const current = revalidated.items.find((item) => (
+            item.reference === candidate.reference
+              && String(item.sessionId) === String(candidate.sessionId)
+          ))
+          const authorized = current === undefined
+            ? undefined
+            : this.authorizeSessionCandidateNow(
+                current,
+                currentSessionId,
+                undefined,
+                finalAuthority,
+              )
+          if (authorized === undefined
+            || authorized.workspace?.id !== candidate.workspace?.id
+            || !sameSessionSourceHeader(authorized.sourceHeader, candidate.sourceHeader)) {
+            throw new Error('lark: session catalog authorization changed during title lookup')
+          }
+        }
+        await this.safeSend(
+          route.chatId,
+          this.text.sessionList(
+            page,
+            totalPages,
+            listed.map((candidate) => ({
+              reference: candidate.reference,
+              title: candidate.title,
+              project: candidate.workspace?.title,
+              createdAt: sessionCreatedAt(candidate.createdAt),
+              current: candidate.current,
+            })),
+            candidates.truncated,
+          ),
+          deliveryOptions,
+        )
+      } catch {
+        this.ctx.logger.warn('[lark] session list failed')
+        await this.safeSend(route.chatId, this.text.sessionUnavailable, deliveryOptions)
+      }
+    })
+  }
+
+  private scheduleSessionResume(route: MessageRoute, reference: string): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, async () => {
+      if (route.mutationHash !== undefined
+        && this.conversationBindings?.read(route.sessionBaseId)?.mutationHashes.includes(
+          route.mutationHash,
+        )) {
+        await this.safeSend(route.chatId, this.text.sessionMutationReplayed, routeDeliveryOptions(route))
+        return
+      }
+      const result = await this.enqueueWorkspaceMutation<SessionSwitchCommandResult>(() => (
+        this.withConversation(route.sessionBaseId, async (conversation) => {
+          await this.sessionOperations.get(conversation.baseId)
+          return this.resumeConversationSession(route, conversation, reference)
+        })
+      ))
+      await this.sendSessionSwitchResult(route, result)
+    })
+  }
+
+  private async resumeConversationSession(
+    route: MessageRoute,
+    conversation: ConversationSession,
+    reference: string,
+  ): Promise<SessionSwitchCommandResult> {
+    let selected: ConversationSessionCandidate | undefined
+    try {
+      const candidates = await this.conversationSessionCandidates(
+        conversation.baseId,
+        conversation.sessionId,
+      )
+      selected = candidates.items.find((candidate) => candidate.reference === reference)
+    } catch {
+      return { kind: 'unavailable' }
+    }
+    if (selected === undefined) return { kind: 'unknown' }
+    if (selected.current) {
+      const mutation = await this.recordCurrentConversationMutation(route, conversation)
+      if (mutation === 'busy') return { kind: 'busy' }
+      if (mutation === 'failed') return { kind: 'history-failed' }
+      return { kind: 'already-current', candidate: selected }
+    }
+    return this.resumeHistoricalSession(route, conversation, selected)
+  }
+
+  private async resumeHistoricalSession(
+    route: MessageRoute,
+    conversation: ConversationSession,
+    selected: ConversationSessionCandidate,
+  ): Promise<SessionSwitchCommandResult> {
+    const previousSessionId = conversation.sessionId
+    const previousHandle = conversation.handle
+    const baseId = conversation.baseId
+    let maintenance: Promise<SessionSwitchMaintenanceResult>
+    try {
+      maintenance = previousHandle.agent.runMaintenance(async (signal) => {
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'busy' }
+        const persistence = sessionPersistenceOf(this.ctx)
+        if (persistence?.inspect === undefined || this.conversationBindings === undefined) {
+          return { kind: 'unavailable' }
+        }
+        try {
+          const durable = await this.ctx.sessions.flush(previousHandle.agent.session)
+          if (durable !== true) throw new Error('no durability listener participated')
+          await this.putConversationBinding(
+            baseId,
+            this.currentConversationBinding(baseId, previousSessionId, conversation.modelSelection),
+          )
+        } catch (error) {
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          return { kind: 'history-failed' }
+        }
+        if (signal.aborted || previousHandle.agent.inbox.hasPending) return { kind: 'busy' }
+
+        let revalidated: ConversationSessionCandidate | undefined
+        try {
+          const candidates = await this.conversationSessionCandidates(baseId, previousSessionId)
+          revalidated = candidates.items.find((candidate) => (
+            candidate.reference === selected.reference
+              && String(candidate.sessionId) === String(selected.sessionId)
+              && sameSessionSourceHeader(candidate.sourceHeader, selected.sourceHeader)
+              && !candidate.current
+          ))
+        } catch {
+          return { kind: 'unavailable' }
+        }
+        if (revalidated === undefined || revalidated.workspace === undefined) {
+          return { kind: 'unknown' }
+        }
+        const candidate = revalidated
+        const candidateWorkspace = revalidated.workspace
+        if (this.handles.has(String(candidate.sessionId))
+          || this.ctx.agents.get(candidate.sessionId) !== undefined) return { kind: 'busy' }
+
+        let handle: AgentHandle
+        let modelSelection: ConversationModelSelection
+        let modelSelectionRef: ModelSelectionRef
+        try {
+          modelSelection = await this.persistedModelSelection(
+            persistence,
+            candidate.sessionId,
+            this.commandAbort.signal,
+          )
+            ?? this.defaultModelSelection()
+          handle = await this.ensureHandle(
+            candidate.sessionId,
+            true,
+            false,
+            candidate.agentPreset,
+            candidateWorkspace.path,
+            modelSelection,
+            this.commandAbort.signal,
+          )
+          modelSelectionRef = this.modelSelectionFor(handle)
+        } catch {
+          const candidateHandle = await this.handles.get(String(candidate.sessionId))?.catch(() => undefined)
+          if (candidateHandle !== undefined) {
+            this.retireCandidateHandleAfterIdle(String(candidate.sessionId), candidateHandle)
+          }
+          return { kind: 'failed' }
+        }
+        if (signal.aborted
+          || previousHandle.agent.inbox.hasPending
+          || conversation.handle !== previousHandle
+          || conversation.sessionId !== previousSessionId) {
+          this.retireCandidateHandleAfterIdle(String(candidate.sessionId), handle)
+          return { kind: 'busy' }
+        }
+
+        let candidateMaintenance: Promise<SessionCandidateCommitResult>
+        try {
+          candidateMaintenance = handle.agent.runMaintenance(async (candidateSignal) => {
+            if (candidateSignal.aborted
+              || handle.agent.inbox.hasPending
+              || signal.aborted
+              || previousHandle.agent.inbox.hasPending
+              || conversation.handle !== previousHandle
+              || conversation.sessionId !== previousSessionId) return { kind: 'busy' }
+            try {
+              const durable = await this.ctx.sessions.flush(handle.agent.session)
+              if (durable !== true) throw new Error('no durability listener participated')
+            } catch {
+              return { kind: 'failed' }
+            }
+            if (candidateSignal.aborted
+              || handle.agent.inbox.hasPending
+              || signal.aborted
+              || previousHandle.agent.inbox.hasPending
+              || conversation.handle !== previousHandle
+              || conversation.sessionId !== previousSessionId) return { kind: 'busy' }
+            let authorized: ConversationSessionCandidate | undefined
+            try {
+              const candidates = await this.conversationSessionCandidates(
+                baseId,
+                previousSessionId,
+                String(candidate.sessionId),
+              )
+              const current = candidates.items.find((item) => (
+                item.reference === candidate.reference
+                  && String(item.sessionId) === String(candidate.sessionId)
+              ))
+              authorized = current === undefined
+                ? undefined
+                : this.authorizeSessionCandidateNow(
+                    current,
+                    previousSessionId,
+                    String(candidate.sessionId),
+                    this.synchronousSessionAuthority(),
+                  )
+            } catch {
+              return { kind: 'unavailable' }
+            }
+            const authorizedWorkspace = authorized?.workspace
+            if (authorized === undefined
+              || authorizedWorkspace === undefined
+              || authorizedWorkspace.id !== candidateWorkspace.id
+              || !sameSessionSourceHeader(authorized.sourceHeader, candidate.sourceHeader)
+              || !sameSessionSourceHeader(authorized.sourceHeader, handle.agent.session.header)) {
+              return { kind: 'unknown' }
+            }
+            if (candidateSignal.aborted
+              || handle.agent.inbox.hasPending
+              || signal.aborted
+              || previousHandle.agent.inbox.hasPending
+              || conversation.handle !== previousHandle
+              || conversation.sessionId !== previousSessionId) return { kind: 'busy' }
+            try {
+              await this.putConversationBinding(
+                baseId,
+                this.mutatedConversationBinding(
+                  baseId,
+                  String(authorized.sessionId),
+                  modelSelection,
+                  route.mutationHash,
+                ),
+              )
+            } catch (error) {
+              if (error instanceof BindingConfirmationInterruptedError) throw error
+              return { kind: 'failed' }
+            }
+            return { kind: 'committed', candidate: authorized, workspace: authorizedWorkspace }
+          })
+        } catch {
+          this.retireCandidateHandleAfterIdle(String(candidate.sessionId), handle)
+          return { kind: 'busy' }
+        }
+
+        let candidateResult: SessionCandidateCommitResult
+        try {
+          candidateResult = await candidateMaintenance
+        } catch (error) {
+          this.retireCandidateHandleAfterIdle(String(candidate.sessionId), handle)
+          if (error instanceof BindingConfirmationInterruptedError) throw error
+          return { kind: 'failed' }
+        }
+        if (candidateResult.kind !== 'committed') {
+          this.retireCandidateHandleAfterIdle(String(candidate.sessionId), handle)
+          return candidateResult
+        }
+        const committedCandidate = candidateResult.candidate
+
+        conversation.handle = handle
+        conversation.sessionId = String(committedCandidate.sessionId)
+        conversation.modelSelection = modelSelection
+        conversation.modelSelectionRef = modelSelectionRef
+        conversation.workspaceId = candidateResult.workspace.id
+        this.lastSessionGenerations.set(
+          baseId,
+          Math.max(this.lastSessionGenerations.get(baseId) ?? 0, selected.generation),
+        )
+        this.clearSessionState(previousSessionId)
+        return {
+          kind: 'committed',
+          candidate: committedCandidate,
+          previousSessionId,
+          previousHandle,
+        }
+      })
+    } catch {
+      return { kind: 'busy' }
+    }
+
+    let result: SessionSwitchMaintenanceResult
+    try {
+      result = await maintenance
+    } catch (error) {
+      if (error instanceof BindingConfirmationInterruptedError) throw error
+      return { kind: 'failed' }
+    }
+    if (result.kind === 'committed') {
+      this.retireHandleAfterIdle(result.previousSessionId, result.previousHandle, 'session')
+      return { kind: 'resumed', candidate: result.candidate }
+    }
+    return result
+  }
+
+  private async sendSessionSwitchResult(
+    route: MessageRoute,
+    result: SessionSwitchCommandResult,
+  ): Promise<void> {
+    const options = routeDeliveryOptions(route)
+    switch (result.kind) {
+      case 'resumed':
+        await this.safeSend(route.chatId, this.text.sessionResumed(), options)
+        return
+      case 'already-current':
+        await this.safeSend(route.chatId, this.text.sessionAlreadyCurrent(), options)
+        return
+      case 'busy':
+        await this.safeSend(route.chatId, this.text.sessionBusy, options)
+        return
+      case 'history-failed':
+        await this.safeSend(route.chatId, this.text.sessionHistoryCheckpointFailed, options)
+        return
+      case 'unknown':
+        await this.safeSend(route.chatId, this.text.sessionUnknown, options)
+        return
+      case 'unavailable':
+        await this.safeSend(route.chatId, this.text.sessionUnavailable, options)
+        return
+      case 'failed':
+        await this.safeSend(route.chatId, this.text.sessionResumeFailed, options)
     }
   }
 
@@ -2647,8 +3480,7 @@ export class LarkBridge {
         let modelSelectionRef: ModelSelectionRef
         try {
           const composition = activeSessionComposition(previousHandle.agent.session)
-          const generation = Math.max(Date.now(), (this.lastSessionGenerations.get(baseId) ?? 0) + 1)
-          this.lastSessionGenerations.set(baseId, generation)
+          const generation = this.nextSessionGeneration(baseId)
           sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
           handle = await this.ensureHandle(
             sessionId,
@@ -2664,7 +3496,7 @@ export class LarkBridge {
           return { kind: 'failed' }
         }
         if (signal.aborted || previousHandle.agent.inbox.hasPending) {
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           return { kind: 'failed' }
         }
         try {
@@ -2673,11 +3505,11 @@ export class LarkBridge {
           if (durable !== true) throw new Error('no durability listener participated')
         } catch (error) {
           this.ctx.logger.error('[lark] fresh session checkpoint failed: %s', messageOf(error))
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           return { kind: 'failed' }
         }
         if (signal.aborted || previousHandle.agent.inbox.hasPending) {
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           return { kind: 'failed' }
         }
         try {
@@ -2692,7 +3524,7 @@ export class LarkBridge {
           )
         } catch (error) {
           this.ctx.logger.error('[lark] fresh session binding commit failed: %s', messageOf(error))
-          await this.abandonFreshHandle(String(sessionId), handle)
+          await this.disposeCandidateHandle(String(sessionId), handle)
           if (error instanceof BindingConfirmationInterruptedError) throw error
           return { kind: 'failed' }
         }
@@ -3113,7 +3945,7 @@ export class LarkBridge {
     const modelSelectionRef = this.modelSelectionFor(handle)
     this.lastSessionGenerations.set(
       baseId,
-      Math.max(this.lastSessionGenerations.get(baseId) ?? 0, binding.generation),
+      Math.max(this.lastSessionGenerations.get(baseId) ?? 0, binding.maxGeneration),
     )
     const entry: ConversationSession = {
       baseId,
@@ -3152,7 +3984,8 @@ export class LarkBridge {
         throw new Error('lark: committed conversation binding requires session persistence')
       }
       const sessionId = boundSessionId(baseId, committed)
-      const matches = (await persistence.list()).filter((header) => String(header.id) === String(sessionId))
+      const headers = await persistence.list()
+      const matches = headers.filter((header) => String(header.id) === String(sessionId))
       if (matches.length !== 1) {
         throw new Error(`lark: committed session "${String(sessionId)}" is not uniquely persisted`)
       }
@@ -3163,19 +3996,32 @@ export class LarkBridge {
         sessionId,
         persisted: true,
         generation: committed.generation,
+        maxGeneration: Math.max(committed.generation, maximumSessionGeneration(baseId, headers)),
         modelSelection,
         ...(agentPreset === undefined ? {} : { agentPreset }),
       }
     }
     if (persistence === undefined) {
-      return { sessionId: SessionId(baseId), persisted: false, generation: 0, modelSelection: null }
+      return {
+        sessionId: SessionId(baseId),
+        persisted: false,
+        generation: 0,
+        maxGeneration: 0,
+        modelSelection: null,
+      }
     }
     if (typeof persistence.list !== 'function') {
       throw new TypeError('lark: sessionPersistence.list is unavailable')
     }
     const latest = latestSessionBinding(baseId, await persistence.list())
     if (latest === undefined) {
-      return { sessionId: SessionId(baseId), persisted: false, generation: 0, modelSelection: null }
+      return {
+        sessionId: SessionId(baseId),
+        persisted: false,
+        generation: 0,
+        maxGeneration: 0,
+        modelSelection: null,
+      }
     }
     return {
       ...latest,
@@ -3186,9 +4032,10 @@ export class LarkBridge {
   private async persistedModelSelection(
     persistence: SessionPersistenceLike,
     sessionId: ReturnType<typeof SessionId>,
+    signal?: AbortSignal,
   ): Promise<ConversationModelSelection | null> {
     if (persistence.inspect === undefined) return null
-    const inspected = await persistence.inspect(sessionId)
+    const inspected = await persistence.inspect(sessionId, signal)
     const header = foldRequestHeader(inspected.events as readonly SessionEvent[])
     return modelSelectionFromConfig(header?.config) ?? null
   }
@@ -3284,6 +4131,19 @@ export class LarkBridge {
     return conversationBinding(baseId, sessionId, modelSelection, mutationHashes)
   }
 
+  private nextSessionGeneration(baseId: string): number {
+    const highWater = this.lastSessionGenerations.get(baseId) ?? 0
+    if (highWater >= Number.MAX_SAFE_INTEGER) {
+      throw new RangeError('lark: session generation space is exhausted')
+    }
+    const generation = Math.max(Date.now(), highWater + 1)
+    if (!Number.isSafeInteger(generation)) {
+      throw new RangeError('lark: next session generation is invalid')
+    }
+    this.lastSessionGenerations.set(baseId, generation)
+    return generation
+  }
+
   private defaultModelSelection(): ConversationModelSelection {
     return Object.freeze({ provider: this.provider, model: this.model })
   }
@@ -3301,6 +4161,7 @@ export class LarkBridge {
     persistedAgentPreset?: string,
     cwd = this.cwd,
     modelSelection: ConversationModelSelection | null = null,
+    signal?: AbortSignal,
   ): Promise<AgentHandle> {
     const key = String(sessionId)
     const existing = this.handles.get(key)
@@ -3312,6 +4173,7 @@ export class LarkBridge {
       persistedAgentPreset,
       cwd,
       modelSelection,
+      signal,
     )
     this.handles.set(key, opened)
     try {
@@ -3333,7 +4195,9 @@ export class LarkBridge {
     persistedAgentPreset?: string,
     cwd = this.cwd,
     modelSelection: ConversationModelSelection | null = null,
+    signal?: AbortSignal,
   ): Promise<AgentHandle> {
+    signal?.throwIfAborted()
     const agentOptions = modelSelection ?? this.defaultModelSelection()
     const modelSelectionRef: ModelSelectionRef = {
       current: { provider: agentOptions.provider, model: agentOptions.model },
@@ -3343,9 +4207,11 @@ export class LarkBridge {
     const requestedPreset = persisted
       ? (presets === undefined
           ? undefined
-          : await this.persistedAgentPreset(sessionId, persistedAgentPreset))
+          : await this.persistedAgentPreset(sessionId, persistedAgentPreset, signal))
       : optionalAgentPreset(persistedAgentPreset)
+    signal?.throwIfAborted()
     const composition = await this.agentComposition(presets, requestedPreset)
+    signal?.throwIfAborted()
     const setup = async (agentCtx: Context): Promise<void> => {
       installModelSelection(agentCtx, modelSelectionRef)
       await composition.setup?.(agentCtx)
@@ -3354,6 +4220,7 @@ export class LarkBridge {
       ? await this.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions,
+        ...(signal === undefined ? {} : { signal }),
         setup,
       })
       : await this.ctx.agents.create({
@@ -3363,6 +4230,7 @@ export class LarkBridge {
           ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
         },
         agentOptions,
+        ...(signal === undefined ? {} : { signal }),
         setup,
       })
     this.modelSelections.set(handle.agent, modelSelectionRef)
@@ -3389,21 +4257,67 @@ export class LarkBridge {
     }
   }
 
-  private async abandonFreshHandle(sessionId: string, handle: AgentHandle): Promise<void> {
+  private async disposeCandidateHandle(sessionId: string, handle: AgentHandle): Promise<void> {
     this.clearSessionState(sessionId)
     try {
       await handle.dispose()
     } catch (error) {
-      this.ctx.logger.error('[lark] abandoned fresh session disposal failed: %s', messageOf(error))
+      this.ctx.logger.error('[lark] candidate session disposal failed: %s', messageOf(error))
     } finally {
       this.handles.delete(sessionId)
     }
   }
 
+  private retireCandidateHandleAfterIdle(sessionId: string, handle: AgentHandle): void {
+    this.clearSessionState(sessionId)
+    let retirement: Promise<void>
+    try {
+      retirement = handle.agent.whenIdle().then(async () => {
+        if (this.stopping) return
+        let durable = false
+        try {
+          durable = await handle.agent.runMaintenance(async (signal) => {
+            if (signal.aborted || handle.agent.inbox.hasPending) return false
+            try {
+              const flushed = await this.ctx.sessions.flush(handle.agent.session)
+              return flushed === true && !signal.aborted && !handle.agent.inbox.hasPending
+            } catch {
+              return false
+            }
+          })
+        } catch {
+          this.retireCandidateHandleAfterIdle(sessionId, handle)
+          return
+        }
+        if (!durable) {
+          this.ctx.logger.error('[lark] retired candidate session could not be confirmed durable; retaining its handle')
+          return
+        }
+        if (handle.agent.status !== 'idle' || handle.agent.inbox.hasPending) {
+          this.retireCandidateHandleAfterIdle(sessionId, handle)
+          return
+        }
+        this.handles.delete(sessionId)
+        await this.disposeReplacedHandle(sessionId, handle, 'candidate')
+      })
+    } catch {
+      this.ctx.logger.error('[lark] candidate session retirement failed')
+      return
+    }
+    this.handleRetirements.add(retirement)
+    const cleanup = (): void => {
+      this.handleRetirements.delete(retirement)
+    }
+    void retirement.then(cleanup, () => {
+      cleanup()
+      this.ctx.logger.error('[lark] candidate session retirement failed')
+    })
+  }
+
   private async disposeReplacedHandle(
     sessionId: string,
     handle: AgentHandle,
-    reason: 'project' | 'reset',
+    reason: 'project' | 'reset' | 'session' | 'candidate',
   ): Promise<void> {
     try {
       await handle.dispose()
@@ -3417,7 +4331,7 @@ export class LarkBridge {
   private retireHandleAfterIdle(
     sessionId: string,
     handle: AgentHandle,
-    reason: 'project' | 'reset',
+    reason: 'project' | 'reset' | 'session' | 'candidate',
   ): void {
     let retirement: Promise<void>
     try {
@@ -3453,10 +4367,11 @@ export class LarkBridge {
   private async persistedAgentPreset(
     sessionId: ReturnType<typeof SessionId>,
     headerPreset?: string,
+    signal?: AbortSignal,
   ): Promise<string | undefined> {
     const persistence = sessionPersistenceOf(this.ctx)
     if (persistence?.inspect === undefined) return optionalAgentPreset(headerPreset)
-    const inspected = await persistence.inspect(sessionId)
+    const inspected = await persistence.inspect(sessionId, signal)
     return selectedAgentPreset(inspected.meta.agentPreset ?? headerPreset, inspected.events)
   }
 
