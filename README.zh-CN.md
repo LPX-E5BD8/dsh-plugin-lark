@@ -38,6 +38,8 @@
 
 必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、JSONL 持久化、JSON storage-domain、Tools、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.8.8 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
 
+Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
+
 从 v0.8.5 起，同一个 Linux Release 门禁随后会切到 Node 24，以 engine-strict 重新创建 `node_modules`，重跑完整源码/Harness 和独立 packed-consumer 门禁，再在隔离的标准 profile 中消费前面已经打好的同一份 canonical 候选包。v0.8.5 的基线 v0.8.4 只支持 Node 22，因此当时执行的是全新安装；从 v0.8.6 起，Node 24 还会验证从已经兼容的 v0.8.5 基线相邻升级。
 
 从 v0.8.6 起，另一个必需门禁会在 GitHub 托管的 macOS 26 arm64 上运行 engine-strict Node 22；从 v0.8.7 起，同一隔离流程同时覆盖 Node 22 与 24。每条 runtime 都会重跑完整源码/Harness 测试、audit 和独立 packed-consumer 安装，然后在 Actions artifact digest 校验后下载并消费由 Ubuntu 生成的同一份 canonical archive。两条 runtime 都不会在 macOS 上执行 `dsh plugin`、组合标准 Web profile，也不验证应用启动和有状态操作。
