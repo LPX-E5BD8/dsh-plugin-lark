@@ -10,7 +10,7 @@ This runbook covers `dsh-plugin-lark` on the supported DeepSeek Harness `0.1.0-r
 - Stop Harness gracefully and wait for the process to exit before copying or restoring state. Do not take a live `cp`/`tar` snapshot, and do not use `kill -9` as a backup boundary.
 - Keep the same Lark app ID, state roots, launch workspace, `defaultSessionId`, JSONL compression, canonical Workspace paths, profile configuration, and credential source unless the migration explicitly changes them. The app ID participates in hashed storage keys; changing it makes prior receipts and bindings appear absent.
 - Snapshot sessions, storage domains, attachments, and the Web profile at one point in time. Never restore only one referenced attachment or `lark_conversations.json`, merge old and new JSON by hand, or edit references/hashes/schema fields manually.
-- Treat every snapshot as sensitive. Session logs can contain prompts, tool results, and repository data; Workspace state contains paths; selected model route IDs are plaintext. Store snapshots outside the checkout with restrictive access, and never attach them to an issue.
+- Treat every snapshot as sensitive. Session logs can contain prompts, tool results, and repository data; Workspace state contains paths; selected model route IDs and notify destination chat/user/message IDs are plaintext. Store snapshots outside the checkout with restrictive access, and never attach them to an issue.
 - A state rollback does not undo messages already sent, model/provider usage, tool side effects, or files changed in a Workspace. Protect project directories with their own version control or backup.
 
 ## One cold-backup unit
@@ -20,7 +20,7 @@ The stock rc.6 Web profile uses these paths:
 | Unit | Stock location | Why it must stay aligned |
 | --- | --- | --- |
 | Session persistence | `$DSH_HOME/sessions` | JSONL headers, events, generations, cwd, preset, and request headers |
-| Storage domains | `$DSH_HOME/storages` | `lark_inbound.json`, `lark_conversations.json`, `workspace.json`, and other host-domain state |
+| Storage domains | `$DSH_HOME/storages` | `lark_inbound.json`, `lark_conversations.json`, `lark_notify.json`, `workspace.json`, and other host-domain state |
 | Attachment store | `$DSH_HOME/attachments` | Immutable image objects referenced by Session events; objects and logs must stay aligned |
 | Web profile installation | `$DSH_HOME/profiles/web` | Plugin specification, profile package graph, and local-checkout reference |
 | Plugin checkout | The absolute path passed to `dsh plugin --profile web add` | A local install can remain linked to that directory; keep the old checkout through the rollback window |
@@ -48,6 +48,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.8` | Adds no durable schema. During graceful shutdown it makes a bounded attempt to terminalize every known running execution Card through a signal-aware final PATCH without appending a Session result or sending partial output. | v0.9.7 reads the same state but can leave an already delivered running Card with a stale Stop control after its process-local turn authority disappears. Stop v0.9.8 cleanly before rollback and treat any still-running older Card as stale. |
 | `0.9.9` | Adds no plugin-owned schema. Opted-in images publish immutable objects under the Harness attachment backend, while Session events store only validated content-addressed references and metadata. | v0.9.8 retains and reads the same Session image blocks when its deployment has an attachment service, but new Lark image messages return to the unsupported path. Rolling code back does not delete objects or orphans; keep the attachment backend aligned with Session logs. |
 | `0.9.10` | Adds no plugin-owned schema. Approved outbound artifacts use existing `tool/call`, approval audit, and `tool/result` events; platform upload keys, destinations, paths, and bytes are never stored in plugin sidecars. | v0.9.9 reads the same Session log but no longer registers the send tool. Rollback cannot retract a delivered platform message or delete an uploaded orphan, and an open/unknown tool call follows ordinary rc.6 cold repair. |
+| `0.9.11` | Adds the `lark_notify` storage-domain unit (`destinations` + `outbox`). Destination rows store the chat/user/message IDs required to deliver after restart; outbox rows store hashed keys, kind, bounded summary, mention tokens, retry/expiry, and terminal status. | v0.9.10 ignores the new unit and no longer registers `notify_lark`. Already delivered platform cards remain; pending outbox items are not drained until the feature is enabled again. Do not replay a delivered idempotency key after rollback. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -64,7 +65,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.10'
+target_tag='v0.9.11'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -218,8 +219,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.10 | State handling |
+| Rollback target from v0.9.11 | State handling |
 | --- | --- |
+| v0.9.10 | Uses the same Session, bindings, and artifact tool, but ignores `lark_notify` and does not register `notify_lark`. Already delivered notification cards remain on the platform; pending outbox rows stay until the feature is enabled again. |
 | v0.9.9 | Uses the same bindings, attachment store, approval audit, and Session vocabulary, but removes the outbound-artifact tool. Already delivered messages and uploaded platform orphans remain external; do not infer their state from a rolled-back `tool/result`. |
 | v0.9.8 | Uses the same bindings, Session logs, and image-routing guard but never downloads a new Lark image. Existing image blocks still require their referenced attachment objects and an image-capable route. No object or orphan is deleted; keep the attachment store with the snapshot. |
 | v0.9.7 | Uses the same durable state and image-routing guard, but removes graceful terminalization for ordinary running execution Cards. A Card still showing Running/Stop after process exit has no live Stop authority; inspect the Session after restart and retry as needed. |

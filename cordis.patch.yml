@@ -22,3 +22,4 @@
         maxOutboundTextFileBytes: 131072
         maxOutboundImageBytes: 5242880
         maxOutboundImagePixels: 20000000
+        proactiveDelivery: false
