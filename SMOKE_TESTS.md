@@ -10,7 +10,7 @@ In the matching developer console (`open.feishu.cn` or `open.larksuite.com`):
 2. Subscribe to `im.message.receive_v1`.
 3. Register the `card.action.trigger` callback.
 4. Grant the bot permission to receive and send messages. Grant `im:resource` when inbound text files, inbound images, outbound artifacts, or the animated loading image are being checked.
-5. Add the tester's `open_id` to local `allowFrom` and `projectManageFrom` overlays. Do not use `allowAllUsers: true` for a shared or production app.
+5. Add the tester's `open_id` to local `allowFrom`, `projectManageFrom`, and `operatorFrom` overlays. Do not use `allowAllUsers: true` for a shared or production app.
 
 Build and install the exact checkout being tested:
 
@@ -41,6 +41,8 @@ Create an overlay outside the checkout, such as `/tmp/dsh-lark-smoke.yml`:
     allowFrom:
       - <tester-open-id>
     projectManageFrom:
+      - <tester-open-id>
+    operatorFrom:
       - <tester-open-id>
     maxConversationHandles: 1 # exercise cold resume after idle LRU eviction
     inboundTextFiles: true
@@ -94,7 +96,7 @@ Before exercising structured input, use a direct Native `ask_user_question` call
 
 Perform the same checks in a direct chat on each domain:
 
-1. Send `/help`; verify one localized help reply and the mounted Agent's compatible commands.
+1. Send `/help`; verify one localized help reply and the mounted Agent's compatible commands. As an `operatorFrom` user, also send `/status` and `/diag`; verify Card 2.0 replies with version/uptime/connection and sanitized checks, and that a non-operator authorized user receives only the operator-only notice.
 2. Send a task that requires a repository tool. Verify one Card 2.0 message is updated in place, shows reasoning, no more than the latest three tools, and reaches a terminal status.
 3. Send `/new`, then a follow-up. Verify the acknowledgement arrives and the follow-up runs in the fresh session.
 4. Trigger a protected tool when approval is mounted. Verify the initial Approval Card 2.0 is accepted by the configured platform, only the initiating user in the original chat can Allow once or Deny, the callback returns the expected toast, and the decided card update succeeds. A rejected create must resolve unavailable without running the tool; a rejected update must not reverse or repeat an admitted decision. The v0.9.2 release blocker requires this path on Feishu; an international Lark claim still requires a separate Lark app and the domain's complete checklist.

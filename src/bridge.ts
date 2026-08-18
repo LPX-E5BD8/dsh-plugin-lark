@@ -37,6 +37,7 @@ import {
   renderHumanInputCard,
   renderHumanInputTerminalCard,
   renderNotifyCard,
+  renderOperatorCard,
   renderTurnCardWithMeta,
 } from './cards.ts'
 import type {
@@ -118,6 +119,17 @@ import type {
   OutboundArtifactPreflight,
   PreparedOutboundArtifact,
 } from './outbound-artifact.ts'
+import {
+  buildDiagChecks,
+  classifyConversation,
+  classifyOperatorFailure,
+  formatDiagBody,
+  formatStatusBody,
+  MAX_RECENT_FAILURES,
+  pluginReleaseVersion,
+  type OperatorFailureCategory,
+  type OperatorWorkState,
+} from './operator-status.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 import {
@@ -132,6 +144,7 @@ export interface LarkBridgeOptions {
   allowFrom?: string[]
   allowAllUsers?: boolean
   projectManageFrom?: string[]
+  operatorFrom?: string[]
   defaultSessionId?: string
   provider?: string
   model?: string
@@ -644,7 +657,9 @@ const GROUP_SESSION_SCOPE_VERSION = 'group-v1'
 const RECENT_INBOUND_LIMIT = 1024
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const INBOUND_MUTATION_HASH_DOMAIN = 'dsh-plugin-lark/conversation-mutation/v1'
-const BRIDGE_COMMANDS = new Set(['start', 'help', 'new', 'clear', 'project', 'session', 'model'])
+const BRIDGE_COMMANDS = new Set([
+  'start', 'help', 'new', 'clear', 'project', 'session', 'model', 'status', 'diag',
+])
 const UNSUPPORTED_RUNTIME_COMMANDS = new Set(['feedback', 'export'])
 const MODEL_CATALOG_PROVIDER_LIMIT = 32
 const MODEL_CATALOG_ENTRY_LIMIT = 128
@@ -1596,6 +1611,7 @@ export class LarkBridge {
   private readonly allowFrom: ReadonlySet<string>
   private readonly allowAllUsers: boolean
   private readonly projectManageFrom: ReadonlySet<string>
+  private readonly operatorFrom: ReadonlySet<string>
   private readonly sharedSessionBaseId: string | undefined
   private readonly provider: string
   private readonly model: string
@@ -1686,6 +1702,8 @@ export class LarkBridge {
     Promise<{ readonly admitted: true }>
   >()
   private commandAbort = new AbortController()
+  private startedAt = 0
+  private readonly recentFailures: OperatorFailureCategory[] = []
 
   constructor(ctx: Context, options: LarkBridgeOptions) {
     this.ctx = ctx
@@ -1700,6 +1718,9 @@ export class LarkBridge {
     this.allowAllUsers = options.allowAllUsers ?? DEFAULT_CONFIG.allowAllUsers
     this.projectManageFrom = new Set(
       (options.projectManageFrom ?? []).map((openId) => openId.trim()).filter(Boolean),
+    )
+    this.operatorFrom = new Set(
+      (options.operatorFrom ?? []).map((openId) => openId.trim()).filter(Boolean),
     )
     const defaultSessionId = (options.defaultSessionId ?? '').trim()
     this.sharedSessionBaseId = defaultSessionId === '' ? undefined : defaultSessionId
@@ -1806,6 +1827,7 @@ export class LarkBridge {
     if (this.disposeEvents !== undefined) return this.startPromise ?? Promise.resolve()
     this.stopping = false
     this.clientStarted = false
+    this.startedAt = Date.now()
     this.commandAbort = new AbortController()
     this.disposeEvents = this.ctx.on('session/event', (session: Session, event: SessionEvent) => {
       this.handleSessionEvent(session, event)
@@ -3712,6 +3734,7 @@ export class LarkBridge {
     if (this.notifyDrainWorker !== undefined) return
     const worker = Promise.resolve().then(() => this.runNotifyDrainWorker()).catch((error: unknown) => {
       this.ctx.logger.error('[lark] notify drain failed: %s', messageOf(error))
+      this.noteOperatorFailure(error)
     })
     this.notifyDrainWorker = worker
     const cleanup = (): void => {
@@ -3917,9 +3940,10 @@ export class LarkBridge {
             const help = block === undefined
               ? this.commandHelp(conversation.handle.agent)
               : `${this.text.help}\n\n${block}`
+            const text = this.isOperator(route) ? `${help}\n${this.text.operatorHelp}` : help
             await this.safeSend(
               route.chatId,
-              help,
+              text,
               routeDeliveryOptions(route),
             )
           })
@@ -3967,6 +3991,12 @@ export class LarkBridge {
         else await this.scheduleModelSwitch(route, target)
         break
       }
+      case '/status':
+        await this.showOperatorStatus(route)
+        break
+      case '/diag':
+        await this.showOperatorDiag(route)
+        break
       default:
         await this.executeRuntimeCommand(route, text, command)
     }
@@ -4064,6 +4094,112 @@ export class LarkBridge {
 
   private canManageProjects(route: MessageRoute): boolean {
     return route.chatType === 'p2p' && this.projectManageFrom.has(route.openId)
+  }
+
+  private isOperator(route: MessageRoute): boolean {
+    return this.operatorFrom.has(route.openId)
+  }
+
+  private noteOperatorFailure(error: unknown): void {
+    this.recentFailures.push(classifyOperatorFailure(messageOf(error)))
+    if (this.recentFailures.length > MAX_RECENT_FAILURES) this.recentFailures.shift()
+  }
+
+  private showOperatorStatus(route: MessageRoute): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, () => this.replyOperatorCard(route, 'status'))
+  }
+
+  private showOperatorDiag(route: MessageRoute): Promise<void> {
+    return this.enqueueConversationOperation(route.sessionBaseId, () => this.replyOperatorCard(route, 'diag'))
+  }
+
+  private async replyOperatorCard(route: MessageRoute, kind: 'status' | 'diag'): Promise<void> {
+    if (!this.isOperator(route)) {
+      await this.safeSend(route.chatId, this.text.operatorOnly, routeDeliveryOptions(route))
+      return
+    }
+    const body = kind === 'diag'
+      ? await this.operatorDiagBody(route)
+      : await this.operatorStatusBody(route)
+    if (this.client.sendCard === undefined) {
+      await this.safeSend(route.chatId, body, routeDeliveryOptions(route))
+      return
+    }
+    await this.client.sendCard(
+      route.chatId,
+      renderOperatorCard({ locale: this.locale, kind, body }),
+      routeDeliveryOptions(route),
+    )
+  }
+
+  private async operatorStatusBody(route: MessageRoute): Promise<string> {
+    const conversation = this.conversations.get(route.sessionBaseId)
+    const work = this.operatorWorkState(route.sessionBaseId, conversation)
+    const health = this.client.connectionHealth?.()
+    return formatStatusBody({
+      version: pluginReleaseVersion(),
+      uptimeMs: Math.max(0, Date.now() - this.startedAt),
+      connection: health?.state ?? 'unknown',
+      conversation: classifyConversation({
+        shared: this.sharedSessionBaseId !== undefined,
+        chatType: route.chatType,
+        threaded: route.replyInThread === true,
+      }),
+      project: conversation?.workspaceId === undefined ? 'none' : 'registered',
+      modelProvider: conversation?.modelSelection.provider ?? this.provider,
+      model: conversation?.modelSelection.model ?? this.model,
+      work,
+      ...(this.operatorContextLabel(conversation) === undefined
+        ? {}
+        : { contextLabel: this.operatorContextLabel(conversation) }),
+    }, this.locale)
+  }
+
+  private async operatorDiagBody(route: MessageRoute): Promise<string> {
+    const conversation = this.conversations.get(route.sessionBaseId)
+    let workspaceCount: number | undefined
+    try {
+      const registry = workspaceRegistryOf(this.ctx)
+      workspaceCount = registry === undefined ? undefined : listedWorkspaces(registry).length
+    } catch {
+      workspaceCount = undefined
+    }
+    let storageFlushOk: boolean | undefined
+    if (conversation !== undefined) {
+      try {
+        storageFlushOk = await this.ctx.sessions.flush(conversation.handle.agent.session) === true
+      } catch {
+        storageFlushOk = false
+      }
+    }
+    return formatDiagBody(buildDiagChecks({
+      botReady: this.clientStarted && this.client.connectionHealth?.().state !== 'failed',
+      workspaceCount,
+      persistenceMounted: sessionPersistenceOf(this.ctx) !== undefined,
+      storageFlushOk,
+      providerConfigured: this.provider !== '' && this.model !== '',
+      recentFailures: [...this.recentFailures],
+    }, this.locale), this.locale)
+  }
+
+  private operatorWorkState(
+    sessionId: string,
+    conversation: ConversationSession | undefined,
+  ): OperatorWorkState {
+    if ([...this.pendingHumanInputs.values()].some((item) => item.baseId === sessionId)) {
+      return 'awaiting-input'
+    }
+    if ([...this.pending.values()].some((item) => item.baseId === sessionId)) {
+      return 'awaiting-approval'
+    }
+    if (conversation?.handle.agent.status === 'running') return 'running'
+    return 'idle'
+  }
+
+  private operatorContextLabel(conversation: ConversationSession | undefined): string | undefined {
+    const window = conversation === undefined ? undefined : this.contextWindows.get(conversation.sessionId)
+    if (window === undefined) return undefined
+    return `${window}`
   }
 
   private async requireProjectManager(route: MessageRoute): Promise<boolean> {
@@ -6982,8 +7118,12 @@ export class LarkBridge {
               return false
             }
           })
-        } catch {
-          this.ctx.logger.error('[lark] retired candidate session maintenance failed; retaining its handle')
+        } catch (error) {
+          this.ctx.logger.error(
+            '[lark] retired candidate session maintenance failed; retaining its handle: %s',
+            messageOf(error),
+          )
+          this.noteOperatorFailure(error)
           return
         }
         if (!durable) {
@@ -6997,17 +7137,19 @@ export class LarkBridge {
         this.handles.delete(sessionId)
         await this.disposeReplacedHandle(sessionId, handle, 'candidate')
       })
-    } catch {
-      this.ctx.logger.error('[lark] candidate session retirement failed')
+    } catch (error) {
+      this.ctx.logger.error('[lark] candidate session retirement failed: %s', messageOf(error))
+      this.noteOperatorFailure(error)
       return
     }
     this.handleRetirements.add(retirement)
     const cleanup = (): void => {
       this.handleRetirements.delete(retirement)
     }
-    void retirement.then(cleanup, () => {
+    void retirement.then(cleanup, (error: unknown) => {
       cleanup()
-      this.ctx.logger.error('[lark] candidate session retirement failed')
+      this.ctx.logger.error('[lark] candidate session retirement failed: %s', messageOf(error))
+      this.noteOperatorFailure(error)
     })
   }
 

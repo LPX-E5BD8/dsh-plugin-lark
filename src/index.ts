@@ -48,6 +48,7 @@ export interface LarkConfig {
   maxOutboundImageBytes?: number
   maxOutboundImagePixels?: number
   proactiveDelivery?: boolean
+  operatorFrom?: string[]
 }
 
 export const Config: Schema = Schema.object({
@@ -99,6 +100,7 @@ export const Config: Schema = Schema.object({
     .max(MAX_OUTBOUND_IMAGE_PIXELS)
     .default(DEFAULT_CONFIG.maxOutboundImagePixels),
   proactiveDelivery: Schema.boolean().default(DEFAULT_CONFIG.proactiveDelivery),
+  operatorFrom: Schema.array(Schema.string()).default([]),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -231,6 +233,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         sessionReferenceNamespace: appId,
         notifyOutbox,
         proactiveDelivery: config.proactiveDelivery,
+        operatorFrom: config.operatorFrom ?? [],
       })
       await bridge.start()
     } catch (error) {

@@ -33,6 +33,7 @@ export const DEFAULT_CONFIG = {
   maxOutboundImageBytes: DEFAULT_OUTBOUND_IMAGE_BYTES,
   maxOutboundImagePixels: DEFAULT_OUTBOUND_IMAGE_PIXELS,
   proactiveDelivery: DEFAULT_PROACTIVE_DELIVERY,
+  operatorFrom: [],
 } as const
 
 export const LARK_APP_ID_PATTERN = /^cli_[0-9a-f]{16}$/i
