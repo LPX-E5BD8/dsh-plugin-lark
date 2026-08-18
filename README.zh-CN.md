@@ -14,7 +14,7 @@
 - **图片历史路由安全：** 只按精确压缩后的模型可见 surface 检测图片，阻止模型切换、Session 恢复或普通 prompt 把这段历史发送给纯文本或能力未知路由。
 - **结构化人工输入：** 把官方 `ask_user_question` 工具渲染为有界的原生单选、多选或自由文本卡片，并把已授权回答返回同一个运行中 turn。
 - **可选私聊文本附件：** 通过严格的鉴权、文件名、MIME、字节数与内容检查，接收一个有界的 UTF-8 `.txt`、`.log`、`.patch` 或 `.diff` 消息，不接受 URL，也不创建临时文件。
-- **实时执行卡片：** 将思考过程、待办、重试、上下文压缩、Hook、工作流、工具调用与结果、Token 用量和最终答案持续更新到一张有大小上限的 Card 2.0 卡片中。
+- **实时执行卡片：** 将思考过程、待办、重试、上下文压缩、Hook、工作流、工具调用与结果、Token 用量和最终答案持续更新到一张有大小上限的 Card 2.0 卡片中；服务停机打断执行时会有界尝试移除失效的实时控件。
 - **安全的工具审批与停止：** 审批和停止操作绑定到发起它们的会话、聊天和用户；过期或跨聊天操作默认拒绝。
 - **可靠的回复投递：** 卡片及降级文本始终回复触发消息或原生话题；长答案会完整续发，并通过持久化回执避免常规 WebSocket 重投造成重复执行。
 - **有界的进程内驻留：** 释放已完成持久化检查点的最近最少使用空闲 Agent；再次访问时精确冷恢复原会话，且不会删除历史记录。
@@ -37,13 +37,13 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
 | `0.8.0`–`0.8.4` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持原有 Node 22/Linux 基线；v0.8.4 新增不启动应用的 Web profile package lifecycle 门禁。 |
 
-必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、语义 checkpoint policy、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、Tools、User Questions、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.6 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
+必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、语义 checkpoint policy、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、Tools、User Questions、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.7 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
 
 Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
 
@@ -90,7 +90,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.7'
+version='0.9.8'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -263,6 +263,8 @@ Harness rc.6 的 Web 模型选择器尚未公开可供多个入口共享的 per-
 
 执行区域会限制可见思考内容和近期工具调用数量。运行中卡片在具备 `im:resource` 权限时使用动态加载图，结束后替换为终态图标，并提供绑定到原始会话、聊天和用户的停止按钮。紧凑页脚在一行中展示耗时、上下文窗口占用、缓存命中、输入、输出和思考 Token 用量。
 
+优雅停机会在移除 Session listener 与 REST 投递能力前，同步冻结每一张已知的运行中执行卡：先中断旧卡片写入，把仍在运行的工具标为失败、进行中待办退回待处理，移除“停止执行”，再排在旧投递链后尝试一次最终 PATCH；整个关闭窗口上限为 2 秒，低于 rc.6 的 5 秒宿主 grace。这张卡只声明实时执行已被服务停机打断、持久化结果尚未确认；它不会伪造 Session `turn/end`、续发 partial 长答案，也不能证明并发 Agent teardown 是否提交了终态。硬崩溃、第二次强制信号、取得 message ID 前 create 结果不明或最终 PATCH 结果不明时，远端仍可能残留 stale 卡片。
+
 普通成功回复不带醒目标题；失败、阻塞、取消和达到 Token 上限时使用语义化标题。如果 Card API 不可用，最终助手文本仍会降级为普通文本投递。
 
 对于源自 Lark 的直接 Native `ask_user_question` 调用，桥接器会在一张卡片中渲染最多三个问题：单选、多选和有界自由文本。自定义答案会补充多选，并覆盖单选。模型生成的标题、问题、选项标签和说明全部按纯文本字面量渲染；回调路由只使用内部选项 token，不使用模型 ID。终态卡片不包含问题、答案、表单字段、请求 token 或按钮。不要输入凭据或其他秘密：工具调用中的问题，以及成功提交后的工具结果，都会进入 Harness Session transcript。
@@ -285,7 +287,7 @@ Harness rc.6 的 Web 模型选择器尚未公开可供多个入口共享的 per-
 
 接收成功的文件会变成显式标记的“不可信用户数据”文本 block。安全 basename、已验证 MIME、字节数与内容会按设计进入普通 Harness Session transcript，因此遵循该 backend 的保留、导出、fork 与访问策略。它们不会进入插件日志、哈希回执存储、conversation binding 或错误回复。附件链路不会向 Session 新增平台 resource key、文件 message ID、发送者 ID、凭据、除归一化 MIME 外的原始 headers、原始 SDK 错误或插件/宿主派生的私有路径。Session 原本的会话身份仍遵循已记录的范围契约——兼容的私聊 Session ID 可能独立于附件而由 chat ID 派生。用户提供的正文不会被自动脱敏，当然可能自行包含类似路径的文字。与其他入站 prompt 一样，Agent 接收后、回执提交前若硬崩溃，平台重投仍可能再次提交。
 
-v0.9.7 仍不支持入站图片、主动发送产物、URL、压缩包、通用二进制、音频和视频；这些能力已拆分为后续独立 Roadmap 里程碑。图片历史路由 guard 只处理已由其他可信 surface 写入共享 Harness Session 的 image block，本身不会下载或持久化图片字节。群附件也继续默认拒绝：普通独立文件消息无法携带本通道要求的机器人 @，因此未 @ 文件保持静默，人为构造或显式带 @ 的非文本事件也只收到通用提示。管理界面和通用卡片框架同样不在当前范围内。
+v0.9.8 仍不支持入站图片、主动发送产物、URL、压缩包、通用二进制、音频和视频；这些能力已拆分为后续独立 Roadmap 里程碑。图片历史路由 guard 只处理已由其他可信 surface 写入共享 Harness Session 的 image block，本身不会下载或持久化图片字节。群附件也继续默认拒绝：普通独立文件消息无法携带本通道要求的机器人 @，因此未 @ 文件保持静默，人为构造或显式带 @ 的非文本事件也只收到通用提示。管理界面和通用卡片框架同样不在当前范围内。
 
 ## 运维
 

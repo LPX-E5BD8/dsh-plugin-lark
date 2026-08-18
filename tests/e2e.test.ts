@@ -348,6 +348,16 @@ function stopRequestId(card: unknown): string {
   return actions?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.request_id ?? ''
 }
 
+function withoutDeliverySignals(
+  options: Array<LarkDeliveryOptions | undefined>,
+): Array<Omit<LarkDeliveryOptions, 'signal'> | undefined> {
+  return options.map((entry) => {
+    if (entry === undefined) return undefined
+    const { signal: _signal, ...route } = entry
+    return route
+  })
+}
+
 function assistantMessage(
   turn: number,
   text: string,
@@ -428,7 +438,7 @@ test('e2e: shared session routes queued turns to their originating chats', async
   await flushDeliveries()
 
   assert.deepEqual(client.cards.map((card) => card.chatId), ['chat-a', 'chat-b'])
-  assert.deepEqual(client.cardDeliveryOptions, [
+  assert.deepEqual(withoutDeliverySignals(client.cardDeliveryOptions), [
     { replyToMessageId: 'chat-a-first' },
     { replyToMessageId: 'chat-b-second' },
   ])
@@ -1044,11 +1054,11 @@ test('e2e: thread metadata reaches execution, approval, and long-answer delivery
   })
   await waitFor(() => client.sent.length === 1)
 
-  assert.deepEqual(client.cardDeliveryOptions, [
+  assert.deepEqual(withoutDeliverySignals(client.cardDeliveryOptions), [
     { replyToMessageId: 'thread-message', replyInThread: true },
     { replyToMessageId: 'thread-message', replyInThread: true },
   ])
-  assert.deepEqual(client.textDeliveryOptions, [
+  assert.deepEqual(withoutDeliverySignals(client.textDeliveryOptions), [
     { replyToMessageId: 'thread-message', replyInThread: true },
   ])
   await bridge.stop()
@@ -1572,6 +1582,276 @@ test('e2e: stop cancels only the originating active turn', async () => {
   await flushDeliveries()
   assert.equal(stopRequestId(client.updated.at(-1)?.card), '')
   await bridge.stop()
+})
+
+test('e2e: bridge stop terminalizes every known running Card before REST closes', async () => {
+  const client = createClient()
+  const lifecycle: string[] = []
+  const updateSignals: Array<AbortSignal | undefined> = []
+  client.updateCard = async (messageId, card, options) => {
+    lifecycle.push('update')
+    updateSignals.push(options?.signal)
+    client.updated.push({ messageId, card })
+  }
+  client.stop = async () => { lifecycle.push('stop') }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'keep running through shutdown'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', {
+    type: 'tool/call', time: 1_100,
+    data: { turn: 1, step: 1, callId: 'call-running', name: 'bash', arguments: '{"cmd":"pwd"}' },
+  })
+  host.emit('lark:chat-a', {
+    type: 'todo/write', time: 1_200,
+    data: { todos: [
+      { content: 'Finished item', status: 'completed' },
+      { content: 'Interrupted item', status: 'in_progress' },
+    ] },
+  })
+  host.emit('lark:chat-a', assistantMessage(
+    1,
+    `partial-${'答'.repeat(CARD_LIMITS.maxAnswerRunes)}-must-not-continue`,
+  ))
+  await waitFor(() => client.updated.length >= 3)
+  const requestId = stopRequestId(client.cards[0]?.card)
+  assert.notEqual(requestId, '')
+
+  await bridge.stop()
+
+  const terminal = client.updated.at(-1)?.card as {
+    header?: { template?: string; title?: { content?: string } }
+  }
+  const encoded = JSON.stringify(terminal)
+  assert.equal(terminal.header?.template, 'grey')
+  assert.equal(terminal.header?.title?.content, '已取消')
+  assert.equal(stopRequestId(terminal), '')
+  assert.match(encoded, /服务关闭已中断此卡片的实时执行/)
+  assert.match(encoded, /○ Interrupted item/)
+  assert.doesNotMatch(encoded, /◉ Interrupted item|loading_outlined/)
+  assert.equal(updateSignals.at(-1)?.aborted, false)
+  assert.equal(lifecycle.at(-1), 'stop')
+  assert.deepEqual(client.sent, [])
+  const stale = await client.cardHandler?.({
+    openId: 'owner', chatId: 'chat-a', messageId: 'card-1',
+    value: { action: 'turn_stop', request_id: requestId },
+  })
+  assert.equal(stale?.toast.type, 'info')
+  assert.equal(host.cancelCount(), 0)
+})
+
+test('e2e: shutdown aborts an in-flight running PATCH before its terminal PATCH', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'stall one running patch'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  await waitFor(() => client.cards.length === 1)
+
+  const runningEntered = Promise.withResolvers<void>()
+  let runningSignal: AbortSignal | undefined
+  let terminalSignal: AbortSignal | undefined
+  client.updateCard = async (messageId, card, options) => {
+    const terminal = (card as { header?: { template?: string } }).header?.template === 'grey'
+    if (terminal) {
+      terminalSignal = options?.signal
+      client.updated.push({ messageId, card })
+      return
+    }
+    runningSignal = options?.signal
+    runningEntered.resolve()
+    await new Promise<void>((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+    })
+  }
+  host.emit('lark:chat-a', {
+    type: 'tool/call', time: 1_100,
+    data: { turn: 1, step: 1, callId: 'call-stalled', name: 'bash', arguments: '{"cmd":"pwd"}' },
+  })
+  await runningEntered.promise
+
+  await bridge.stop()
+
+  assert.equal(runningSignal?.aborted, true)
+  assert.equal(terminalSignal?.aborted, false)
+  assert.equal(client.updated.length, 1)
+  assert.equal((client.updated[0]?.card as {
+    header?: { template?: string }
+  }).header?.template, 'grey')
+  assert.equal(stopRequestId(client.updated[0]?.card), '')
+})
+
+test('e2e: shutdown terminalizes active Cards from independent Sessions', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run session a'))
+  await client.messageHandler?.(inbound('chat-b', 'owner', 'run session b'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-b', { type: 'turn/start', time: 1_100, data: { turn: 1 } })
+  await waitFor(() => client.cards.length === 2)
+
+  await bridge.stop()
+
+  const terminalIds = new Set(client.updated.filter(({ card }) => (
+    (card as { header?: { template?: string } }).header?.template === 'grey'
+  )).map(({ messageId }) => messageId))
+  assert.deepEqual(terminalIds, new Set(['card-1', 'card-2']))
+  assert.ok(client.updated.filter(({ messageId }) => terminalIds.has(messageId)).every(({ card }) => (
+    stopRequestId(card) === '' && !JSON.stringify(card).includes('loading_outlined')
+  )))
+})
+
+test('e2e: a stalled shutdown terminal PATCH cannot exceed the host grace budget', async () => {
+  const client = createClient()
+  const host = createHost()
+  let terminalSignal: AbortSignal | undefined
+  let stopped = false
+  client.stop = async () => { stopped = true }
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'stall terminal shutdown patch'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  await waitFor(() => client.cards.length === 1)
+  client.updateCard = async (_messageId, _card, options) => {
+    terminalSignal = options?.signal
+    await new Promise<void>(() => {})
+  }
+
+  const startedAt = Date.now()
+  await bridge.stop()
+  const elapsed = Date.now() - startedAt
+
+  assert.equal(terminalSignal?.aborted, true)
+  assert.equal(stopped, true)
+  assert.ok(elapsed >= 1_500, `shutdown deadline fired too early: ${elapsed}ms`)
+  assert.ok(elapsed < 4_000, `shutdown exceeded host grace: ${elapsed}ms`)
+})
+
+test('e2e: shutdown retries a terminal PATCH for a known Card after running updates fail', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'fail a running update'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  await waitFor(() => client.cards.length === 1)
+  const failedUpdate = Promise.withResolvers<void>()
+  client.updateCard = async () => {
+    failedUpdate.resolve()
+    throw new Error('running update unavailable')
+  }
+  host.emit('lark:chat-a', {
+    type: 'tool/call', time: 1_100,
+    data: { turn: 1, step: 1, callId: 'call-failed', name: 'bash', arguments: '{}' },
+  })
+  host.emit('lark:chat-a', assistantMessage(
+    1,
+    `partial-${'答'.repeat(CARD_LIMITS.maxAnswerRunes)}-must-not-fallback`,
+  ))
+  await failedUpdate.promise
+  await flushDeliveries()
+
+  let terminalUpdates = 0
+  client.updateCard = async (messageId, card) => {
+    terminalUpdates += 1
+    client.updated.push({ messageId, card })
+  }
+  await bridge.stop()
+
+  assert.equal(terminalUpdates, 1)
+  assert.equal((client.updated.at(-1)?.card as {
+    header?: { template?: string }
+  }).header?.template, 'grey')
+  assert.deepEqual(client.sent, [])
+})
+
+test('e2e: shutdown never creates a duplicate terminal Card after creation failure', async () => {
+  const client = createClient()
+  let createAttempts = 0
+  let updateAttempts = 0
+  client.sendCard = async () => {
+    createAttempts += 1
+    throw new Error('creation unavailable')
+  }
+  client.updateCard = async () => { updateAttempts += 1 }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'fail Card creation'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  await flushDeliveries()
+  host.emit('lark:chat-a', assistantMessage(
+    1,
+    `partial-${'答'.repeat(CARD_LIMITS.maxAnswerRunes)}-must-not-fallback`,
+  ))
+  await bridge.stop()
+
+  assert.equal(createAttempts, 1)
+  assert.equal(updateAttempts, 0)
+  assert.deepEqual(client.sent, [])
+})
+
+test('e2e: shutdown aborts an unconfirmed running Card create without duplicating it', async () => {
+  const client = createClient()
+  const createEntered = Promise.withResolvers<void>()
+  let createSignal: AbortSignal | undefined
+  let updateAttempts = 0
+  client.sendCard = async (_chatId, _card, options) => {
+    createSignal = options?.signal
+    createEntered.resolve()
+    await new Promise<void>((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true })
+    })
+    return 'ambiguous-card'
+  }
+  client.updateCard = async () => { updateAttempts += 1 }
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'stall Card creation'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  await createEntered.promise
+  await bridge.stop()
+
+  assert.equal(createSignal?.aborted, true)
+  assert.equal(updateAttempts, 0)
+  assert.deepEqual(client.cards, [])
+})
+
+test('e2e: shutdown never overwrites a naturally completed terminal Card', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'finish before shutdown'))
+  host.emit('lark:chat-a', { type: 'turn/start', time: 1_000, data: { turn: 1 } })
+  host.emit('lark:chat-a', assistantMessage(1, 'Completed before shutdown.'))
+  host.emit('lark:chat-a', {
+    type: 'turn/end', time: 1_200,
+    data: { turn: 1, reason: { kind: 'completed' } },
+  })
+  await waitFor(() => client.updated.length >= 1)
+  await flushDeliveries()
+  const updatesBeforeStop = client.updated.length
+
+  await bridge.stop()
+
+  assert.equal(client.updated.length, updatesBeforeStop)
+  const encoded = JSON.stringify(client.updated.at(-1)?.card)
+  assert.match(encoded, /Completed before shutdown/)
+  assert.doesNotMatch(encoded, /服务关闭已中断/)
 })
 
 test('e2e: a failed turn finishes with an attention card', async () => {
@@ -2195,7 +2475,7 @@ test('e2e: long card replies keep a preview and deliver the complete answer', as
   assert.match(card, /answer-start/)
   assert.doesNotMatch(card, /answer-end/)
   assert.equal(client.sent[0]?.text, `回复较长，以下为完整内容：\n\n${answer}`)
-  assert.deepEqual(client.textDeliveryOptions, [
+  assert.deepEqual(withoutDeliverySignals(client.textDeliveryOptions), [
     { replyToMessageId: 'chat-a-write a long answer' },
   ])
   await bridge.stop()

@@ -422,6 +422,8 @@ interface TurnState {
   usage?: TurnCardUsage
   contextWindow?: number
   readonly stopRequestId: string
+  cardDeliveryAbort: AbortController
+  shutdownTerminalQueued?: boolean
   reasoning?: string
   streamingAnswer?: string
   todos?: TurnCardTodo[]
@@ -509,6 +511,7 @@ const WORKSPACE_REGISTRIES_REQUIRING_REMOUNT = new WeakSet<object>()
 const HUMAN_INPUT_CARD_CLOSE_TIMEOUT_MS = 15_000
 const HUMAN_INPUT_SHUTDOWN_CLOSE_TIMEOUT_MS = 2_000
 const HUMAN_INPUT_CARD_REPAIR_DELAY_MS = 250
+const TURN_CARD_SHUTDOWN_CLOSE_TIMEOUT_MS = 2_000
 
 type HumanInputFailureCode =
   | 'LARK_HUMAN_INPUT_INVALID_REQUEST'
@@ -700,6 +703,30 @@ async function collectSettled<T>(
     else failures.push(result.reason)
   }
   return values
+}
+
+async function runSignalBound<T>(
+  signal: AbortSignal,
+  operation: () => PromiseLike<T> | T,
+): Promise<T> {
+  signal.throwIfAborted()
+  let rejectAbort: ((reason: unknown) => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject
+  })
+  const onAbort = (): void => {
+    rejectAbort?.(signal.reason ?? new Error('lark: Card delivery aborted'))
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  if (signal.aborted) onAbort()
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      aborted,
+    ])
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+  }
 }
 
 function approvalOutcome(decision: string): ApprovalOutcome | undefined {
@@ -1465,6 +1492,7 @@ export class LarkBridge {
     const failures: unknown[] = []
     this.stopping = true
     this.commandAbort.abort()
+    this.terminalizeActiveTurnsForShutdown()
     if (this.disposeEvents !== undefined) {
       this.disposeEvents()
       this.disposeEvents = undefined
@@ -5701,6 +5729,7 @@ export class LarkBridge {
       updatedAt: startedAt,
       status: 'running',
       stopRequestId,
+      cardDeliveryAbort: new AbortController(),
       delivery: Promise.resolve(),
       ...(this.contextWindows.get(sessionId) === undefined
         ? {}
@@ -5988,9 +6017,17 @@ export class LarkBridge {
     const answerTruncated = rendered.answerTruncated || completeAnswer !== turnCard.answer
     const deliveredAnswer = answerTruncated ? undefined : completeAnswer
     const longAnswer = turnCard.status === 'running' || !answerTruncated ? undefined : completeAnswer
+    const deliverySignal = state.cardDeliveryAbort.signal
     const delivery = state.delivery
-      .then(() => this.deliverTurnCard(state, rendered.payload, deliveredAnswer, longAnswer))
+      .then(() => this.deliverTurnCard(
+        state,
+        rendered.payload,
+        deliveredAnswer,
+        longAnswer,
+        deliverySignal,
+      ))
       .catch((error: unknown) => {
+        if (deliverySignal.aborted && this.stopping) return
         state.deliveryDisabled = true
         this.ctx.logger.error('[lark] turn card delivery failed: %s', messageOf(error))
         this.fallbackFailedCard(state)
@@ -6004,23 +6041,28 @@ export class LarkBridge {
     card: Record<string, unknown>,
     answer: string | undefined,
     longAnswer: string | undefined,
+    signal: AbortSignal,
   ): Promise<void> {
     if (state.deliveryDisabled === true) return
     if (state.messageId !== undefined) {
-      await this.client.updateCard!(state.messageId, card)
+      await runSignalBound(signal, () => this.client.updateCard!(
+        state.messageId!,
+        card,
+        { signal },
+      ))
       if (answer !== undefined) state.deliveredAnswer = answer
-      await this.deliverLongAnswer(state, longAnswer)
+      await this.deliverLongAnswer(state, longAnswer, signal)
       return
     }
-    const messageId = await this.client.sendCard!(
+    const messageId = await runSignalBound(signal, () => this.client.sendCard!(
       state.route.chatId,
       card,
-      routeDeliveryOptions(state.route),
-    )
+      { ...routeDeliveryOptions(state.route), signal },
+    ))
     if (typeof messageId === 'string' && messageId !== '') {
       state.messageId = messageId
       if (answer !== undefined) state.deliveredAnswer = answer
-      await this.deliverLongAnswer(state, longAnswer)
+      await this.deliverLongAnswer(state, longAnswer, signal)
       return
     }
     state.deliveryDisabled = true
@@ -6028,8 +6070,92 @@ export class LarkBridge {
     this.fallbackFailedCard(state)
   }
 
+  private terminalizeActiveTurnsForShutdown(): void {
+    const updatedAt = Date.now()
+    for (const turns of this.turns.values()) {
+      for (const state of turns.values()) {
+        if (state.status !== 'running' || state.shutdownTerminalQueued === true) continue
+        state.shutdownTerminalQueued = true
+        this.clearStreamTimer(state)
+        state.status = 'cancelled'
+        state.error = this.text.shutdownInterrupted
+        state.updatedAt = updatedAt
+        state.longAnswerSent = true
+        state.textFallbackSent = true
+        this.terminalizeTurnToolsForShutdown(state, updatedAt)
+        state.todos = state.todos?.map((todo) => (
+          todo.status === 'in_progress' ? { ...todo, status: 'pending' } : todo
+        ))
+        this.pendingStops.delete(state.stopRequestId)
+
+        const priorDelivery = state.delivery
+        state.cardDeliveryAbort.abort(new Error('lark: shutdown interrupted running Card delivery'))
+        let payload: Record<string, unknown>
+        try {
+          payload = renderTurnCardWithMeta(this.turnCard(state)).payload
+        } catch {
+          this.ctx.logger.error('[lark] shutdown turn Card render failed')
+          continue
+        }
+        const terminalAbort = new AbortController()
+        state.cardDeliveryAbort = terminalAbort
+        const closing = this.closeTurnCardForShutdown(
+          state,
+          priorDelivery,
+          payload,
+          terminalAbort,
+        )
+        state.delivery = closing
+        this.trackDelivery(closing)
+      }
+    }
+  }
+
+  private terminalizeTurnToolsForShutdown(state: TurnState, updatedAt: number): void {
+    for (let index = 0; index < state.tools.length; index += 1) {
+      const tool = state.tools[index]
+      if (tool?.status !== 'running') continue
+      state.tools[index] = { ...tool, status: 'failed', updatedAt }
+    }
+  }
+
+  private async closeTurnCardForShutdown(
+    state: TurnState,
+    priorDelivery: Promise<void>,
+    payload: Record<string, unknown>,
+    controller: AbortController,
+  ): Promise<void> {
+    let rejectDeadline: ((reason: unknown) => void) | undefined
+    const deadline = new Promise<never>((_resolve, reject) => {
+      rejectDeadline = reject
+    })
+    const timer = setTimeout(() => {
+      const error = new Error('lark: shutdown turn Card close timed out')
+      controller.abort(error)
+      rejectDeadline?.(error)
+    }, TURN_CARD_SHUTDOWN_CLOSE_TIMEOUT_MS)
+    const closing = (async () => {
+      await Promise.allSettled([priorDelivery])
+      if (state.messageId === undefined || this.client.updateCard === undefined) return
+      await runSignalBound(controller.signal, () => this.client.updateCard!(
+        state.messageId!,
+        payload,
+        { signal: controller.signal },
+      ))
+    })()
+    try {
+      await Promise.race([closing, deadline])
+    } catch {
+      this.ctx.logger.error('[lark] shutdown turn Card update failed')
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   private fallbackFailedCard(state: TurnState): void {
-    if (state.deliveryDisabled !== true || state.status === 'running') return
+    if (state.shutdownTerminalQueued === true
+      || state.deliveryDisabled !== true
+      || state.status === 'running') return
     const answer = state.fullAnswer ?? state.answer
     if (state.deliveredAnswer === answer || state.textFallbackSent === true) return
     if (answer === undefined || answer === '') return
@@ -6041,14 +6167,20 @@ export class LarkBridge {
     ))
   }
 
-  private async deliverLongAnswer(state: TurnState, answer: string | undefined): Promise<void> {
-    if (answer === undefined || state.longAnswerSent === true) return
+  private async deliverLongAnswer(
+    state: TurnState,
+    answer: string | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (state.shutdownTerminalQueued === true
+      || answer === undefined
+      || state.longAnswerSent === true) return
     state.longAnswerSent = true
-    await this.client.sendText(
+    await runSignalBound(signal, () => this.client.sendText(
       state.route.chatId,
       `${this.text.longAnswer}\n\n${answer}`,
-      routeDeliveryOptions(state.route),
-    )
+      { ...routeDeliveryOptions(state.route), signal },
+    ))
     state.deliveredAnswer = answer
   }
 

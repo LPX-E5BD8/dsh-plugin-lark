@@ -44,6 +44,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.5` | Adds no durable schema. It makes the exported Cordis entry non-constructible so root shutdown owns the async disposer, registers a known-message terminal delivery synchronously (or immediately on a late create response), and bounds shutdown Card close below the host grace period. | v0.9.4 reads the same state but can drop its async teardown during real profile unload, leaving a pending form stale and an open tool call to cold repair. Even v0.9.5 may cold-repair the open call after a graceful SIGTERM because rc.6 disposes the Agent concurrently; terminal Card delivery is not a durable tool result. |
 | `0.9.6` | Adds no plugin-owned schema. Opted-in accepted text files become ordinary user text blocks in the Session log; resource keys, download state, and file metadata are not added to receipts or bindings. | v0.9.5 reads Sessions that contain these ordinary text blocks, but reverts every new file message to the generic unsupported path. Rolling back does not remove already committed attachment content from Session history. |
 | `0.9.7` | Adds no durable schema or image bytes. It reads the existing exact model-visible Session surface and exact adapter modality metadata before model/session routing; incompatible checks perform no binding mutation. | v0.9.6 reads the same bindings and Session events but removes the image-history guard. Existing image blocks from another surface remain stored and can again reach a text-only route, where the provider is expected to fail closed. |
+| `0.9.8` | Adds no durable schema. During graceful shutdown it makes a bounded attempt to terminalize every known running execution Card through a signal-aware final PATCH without appending a Session result or sending partial output. | v0.9.7 reads the same state but can leave an already delivered running Card with a stale Stop control after its process-local turn authority disappears. Stop v0.9.8 cleanly before rollback and treat any still-running older Card as stale. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -60,7 +61,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.7'
+target_tag='v0.9.8'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -205,11 +206,12 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.7 | State handling |
+| Rollback target from v0.9.8 | State handling |
 | --- | --- |
+| v0.9.7 | Uses the same durable state and image-routing guard, but removes graceful terminalization for ordinary running execution Cards. A Card still showing Running/Stop after process exit has no live Stop authority; inspect the Session after restart and retry as needed. |
 | v0.9.6 | Uses the same durable state but removes image-aware model and Session routing checks. Image blocks already present through another Harness surface remain in the Session; verify every affected conversation uses an image-capable route before serving ordinary prompts. |
 | v0.9.5 | Uses the same durable state and continues every accepted text attachment already committed as an ordinary user block, but new file messages return to the generic unsupported notice and are never downloaded. Stop cleanly first; no attachment sidecar or temporary-file cleanup exists. |
-| v0.9.4 | Uses the same durable state, but its constructible plugin entry can lose the async disposer during root unload. Pending questions may remain interactive-looking while their process state is gone, and their tool calls cold-repair as interrupted. Prefer roll-forward; if rollback is required, stop v0.9.7 cleanly first and treat every outstanding v0.9.4 Card as stale. |
+| v0.9.4 | Uses the same durable state, but its constructible plugin entry can lose the async disposer during root unload. Pending questions may remain interactive-looking while their process state is gone, and their tool calls cold-repair as interrupted. Prefer roll-forward; if rollback is required, stop v0.9.8 cleanly first and treat every outstanding v0.9.4 Card as stale. |
 | v0.9.3 | Uses the same v2 conversation binding, Workspace domain, and Session logs. Structured Card handling and its process-local pending state disappear; stop cleanly first. Already-sent Cards remain terminal or stale in chat, and every outstanding action is rejected. Completed answers already committed as ordinary tool results remain in the transcript. |
 | v0.9.2 | Uses the same v2 conversation binding, Workspace domain, and Session logs. A Session selected through v0.9.3 remains active because v0.9.2 follows that committed binding, but the `/session` list/resume command disappears and rollback does not restore the previously active Session. No archive, unarchive, delete, or search state was introduced by v0.9.3. |
 | v0.9.1 | No durable-state conversion is required. The older Card payload can be rejected by Feishu, so approvals may become unavailable while remaining fail-closed; retain the full snapshot and prefer roll-forward recovery. |

@@ -165,6 +165,7 @@ interface LocaleCopy {
     readonly humanInputCancelled: string
     readonly humanInputIncomplete: string
     readonly interrupted: string
+    readonly shutdownInterrupted: string
     readonly maxTokens: string
     readonly blocked: string
     readonly cancelled: string
@@ -330,6 +331,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       humanInputCancelled: '已取消回答。',
       humanInputIncomplete: '请完成每个问题后再提交。',
       interrupted: '执行被运行时中断。',
+      shutdownInterrupted: '服务关闭已中断此卡片的实时执行；持久化结果未确认，请重启后检查会话并按需重试。',
       maxTokens: '模型达到输出上限。',
       blocked: '执行被阻塞。',
       cancelled: '执行已取消。',
@@ -523,6 +525,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       humanInputCancelled: 'Answer cancelled.',
       humanInputIncomplete: 'Complete every question before submitting.',
       interrupted: 'Execution was interrupted by the runtime.',
+      shutdownInterrupted: 'Service shutdown interrupted this live execution Card. Its durable result is unconfirmed; check the Session after restart and retry if needed.',
       maxTokens: 'The model reached its output limit.',
       blocked: 'Execution was blocked.',
       cancelled: 'Execution was cancelled.',

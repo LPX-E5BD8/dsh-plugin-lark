@@ -1906,7 +1906,9 @@ test('harness e2e: root-fiber disposal registers and drains the terminal Card be
   await harness.client.messageHandler?.(command('ask during root disposal'))
   await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
   const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  const executionCard = harness.client.cards.find((entry) => !isHumanInputCard(entry.card))
   assert.ok(questionCard !== undefined)
+  assert.ok(executionCard !== undefined)
   const patchEntered = Promise.withResolvers<void>()
   const releasePatch = Promise.withResolvers<void>()
   const originalUpdateCard = harness.client.updateCard?.bind(harness.client)
@@ -1931,6 +1933,11 @@ test('harness e2e: root-fiber disposal registers and drains the terminal Card be
   assert.equal(harness.client.stopped, true)
   const terminal = harness.client.updated.findLast(({ messageId }) => messageId === questionCard.messageId)?.card
   assert.match(JSON.stringify(terminal), /cancelled/u)
+  const executionTerminal = harness.client.updated.findLast(
+    ({ messageId }) => messageId === executionCard.messageId,
+  )?.card
+  assert.match(JSON.stringify(executionTerminal), /Service shutdown interrupted this live execution Card/u)
+  assert.doesNotMatch(JSON.stringify(executionTerminal), /turn_stop|loading_outlined/u)
 })
 
 test('harness e2e: root-fiber disposal shortens a stalled Card close below the host grace budget', async (t) => {
