@@ -146,6 +146,10 @@ interface LocaleCopy {
     readonly help: string
     readonly operatorHelp: string
     readonly operatorOnly: string
+    readonly policyUpdated: string
+    readonly policyUsage: string
+    readonly policyUnavailable: string
+    readonly policyFull: string
     readonly denied: string
     readonly unsupportedInput: string
     readonly inboundTextFileInvalid: string
@@ -311,6 +315,7 @@ interface LocaleCopy {
     readonly notifyAttentionTitle: string
     readonly statusTitle: string
     readonly diagTitle: string
+    readonly policyTitle: string
   }
   readonly event: {
     readonly command: string
@@ -341,8 +346,24 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       operatorHelp: [
         '/status — 查看当前通道状态（仅运维）',
         '/diag — 运行脱敏诊断（仅运维）',
+        '/policy — 查看本会话策略（仅运维）',
+        '/policy set … — 收紧本会话授权、提及、项目、模型与工具策略（仅运维）',
       ].join('\n'),
       operatorOnly: '该命令仅限运维人员。',
+      policyUpdated: '已更新本会话策略。',
+      policyUsage: [
+        '用法：/policy',
+        '/policy set approvals|artifacts|notify on|off',
+        '/policy set mention always|default',
+        '/policy set users add|remove <open_id>',
+        '/policy set users clear',
+        '/policy set projects add|remove <id>',
+        '/policy set projects all',
+        '/policy set models add|remove <provider> <model>',
+        '/policy set models all',
+      ].join('\n'),
+      policyUnavailable: '会话策略暂不可用。',
+      policyFull: '该策略列表已满，请先移除条目。',
       denied: '没有权限。',
       unsupportedInput: '暂不支持图片、文件或其他非文本消息，请改用文字发送。',
       inboundTextFileInvalid: '无法读取该附件。仅支持安全文件名的 UTF-8 .txt、.log、.patch 和 .diff 文本文件。',
@@ -540,6 +561,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       notifyAttentionTitle: '需要关注',
       statusTitle: '通道状态',
       diagTitle: '通道诊断',
+      policyTitle: '会话策略',
     },
     event: {
       command: '命令',
@@ -568,8 +590,24 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       operatorHelp: [
         '/status — show channel status (operators only)',
         '/diag — run a sanitized diagnostic (operators only)',
+        '/policy — show this conversation policy (operators only)',
+        '/policy set … — narrow this conversation user, mention, project, model, and tool policy (operators only)',
       ].join('\n'),
       operatorOnly: 'This command is limited to operators.',
+      policyUpdated: 'Updated this conversation policy.',
+      policyUsage: [
+        'Usage: /policy',
+        '/policy set approvals|artifacts|notify on|off',
+        '/policy set mention always|default',
+        '/policy set users add|remove <open_id>',
+        '/policy set users clear',
+        '/policy set projects add|remove <id>',
+        '/policy set projects all',
+        '/policy set models add|remove <provider> <model>',
+        '/policy set models all',
+      ].join('\n'),
+      policyUnavailable: 'Conversation policy is unavailable.',
+      policyFull: 'This policy list is full. Remove an entry first.',
       denied: "You don't have permission.",
       unsupportedInput: 'Images, files, and other non-text messages are not supported yet. Please send text.',
       inboundTextFileInvalid: 'This attachment cannot be read. Only UTF-8 .txt, .log, .patch, and .diff files with safe names are accepted.',
@@ -762,6 +800,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       notifyAttentionTitle: 'Needs attention',
       statusTitle: 'Channel status',
       diagTitle: 'Channel diagnostic',
+      policyTitle: 'Conversation policy',
     },
     event: {
       command: 'Command',

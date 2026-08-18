@@ -23,6 +23,7 @@
 - **有界的进程内驻留：** 释放已完成持久化检查点的最近最少使用空闲 Agent；再次访问时精确冷恢复原会话，且不会删除历史记录。
 - **本地化与可观测性：** 内置 `zh-CN`、`en-US` 界面文案，并可选提供脱敏的 WebSocket readiness 接口。
 - **运维状态与诊断：** `/status` 和 `/diag` 用 Card 2.0 向运维展示版本、运行时间、连接、会话范围、项目、模型与工作状态，以及脱敏修复建议，不含平台 ID 或秘密。
+- **会话级策略：** 运维可以为单个聊天或群单独收窄额外授权用户、提及要求、可见 Workspace、可选模型，以及允许的审批或出站工具类别。本地规则只与全局默认拒绝配置取交集。
 - **失败时默认拒绝：** 授权默认拒绝、Lark 应用凭据仅允许来自启动环境；媒体摄入必须显式开启且全程有界，审批失败也绝不会放行。
 
 ## 环境要求
@@ -43,7 +44,7 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`；v0.9.14 增加会话级策略。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
@@ -96,7 +97,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.13'
+version='0.9.14'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -196,7 +197,7 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
     allowAllUsers: false
     allowFrom: []                # 已授权的飞书/Lark open_id
     projectManageFrom: []        # 允许在私聊中注册/移除项目的 open_id
-    operatorFrom: []            # 允许使用 /status 和 /diag 的 open_id
+    operatorFrom: []            # 允许使用 /status、/diag 和 /policy 的 open_id
     defaultSessionId: ''         # 留空 = 按私聊/群聊范围隔离
     provider: deepseek-official # 会话没有已保存选择时的默认 provider
     model: deepseek-v4-flash    # 会话没有已保存选择时的默认 model
@@ -220,7 +221,9 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 
 `allowFrom` 默认拒绝：当列表为空且 `allowAllUsers: false` 时，所有用户都无权访问。仅当机器人明确需要公开使用时才设置 `allowAllUsers: true`。托管在 `open.larksuite.com` 的应用应使用 `domain: lark`。
 
-`operatorFrom` 是独立且默认拒绝的运维 allowlist，默认值为空。列出的运维人员仍必须通过普通鉴权。`/status` 和 `/diag` 使用与执行卡相同的 Card 2.0 schema，且绝不包含凭据、聊天/消息/会话 ID、私有路径或原始错误。
+`operatorFrom` 是独立且默认拒绝的运维 allowlist，默认值为空。列出的运维人员仍必须通过普通鉴权。`/status`、`/diag` 和 `/policy` 使用与执行卡相同的 Card 2.0 schema，且绝不包含凭据、聊天/消息/会话 ID、私有路径、哈希值或原始错误。
+
+`/policy` 仅限运维，并在 `lark_policy` storage-domain 单元中持久化一份以哈希为键的单聊天文档。一份文档覆盖一个单聊或一整个群（含群内所有回复串与原生话题），因此新开话题串无法绕过已收紧的群策略。设置 `defaultSessionId` 后所有聊天共享同一会话，也就共享同一份策略文档。本地规则只能收窄全局默认拒绝配置：额外的哈希用户名单与 `allowFrom` 取交集；`mention always` 让群里的命令也必须 @ 机器人；Workspace 与模型名单在列出和切换之前就过滤掉不允许的名称；审批、`send_lark_artifact` 与 `notify_lark` 只要全局开关或本地开关有一个关闭就保持关闭。清空某个本地名单会恢复全局默认，但无法开启全局已禁用的能力。名单收窄不会驱逐会话已经选中的项目或模型，只是不再展示被隐藏的名称。运维始终可以恢复自己锁紧的会话。存储的文档不含明文 open ID，也不含任何密钥。
 
 `projectManageFrom` 是独立且默认拒绝的项目管理 allowlist，默认值为空。管理员仍必须通过普通 `allowFrom`/`allowAllUsers` 鉴权，注册与移除命令只接受私聊；`allowAllUsers: true` 绝不会自动授予项目管理权限。项目管理要求标准可写 Workspace Registry 同时提供 `create`、`delete` 和 `resolveByPath`；只读自定义 Registry 仍只能列出和选择。
 
@@ -250,7 +253,7 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 
 投递仍属于至少一次：如果进程在外部副作用完成后、回执提交前硬退出，该副作用仍可能重复。绑定变更还会受到每会话 1,024 条摘要历史的额外保护；早于该有界历史的重放仍可能再次执行。项目注册/移除会先在 binding 中提交该摘要，再修改独立的宿主 Workspace domain，从而阻止旧注册消息在之后已移除项目后重建注册。两个存储之间采用明确的 at-most-once 边界：若摘要提交后、Registry 调用前崩溃，Registry 不产生效果，相同平台消息会被抑制；应先查看 `/project`，再发送一条新命令。Registry 调用或后置条件存在歧义时，所有 Lark 侧 Workspace 变更与附件索引写入默认拒绝，直到重新挂载 Workspace 服务；其他宿主消费者遵循各自的恢复策略。回执窗口已满时若写入失败，较旧回执可能已被淘汰；回调仍会失败，但有效防重窗口可能暂时缩小。不要让多个 Harness 进程共享同一个 JSON 存储根目录，该后端没有跨进程写锁。即使使用不同存储根，多个进程同时连接同一个机器人也不构成精确一次配置。
 
-桥接器命令包括 `/start`（`/help` 的别名）、`/help`、`/new`、`/clear`、`/project`、`/project [Workspace 标题或完整 ID]`、`/project register <名称>`、`/project remove <完整 ID>`、`/session`、`/session list [页码]`、`/session resume <完整引用>`、`/model` 和 `/model <provider-id> <model-id>`。会话恢复不接受标题、原始 Session ID 或文件系统路径。直接发送 `/project` 会列出当前及可用注册，但不会泄露文件系统路径。注册路径只能取自当前 Session header，经 canonical 化且必须是现存目录；名称会归一化并限制长度，注册不会重置 Session，也不会立即把它加入 Workspace 索引。同一路径重复注册保持幂等且不会重命名。移除只接受精确完整 ID，也只删除 Registry 元数据：目录、文件、Agent、Session、binding 和 transcript 都保留，仍在运行的 Session 只会变成未分组。选中 Workspace 后会启动空白会话 generation；旧 transcript 继续保留，但聊天历史不会跨项目带入。创建新 generation 前，桥接器必须先确认旧 transcript 的检查点，再重新校验 Workspace；任一检查失败都会保留旧的实时绑定。未知、歧义、目录缺失或未注册的 Workspace 都会被拒绝，当前会话保持不变。
+桥接器命令包括 `/start`（`/help` 的别名）、`/help`、`/new`、`/clear`、`/project`、`/project [Workspace 标题或完整 ID]`、`/project register <名称>`、`/project remove <完整 ID>`、`/session`、`/session list [页码]`、`/session resume <完整引用>`、`/model`、`/model <provider-id> <model-id>`，以及仅限运维的 `/status`、`/diag` 和 `/policy`。会话恢复不接受标题、原始 Session ID 或文件系统路径。直接发送 `/project` 会列出当前及可用注册，但不会泄露文件系统路径。注册路径只能取自当前 Session header，经 canonical 化且必须是现存目录；名称会归一化并限制长度，注册不会重置 Session，也不会立即把它加入 Workspace 索引。同一路径重复注册保持幂等且不会重命名。移除只接受精确完整 ID，也只删除 Registry 元数据：目录、文件、Agent、Session、binding 和 transcript 都保留，仍在运行的 Session 只会变成未分组。选中 Workspace 后会启动空白会话 generation；旧 transcript 继续保留，但聊天历史不会跨项目带入。创建新 generation 前，桥接器必须先确认旧 transcript 的检查点，再重新校验 Workspace；任一检查失败都会保留旧的实时绑定。未知、歧义、目录缺失或未注册的 Workspace 都会被拒绝，当前会话保持不变。
 
 `/session` 与 `/session list [页码]` 最多展示 200 个合格候选，每页 10 个。每行包含不透明完整引用、最多显示 80 个 Unicode 码点的已存标题、最多 120 个码点的项目标签，以及在 Session 时间戳可表示时生成的 ISO 创建时间。已存 Session Title 可能是由首条人类 prompt 生成的确定性 fallback；清洗和截断只能防止平台标记注入，并不等于内容脱敏。同一精确范围内的所有已授权用户都能看到该标题。列表不会包含原始 Session ID、文件系统路径、完整消息、助手答案或工具正文。
 

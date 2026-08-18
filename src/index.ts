@@ -18,6 +18,7 @@ import {
 } from './outbound-artifact.ts'
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { DurableNotifyOutbox } from './outbound-notify.ts'
+import { DurableConversationPolicyStore } from './conversation-policy.ts'
 import { LarkSdkClient } from './lark.ts'
 import { LARK_LOCALES } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
@@ -115,6 +116,7 @@ async function cleanupRuntime(
   deduplicator: DurableInboundDeduplicator,
   conversationBindings: DurableConversationBindingStore,
   notifyOutbox?: DurableNotifyOutbox,
+  conversationPolicies?: DurableConversationPolicyStore,
 ): Promise<unknown[]> {
   const failures: unknown[] = []
   if (bridge !== undefined) {
@@ -141,6 +143,13 @@ async function cleanupRuntime(
       failures.push(error)
     }
   }
+  if (conversationPolicies !== undefined) {
+    try {
+      await conversationPolicies.close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
   return failures
 }
 
@@ -152,15 +161,26 @@ async function openRuntimeStorage(
   readonly deduplicator: DurableInboundDeduplicator
   readonly conversationBindings: DurableConversationBindingStore
   readonly notifyOutbox?: DurableNotifyOutbox
+  readonly conversationPolicies: DurableConversationPolicyStore
 }> {
   const deduplicator = await DurableInboundDeduplicator.open(ctx.storageDomain, appId)
   try {
     const conversationBindings = await DurableConversationBindingStore.open(ctx.storageDomain, appId)
-    if (!proactiveDelivery) return { deduplicator, conversationBindings }
+    let conversationPolicies: DurableConversationPolicyStore
+    try {
+      conversationPolicies = await DurableConversationPolicyStore.open(ctx.storageDomain, appId)
+    } catch (error) {
+      await conversationBindings.close().catch(() => {})
+      throw error
+    }
+    if (!proactiveDelivery) {
+      return { deduplicator, conversationBindings, conversationPolicies }
+    }
     try {
       const notifyOutbox = await DurableNotifyOutbox.open(ctx.storageDomain, appId)
-      return { deduplicator, conversationBindings, notifyOutbox }
+      return { deduplicator, conversationBindings, notifyOutbox, conversationPolicies }
     } catch (error) {
+      await conversationPolicies.close().catch(() => {})
       await conversationBindings.close().catch(() => {})
       throw error
     }
@@ -190,7 +210,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
     throw new Error('lark: appId must match cli_<16 hexadecimal characters>')
   }
   return (async () => {
-    const { deduplicator, conversationBindings, notifyOutbox } = await openRuntimeStorage(
+    const { deduplicator, conversationBindings, notifyOutbox, conversationPolicies } = await openRuntimeStorage(
       ctx,
       appId,
       config.proactiveDelivery === true,
@@ -234,10 +254,17 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         notifyOutbox,
         proactiveDelivery: config.proactiveDelivery,
         operatorFrom: config.operatorFrom ?? [],
+        conversationPolicies,
       })
       await bridge.start()
     } catch (error) {
-      const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings, notifyOutbox)
+      const failures = await cleanupRuntime(
+        bridge,
+        deduplicator,
+        conversationBindings,
+        notifyOutbox,
+        conversationPolicies,
+      )
       if (failures.length > 0) {
         throw new AggregateError([error, ...failures], 'lark: startup and cleanup failed')
       }
@@ -246,7 +273,13 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
     let teardown: Promise<void> | undefined
     return () => {
       teardown ??= (async () => {
-        const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings, notifyOutbox)
+        const failures = await cleanupRuntime(
+          bridge,
+          deduplicator,
+          conversationBindings,
+          notifyOutbox,
+          conversationPolicies,
+        )
         if (failures.length > 0) throw new AggregateError(failures, 'lark: plugin teardown failed')
       })()
       return teardown

@@ -120,6 +120,20 @@ import type {
   PreparedOutboundArtifact,
 } from './outbound-artifact.ts'
 import {
+  applyPolicyMutation,
+  defaultConversationPolicy,
+  formatPolicyBody,
+  inboundAllowedByMention,
+  intersectPolicy,
+  parsePolicyMutation,
+  policyAllowsModel,
+  policyAllowsUser,
+  policyAllowsWorkspace,
+  type ConversationPolicy,
+  type DurableConversationPolicyStore,
+  type EffectivePolicy,
+} from './conversation-policy.ts'
+import {
   buildDiagChecks,
   classifyConversation,
   classifyOperatorFailure,
@@ -170,6 +184,7 @@ export interface LarkBridgeOptions {
   conversationBindings?: ConversationBindingStore
   notifyOutbox?: DurableNotifyOutbox
   proactiveDelivery?: boolean
+  conversationPolicies?: DurableConversationPolicyStore
 }
 
 interface ConversationSession {
@@ -658,7 +673,7 @@ const RECENT_INBOUND_LIMIT = 1024
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const INBOUND_MUTATION_HASH_DOMAIN = 'dsh-plugin-lark/conversation-mutation/v1'
 const BRIDGE_COMMANDS = new Set([
-  'start', 'help', 'new', 'clear', 'project', 'session', 'model', 'status', 'diag',
+  'start', 'help', 'new', 'clear', 'project', 'session', 'model', 'status', 'diag', 'policy',
 ])
 const UNSUPPORTED_RUNTIME_COMMANDS = new Set(['feedback', 'export'])
 const MODEL_CATALOG_PROVIDER_LIMIT = 32
@@ -1612,6 +1627,7 @@ export class LarkBridge {
   private readonly allowAllUsers: boolean
   private readonly projectManageFrom: ReadonlySet<string>
   private readonly operatorFrom: ReadonlySet<string>
+  private readonly conversationPolicies: DurableConversationPolicyStore | undefined
   private readonly sharedSessionBaseId: string | undefined
   private readonly provider: string
   private readonly model: string
@@ -1647,6 +1663,7 @@ export class LarkBridge {
   private readonly turns = new Map<string, Map<number, TurnState>>()
   private readonly activeRoutes = new Map<string, MessageRoute>()
   private readonly contextWindows = new Map<string, number>()
+  private readonly policyBaseIds = new Map<string, string>()
   private readonly pending = new Map<string, PendingApproval>()
   private readonly pendingHumanInputs = new Map<string, PendingHumanInput>()
   private readonly pendingHumanInputMessages = new Map<string, PendingHumanInput>()
@@ -1712,6 +1729,7 @@ export class LarkBridge {
     this.conversationBindings = options.conversationBindings ?? conversationBindingsOf(ctx)
     this.notifyOutbox = options.notifyOutbox
     this.proactiveDelivery = options.proactiveDelivery === true
+    this.conversationPolicies = options.conversationPolicies
     this.locale = options.locale ?? DEFAULT_CONFIG.locale
     this.text = localeCopy(this.locale).bridge
     this.allowFrom = new Set((options.allowFrom ?? []).map((openId) => openId.trim()).filter(Boolean))
@@ -2006,7 +2024,9 @@ export class LarkBridge {
   private async handleInboundOnce(msg: LarkInbound): Promise<void> {
     const isTextMessage = msg.messageType === undefined || msg.messageType === 'text'
     const command = isTextMessage ? inboundCommand(msg.text) : undefined
-    if (msg.chatType === 'group' && !msg.mentioned && command === undefined) return
+    const sessionBaseId = this.sessionBaseId(msg)
+    const policy = this.effectivePolicy(sessionBaseId)
+    if (!inboundAllowedByMention(policy, msg.chatType, msg.mentioned, command !== undefined)) return
     const replyInThread = msg.chatType === 'group' && hasPlatformId(msg.threadId)
     const mutationHash = inboundMutationHash(msg.chatId, msg.messageId)
     const route: MessageRoute = {
@@ -2015,11 +2035,11 @@ export class LarkBridge {
       mentioned: msg.mentioned,
       openId: msg.openId,
       replyToMessageId: msg.messageId,
-      sessionBaseId: this.sessionBaseId(msg),
+      sessionBaseId,
       ...(mutationHash === undefined ? {} : { mutationHash }),
       ...(replyInThread ? { replyInThread: true } : {}),
     }
-    if (!this.authorized(msg.openId)) {
+    if (!this.authorized(msg.openId, sessionBaseId)) {
       await this.safeSend(route.chatId, this.text.denied, routeDeliveryOptions(route))
       return
     }
@@ -2574,9 +2594,14 @@ export class LarkBridge {
     }
   }
 
-  private authorized(openId: string): boolean {
+  private authorized(openId: string, baseId?: string): boolean {
     if (openId === '') return false
-    return this.allowAllUsers || this.allowFrom.has(openId)
+    if (!this.allowAllUsers && !this.allowFrom.has(openId)) return false
+    if (baseId === undefined || this.operatorFrom.has(openId)) return true
+    // No policy store means no conversation-scoped narrowing, not a denial.
+    const policies = this.conversationPolicies
+    if (policies === undefined) return true
+    return policyAllowsUser(this.effectivePolicy(baseId), policies.principalHash(openId))
   }
 
   private hasApprovalSeam(): boolean {
@@ -2618,6 +2643,9 @@ export class LarkBridge {
     const sessionId = String(req.agent.session.id)
     const route = this.approvalRoute(sessionId)
     if (route === undefined) return next()
+    if (!this.effectivePolicy(route.sessionBaseId).approvals) {
+      return Promise.resolve(APPROVAL_OUTCOME.unavailable)
+    }
     const outboundArtifact = req.toolName === OUTBOUND_ARTIFACT_TOOL_NAME
       && req.callId !== undefined
       ? this.outboundArtifactApprovals.get(
@@ -3257,7 +3285,8 @@ export class LarkBridge {
     }
     if (conversation === undefined
       || !this.outboundArtifactExpectationCurrent(expectation)
-      || !this.authorized(route.openId)) {
+      || !this.authorized(route.openId, route.sessionBaseId)
+      || !this.effectivePolicy(route.sessionBaseId).outboundArtifacts) {
       throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact turn is no longer active.')
     }
     const registry = workspaceRegistryOf(this.ctx)
@@ -3694,6 +3723,7 @@ export class LarkBridge {
       || outbox === undefined
       || !this.proactiveDelivery
       || route === undefined
+      || !this.effectivePolicy(route.sessionBaseId).notify
       || exec.parent !== undefined
       || exec.signal.aborted
       || this.stopping) {
@@ -3997,6 +4027,9 @@ export class LarkBridge {
       case '/diag':
         await this.showOperatorDiag(route)
         break
+      case '/policy':
+        await this.handlePolicyCommand(route, text)
+        break
       default:
         await this.executeRuntimeCommand(route, text, command)
     }
@@ -4016,9 +4049,13 @@ export class LarkBridge {
         await this.safeSend(route.chatId, this.text.projectUnavailable, routeDeliveryOptions(route))
         return
       }
-      const workspaces = listedWorkspaces(registry)
+      const policy = this.effectivePolicy(route.sessionBaseId)
+      const registered = listedWorkspaces(registry)
+      const workspaces = registered.filter((workspace) => policyAllowsWorkspace(policy, workspace.id))
       await this.withConversation(route.sessionBaseId, async (conversation) => {
-        const current = await this.currentWorkspace(conversation, registry, workspaces)
+        // A later narrowing hides a Workspace from the list without evicting an
+        // already-selected one, so the current entry resolves against the registry.
+        const current = await this.currentWorkspace(conversation, registry, registered)
         const canRegisterCurrent = this.canManageProjects(route)
           && !this.workspaceMutationRecoveryRequired
           && registry.create !== undefined
@@ -4100,6 +4137,61 @@ export class LarkBridge {
     return this.operatorFrom.has(route.openId)
   }
 
+  private effectivePolicy(baseId: string) {
+    return intersectPolicy({
+      outboundArtifacts: this.outboundArtifacts,
+      proactiveDelivery: this.proactiveDelivery,
+    }, this.conversationPolicies?.read(this.policyScopeId(baseId)))
+  }
+
+  private handlePolicyCommand(route: MessageRoute, text: string): Promise<void> {
+    return this.enqueueConversationOperation(
+      route.sessionBaseId,
+      () => this.runPolicyCommand(route, text),
+    )
+  }
+
+  private async runPolicyCommand(route: MessageRoute, text: string): Promise<void> {
+    if (!this.isOperator(route)) {
+      await this.safeSend(route.chatId, this.text.operatorOnly, routeDeliveryOptions(route))
+      return
+    }
+    const store = this.conversationPolicies
+    if (store === undefined) {
+      await this.safeSend(route.chatId, this.text.policyUnavailable, routeDeliveryOptions(route))
+      return
+    }
+    const trimmed = text.trim()
+    if (trimmed === '/policy') {
+      await this.replyOperatorCard(route, 'policy')
+      return
+    }
+    const mutation = parsePolicyMutation(trimmed)
+    if (mutation === undefined) {
+      await this.safeSend(route.chatId, this.text.policyUsage, routeDeliveryOptions(route))
+      return
+    }
+    const scope = this.policyScopeId(route.sessionBaseId)
+    const current = store.read(scope) ?? defaultConversationPolicy()
+    let next: ConversationPolicy
+    try {
+      next = applyPolicyMutation(current, mutation, (openId) => store.principalHash(openId))
+    } catch {
+      await this.safeSend(route.chatId, this.text.policyFull, routeDeliveryOptions(route))
+      return
+    }
+    try {
+      await store.put(scope, next)
+    } catch (error) {
+      this.noteOperatorFailure(error)
+      this.ctx.logger.error('[lark] conversation policy write failed')
+      await this.safeSend(route.chatId, this.text.policyUnavailable, routeDeliveryOptions(route))
+      return
+    }
+    await this.safeSend(route.chatId, this.text.policyUpdated, routeDeliveryOptions(route))
+    await this.replyOperatorCard(route, 'policy')
+  }
+
   private noteOperatorFailure(error: unknown): void {
     this.recentFailures.push(classifyOperatorFailure(messageOf(error)))
     if (this.recentFailures.length > MAX_RECENT_FAILURES) this.recentFailures.shift()
@@ -4113,14 +4205,32 @@ export class LarkBridge {
     return this.enqueueConversationOperation(route.sessionBaseId, () => this.replyOperatorCard(route, 'diag'))
   }
 
-  private async replyOperatorCard(route: MessageRoute, kind: 'status' | 'diag'): Promise<void> {
+  private policyBaseIdForSession(sessionId: ReturnType<typeof SessionId>): string {
+    const key = String(sessionId)
+    const noted = this.policyBaseIds.get(key)
+    if (noted !== undefined) return noted
+    for (const conversation of this.conversations.values()) {
+      if (conversation.sessionId === key) return conversation.baseId
+    }
+    return key
+  }
+
+  // openHandle registers conversation-scoped tools before the conversation entry
+  // exists, so the owning base id has to be recorded before the handle opens.
+  private notePolicySession(baseId: string, sessionId: ReturnType<typeof SessionId>): void {
+    this.policyBaseIds.set(String(sessionId), baseId)
+  }
+
+  private async replyOperatorCard(route: MessageRoute, kind: 'status' | 'diag' | 'policy'): Promise<void> {
     if (!this.isOperator(route)) {
       await this.safeSend(route.chatId, this.text.operatorOnly, routeDeliveryOptions(route))
       return
     }
     const body = kind === 'diag'
       ? await this.operatorDiagBody(route)
-      : await this.operatorStatusBody(route)
+      : kind === 'policy'
+        ? formatPolicyBody(this.effectivePolicy(route.sessionBaseId), this.locale)
+        : await this.operatorStatusBody(route)
     if (this.client.sendCard === undefined) {
       await this.safeSend(route.chatId, body, routeDeliveryOptions(route))
       return
@@ -4619,7 +4729,10 @@ export class LarkBridge {
         return
       }
       const result = await this.enqueueWorkspaceMutation<ProjectSwitchCommandResult>(async () => {
-        const resolved = await this.resolveProjectSelection(target)
+        const resolved = await this.resolveProjectSelection(
+          target,
+          this.effectivePolicy(route.sessionBaseId),
+        )
         if (resolved.kind !== 'selected') return resolved
         return this.withConversation(route.sessionBaseId, async (conversation) => {
           await this.sessionOperations.get(conversation.baseId)
@@ -4632,6 +4745,7 @@ export class LarkBridge {
 
   private async resolveProjectSelection(
     target: string,
+    policy: EffectivePolicy,
   ): Promise<ProjectSelectionResult> {
     let registry: WorkspaceRegistryLike | undefined
     let workspaces: RegisteredWorkspace[]
@@ -4646,7 +4760,9 @@ export class LarkBridge {
       if (sessionPersistenceOf(this.ctx) === undefined || this.conversationBindings === undefined) {
         return { kind: 'unavailable' }
       }
-      workspaces = listedWorkspaces(registry)
+      workspaces = listedWorkspaces(registry).filter((workspace) => (
+        policyAllowsWorkspace(policy, workspace.id)
+      ))
     } catch {
       this.ctx.logger.warn('[lark] project registry lookup failed')
       return { kind: 'unavailable' }
@@ -4743,6 +4859,7 @@ export class LarkBridge {
           const { agentPreset } = activeSessionComposition(previousHandle.agent.session)
           const generation = this.nextSessionGeneration(baseId)
           sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
+          this.notePolicySession(baseId, sessionId)
           handle = await this.ensureHandle(
             sessionId,
             false,
@@ -5317,6 +5434,7 @@ export class LarkBridge {
             this.commandAbort.signal,
           )
             ?? this.defaultModelSelection()
+          this.notePolicySession(baseId, candidate.sessionId)
           handle = await this.ensureHandle(
             candidate.sessionId,
             true,
@@ -5525,11 +5643,18 @@ export class LarkBridge {
             return
           }
           const catalog = await this.modelCatalog(llm)
+          const policy = this.effectivePolicy(route.sessionBaseId)
+          const groups = catalog.groups.flatMap((group) => {
+            const models = group.models.filter((model) => (
+              policyAllowsModel(policy, model.provider, model.id)
+            ))
+            return models.length === 0 ? [] : [{ ...group, models }]
+          })
           await this.safeSend(
             route.chatId,
             this.text.modelList(
               conversation.modelSelection,
-              catalog.groups,
+              groups,
               catalog.providerIds.has(conversation.modelSelection.provider),
               catalog.partial,
               catalog.truncated,
@@ -5622,7 +5747,12 @@ export class LarkBridge {
     return this.enqueueConversationBarrier(route.sessionBaseId, async () => {
       const deliveryOptions = routeDeliveryOptions(route)
       const requested = modelTarget(input)
-      if (requested === undefined) {
+      if (requested === undefined
+        || !policyAllowsModel(
+          this.effectivePolicy(route.sessionBaseId),
+          requested.provider,
+          requested.model,
+        )) {
         await this.safeSend(route.chatId, this.text.modelUnknown, deliveryOptions)
         return
       }
@@ -6289,6 +6419,7 @@ export class LarkBridge {
           const composition = activeSessionComposition(previousHandle.agent.session)
           const generation = this.nextSessionGeneration(baseId)
           sessionId = SessionId(`${baseId}${SESSION_RESET_SEPARATOR}${generation}-${randomUUID()}`)
+          this.notePolicySession(baseId, sessionId)
           handle = await this.ensureHandle(
             sessionId,
             false,
@@ -6740,6 +6871,7 @@ export class LarkBridge {
   private async openConversation(baseId: string): Promise<ConversationSession> {
     const binding = await this.resolveSessionBinding(baseId)
     const modelSelection = binding.modelSelection ?? this.defaultModelSelection()
+    this.notePolicySession(baseId, binding.sessionId)
     const handle = await this.ensureHandle(
       binding.sessionId,
       binding.persisted,
@@ -6765,6 +6897,24 @@ export class LarkBridge {
     this.conversations.set(baseId, entry)
     this.touchConversation(entry)
     return entry
+  }
+
+  // ROADMAP 0.9.14 scopes policy to a chat or group. Group conversation ids are
+  // per reply tree, so a tree-scoped document would evaporate in the next thread.
+  private policyScopeId(baseId: string): string {
+    const prefix = `${DEFAULT_CONFIG.sessionPrefix}${SESSION_RESET_SEPARATOR}`
+    if (!baseId.startsWith(prefix)) return baseId
+    const scoped = baseId.slice(prefix.length)
+    const groupPrefix = `${GROUP_SESSION_SCOPE_VERSION}:`
+    if (!scoped.startsWith(groupPrefix)) return scoped
+    const chat = scoped.slice(groupPrefix.length)
+    const separator = chat.indexOf(':')
+    if (separator <= 0) return baseId
+    try {
+      return decodeURIComponent(chat.slice(0, separator))
+    } catch {
+      return baseId
+    }
   }
 
   private sessionBaseId(msg: Pick<
@@ -7023,6 +7173,7 @@ export class LarkBridge {
       installModelSelection(agentCtx, modelSelectionRef)
       await composition.setup?.(agentCtx)
       if (this.outboundArtifacts
+        && this.effectivePolicy(this.policyBaseIdForSession(sessionId)).outboundArtifacts
         && process.platform === 'linux'
         && this.client.uploadArtifact !== undefined
         && this.client.sendArtifact !== undefined
@@ -7031,7 +7182,9 @@ export class LarkBridge {
         && workspaceRegistryOf(this.ctx) !== undefined) {
         agentCtx.tools.register(this.outboundArtifactTool(sessionId))
       }
-      if (this.proactiveDelivery && this.notifyOutbox !== undefined) {
+      if (this.proactiveDelivery
+        && this.notifyOutbox !== undefined
+        && this.effectivePolicy(this.policyBaseIdForSession(sessionId)).notify) {
         agentCtx.tools.register(this.notifyLarkTool(sessionId))
       }
       const scopedTools = (agentCtx as unknown as { tools?: {
@@ -7819,6 +7972,7 @@ export class LarkBridge {
     this.turns.delete(sessionId)
     this.activeRoutes.delete(sessionId)
     this.contextWindows.delete(sessionId)
+    this.policyBaseIds.delete(sessionId)
     for (const [requestId, pending] of this.pendingStops) {
       if (pending.sessionId === sessionId) this.pendingStops.delete(requestId)
     }

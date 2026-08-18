@@ -459,8 +459,213 @@ test('e2e: help replies to the command message', async () => {
   })
 
   assert.equal(client.sent.length, 1)
+  assert.match(client.sent.at(-1)?.text ?? '', /\/new/u)
   assert.deepEqual(client.textDeliveryOptions, [{ replyToMessageId: 'help-message' }])
   await bridge.stop()
+})
+
+// An absent policy store means "no conversation-scoped narrowing", never "deny".
+test('e2e: an authorized user is served without a conversation policy store', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, { client, allowFrom: ['owner'] })
+  await bridge.start()
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/help'),
+    messageId: 'no-policy-store',
+  })
+
+  assert.match(client.sent.at(-1)?.text ?? '', /\/new/u)
+  assert.doesNotMatch(client.sent.at(-1)?.text ?? '', /permission|没有权限/u)
+  await bridge.stop()
+})
+
+test('e2e: /policy is operator-only and can only narrow notify', async () => {
+  const client = createClient()
+  const host = createHost()
+  const { DurableConversationPolicyStore } = await import('../src/conversation-policy.ts')
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const Storage = (await import('@deepseek-ai/dsh-storage')).default
+  const StorageDomain = await import('@deepseek-ai/dsh-storage-domain')
+  const StorageJson = await import('@deepseek-ai/dsh-storage-json')
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-policy-e2e-'))
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  await ctx.plugin(StorageJson, { root })
+  await ctx.plugin(StorageDomain, { backend: 'json' })
+  const policies = await DurableConversationPolicyStore.open(ctx.storageDomain, 'cli_policye2e0001')
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner', 'guest'],
+    operatorFrom: ['owner'],
+    proactiveDelivery: true,
+    conversationPolicies: policies,
+  })
+  await bridge.start()
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'guest', '/policy set notify off'),
+    messageId: 'policy-guest',
+  })
+  assert.match(client.sent.at(-1)?.text ?? '', /limited to operators|仅限运维/u)
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/policy set notify off'),
+    messageId: 'policy-owner',
+  })
+  const encoded = JSON.stringify(client.cards)
+  assert.match(encoded, /"element_id":"policy"/u)
+  assert.match(encoded, /Proactive notify: off|主动通知：关闭/u)
+  assert.doesNotMatch(encoded, /oc_|ou_|secret|[0-9a-f]{64}/u)
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/policy set users add owner'),
+    messageId: 'policy-users',
+  })
+  const userCard = JSON.stringify(client.cards.at(-1))
+  assert.match(userCard, /Extra allowlist: 1 users|额外授权：1 人/u)
+  assert.doesNotMatch(userCard, /guest|ou_|owner/u)
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'guest', '/help'),
+    messageId: 'policy-guest-denied',
+  })
+  assert.match(client.sent.at(-1)?.text ?? '', /permission|没有权限/u)
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/help'),
+    messageId: 'policy-owner-still',
+  })
+  assert.match(client.sent.at(-1)?.text ?? '', /\/new/u)
+  await bridge.stop()
+  await policies.close()
+  await ctx.fiber.dispose()
+  await rm(root, { recursive: true, force: true })
+})
+
+test('e2e: conversation mention policy can require group mentions for commands', async () => {
+  const client = createClient()
+  const host = createHost()
+  const { DurableConversationPolicyStore } = await import('../src/conversation-policy.ts')
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const Storage = (await import('@deepseek-ai/dsh-storage')).default
+  const StorageDomain = await import('@deepseek-ai/dsh-storage-domain')
+  const StorageJson = await import('@deepseek-ai/dsh-storage-json')
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-policy-mention-'))
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  await ctx.plugin(StorageJson, { root })
+  await ctx.plugin(StorageDomain, { backend: 'json' })
+  const policies = await DurableConversationPolicyStore.open(ctx.storageDomain, 'cli_policymention01')
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner'],
+    operatorFrom: ['owner'],
+    conversationPolicies: policies,
+  })
+  await bridge.start()
+  await client.messageHandler?.({
+    ...groupInbound({
+      chatId: 'group-a',
+      text: '/policy set mention always',
+      messageId: 'mention-set',
+      rootId: 'mention-root',
+      openId: 'owner',
+      mentioned: true,
+    }),
+  })
+  const before = client.sent.length
+  await client.messageHandler?.({
+    ...groupInbound({
+      chatId: 'group-a',
+      text: '/help',
+      messageId: 'mention-help-silent',
+      rootId: 'mention-root',
+      openId: 'owner',
+      mentioned: false,
+    }),
+  })
+  assert.equal(client.sent.length, before)
+  await client.messageHandler?.({
+    ...groupInbound({
+      chatId: 'group-a',
+      text: '/help',
+      messageId: 'mention-help-ok',
+      rootId: 'mention-root',
+      openId: 'owner',
+      mentioned: true,
+    }),
+  })
+  assert.match(client.sent.at(-1)?.text ?? '', /\/new/u)
+  await bridge.stop()
+  await policies.close()
+  await ctx.fiber.dispose()
+  await rm(root, { recursive: true, force: true })
+})
+
+test('e2e: a group policy binds the whole group, not one reply tree', async () => {
+  const client = createClient()
+  const host = createHost()
+  const { DurableConversationPolicyStore } = await import('../src/conversation-policy.ts')
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const Storage = (await import('@deepseek-ai/dsh-storage')).default
+  const StorageDomain = await import('@deepseek-ai/dsh-storage-domain')
+  const StorageJson = await import('@deepseek-ai/dsh-storage-json')
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-policy-group-'))
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  await ctx.plugin(StorageJson, { root })
+  await ctx.plugin(StorageDomain, { backend: 'json' })
+  const policies = await DurableConversationPolicyStore.open(ctx.storageDomain, 'cli_policygroup01')
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner', 'guest'],
+    operatorFrom: ['owner'],
+    conversationPolicies: policies,
+  })
+  await bridge.start()
+
+  await client.messageHandler?.(groupInbound({
+    chatId: 'group-a',
+    text: '/policy set users add owner',
+    messageId: 'group-policy-set',
+    rootId: 'tree-one',
+    openId: 'owner',
+    mentioned: true,
+  }))
+  assert.match(JSON.stringify(client.cards.at(-1)), /Extra allowlist: 1 users|额外授权：1 人/u)
+
+  // A different reply tree in the same group must inherit the group policy.
+  await client.messageHandler?.(groupInbound({
+    chatId: 'group-a',
+    text: '/help',
+    messageId: 'group-other-tree',
+    rootId: 'tree-two',
+    openId: 'guest',
+    mentioned: true,
+  }))
+  assert.match(client.sent.at(-1)?.text ?? '', /permission|没有权限/u)
+
+  // A different group keeps the global configuration.
+  await client.messageHandler?.(groupInbound({
+    chatId: 'group-b',
+    text: '/help',
+    messageId: 'other-group',
+    rootId: 'tree-three',
+    openId: 'guest',
+    mentioned: true,
+  }))
+  assert.match(client.sent.at(-1)?.text ?? '', /\/new/u)
+
+  await bridge.stop()
+  await policies.close()
+  await ctx.fiber.dispose()
+  await rm(root, { recursive: true, force: true })
 })
 
 test('e2e: empty operatorFrom denies /status even for allowFrom users', async () => {

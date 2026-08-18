@@ -72,6 +72,7 @@ const CARD_ELEMENT = {
   notify: 'notify',
   status: 'status',
   diag: 'diag',
+  policy: 'policy',
 } as const
 
 export const CARD_ACTIONS = {
@@ -911,17 +912,22 @@ export interface NotifyCard {
 
 export interface OperatorCard {
   readonly locale?: LarkLocale
-  readonly kind: 'status' | 'diag'
+  readonly kind: 'status' | 'diag' | 'policy'
   readonly body: string
 }
 
 export function renderOperatorCard(card: OperatorCard): Record<string, unknown> {
   const locale = card.locale ?? DEFAULT_CONFIG.locale
   const copy = localeCopy(locale).card
-  const title = card.kind === 'diag' ? copy.diagTitle : copy.statusTitle
+  const title = card.kind === 'diag'
+    ? copy.diagTitle
+    : card.kind === 'policy' ? copy.policyTitle : copy.statusTitle
+  const elementId = card.kind === 'diag'
+    ? CARD_ELEMENT.diag
+    : card.kind === 'policy' ? CARD_ELEMENT.policy : CARD_ELEMENT.status
   const payload = basePayload(title, [
     markdownElement(
-      card.kind === 'diag' ? CARD_ELEMENT.diag : CARD_ELEMENT.status,
+      elementId,
       `**${escapeMarkdown(title)}**\n${escapeMarkdown(card.body)}`,
     ),
   ])
