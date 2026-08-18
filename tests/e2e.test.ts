@@ -525,6 +525,15 @@ test('e2e: /policy is operator-only and can only narrow notify', async () => {
   })
   const userCard = JSON.stringify(client.cards.at(-1))
   assert.match(userCard, /Extra allowlist: 1 users|额外授权：1 人/u)
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/policy set projects add ws-a'),
+    messageId: 'policy-projects',
+  })
+  // Every counted line carries its unit, so the card reads consistently.
+  assert.match(
+    JSON.stringify(client.cards.at(-1)),
+    /Visible projects: 1 projects|可见项目：1 个/u,
+  )
   assert.doesNotMatch(userCard, /guest|ou_|owner/u)
   await client.messageHandler?.({
     ...inbound('chat-a', 'guest', '/help'),
@@ -599,6 +608,66 @@ test('e2e: conversation mention policy can require group mentions for commands',
     }),
   })
   assert.match(client.sent.at(-1)?.text ?? '', /\/new/u)
+  await bridge.stop()
+  await policies.close()
+  await ctx.fiber.dispose()
+  await rm(root, { recursive: true, force: true })
+})
+
+test('e2e: a conversation policy also gates Card actions', async () => {
+  const client = createClient()
+  const host = createHost()
+  const { DurableConversationPolicyStore } = await import('../src/conversation-policy.ts')
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const Storage = (await import('@deepseek-ai/dsh-storage')).default
+  const StorageDomain = await import('@deepseek-ai/dsh-storage-domain')
+  const StorageJson = await import('@deepseek-ai/dsh-storage-json')
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-policy-card-'))
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  await ctx.plugin(StorageJson, { root })
+  await ctx.plugin(StorageDomain, { backend: 'json' })
+  const policies = await DurableConversationPolicyStore.open(ctx.storageDomain, 'cli_policycard001')
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner', 'other'],
+    conversationPolicies: policies,
+  })
+  bridge.start()
+
+  await client.messageHandler?.(inbound('chat-a', 'owner', 'run it'))
+  host.emit('lark:chat-a', { type: 'turn/start', data: { turn: 1 } })
+  const outcome = host.requestApproval({
+    agent: { session: { id: 'lark:chat-a' } },
+    toolName: 'exec',
+    reason: 'run tests',
+  })
+  await Promise.resolve()
+  const id = requestId(client.cards[0]?.card)
+
+  // "other" stays globally authorized but is outside this chat's policy allowlist.
+  const { defaultConversationPolicy } = await import('../src/conversation-policy.ts')
+  await policies.put('chat-a', {
+    ...defaultConversationPolicy(),
+    allowFrom: [policies.principalHash('owner')],
+  })
+  await client.cardHandler?.({
+    openId: 'other', chatId: 'chat-a', messageId: 'card-1',
+    value: { decision: 'allowed-once', request_id: id },
+  })
+  assert.equal(client.updated.length, 0)
+  assert.match(client.sent.at(-1)?.text ?? '', /permission|没有权限/u)
+
+  await client.cardHandler?.({
+    openId: 'owner', chatId: 'chat-a', messageId: 'card-1',
+    value: { decision: 'allowed-once', request_id: id },
+  })
+  assert.equal(await outcome, 'allowed-once')
+  assert.equal(client.updated.length, 1)
+
   await bridge.stop()
   await policies.close()
   await ctx.fiber.dispose()

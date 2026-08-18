@@ -2491,7 +2491,7 @@ export class LarkBridge {
   }
 
   async handleCardAction(action: LarkCardAction): Promise<LarkCardActionResult> {
-    if (!this.authorized(action.openId)) {
+    if (!this.authorized(action.openId, this.cardActionPolicyScope(action.chatId))) {
       if (action.chatId !== '') await this.safeSend(action.chatId, this.text.denied)
       return actionToast('error', this.text.approvalUnauthorized)
     }
@@ -4176,8 +4176,14 @@ export class LarkBridge {
     let next: ConversationPolicy
     try {
       next = applyPolicyMutation(current, mutation, (openId) => store.principalHash(openId))
-    } catch {
-      await this.safeSend(route.chatId, this.text.policyFull, routeDeliveryOptions(route))
+    } catch (error) {
+      if (error instanceof RangeError) {
+        await this.safeSend(route.chatId, this.text.policyFull, routeDeliveryOptions(route))
+        return
+      }
+      this.noteOperatorFailure(error)
+      this.ctx.logger.error('[lark] conversation policy mutation failed')
+      await this.safeSend(route.chatId, this.text.policyUnavailable, routeDeliveryOptions(route))
       return
     }
     try {
@@ -4283,7 +4289,7 @@ export class LarkBridge {
       }
     }
     return formatDiagBody(buildDiagChecks({
-      botReady: this.clientStarted && this.client.connectionHealth?.().state !== 'failed',
+      botReady: this.clientStarted ? this.client.connectionHealth?.().ready : false,
       workspaceCount,
       persistenceMounted: sessionPersistenceOf(this.ctx) !== undefined,
       storageFlushOk,
@@ -6915,6 +6921,13 @@ export class LarkBridge {
     } catch {
       return baseId
     }
+  }
+
+  // A Card callback carries no conversation scope, only its chat. In shared-session
+  // mode the whole deployment is one scope, so resolve that instead.
+  private cardActionPolicyScope(chatId: string): string | undefined {
+    if (this.sharedSessionBaseId !== undefined) return this.sharedSessionBaseId
+    return chatId === '' ? undefined : chatId
   }
 
   private sessionBaseId(msg: Pick<

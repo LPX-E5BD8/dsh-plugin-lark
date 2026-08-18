@@ -57,6 +57,32 @@ test('diag checks stay actionable and secret-free', () => {
   assert.equal(sanitizeOperatorLabel('oc_should_stay_short', 'x').startsWith('oc_'), true)
 })
 
+// A client without a health probe gives no signal, which is not a healthy bot.
+test('diag reports an unconfirmed bot instead of a healthy one without a health probe', () => {
+  const unknown = buildDiagChecks({
+    botReady: undefined,
+    workspaceCount: 1,
+    persistenceMounted: true,
+    storageFlushOk: true,
+    providerConfigured: true,
+    recentFailures: [],
+  }, 'en-US')
+  const body = formatDiagBody(unknown, 'en-US')
+  assert.match(body, /WARN Bot connection state is unconfirmed/u)
+  assert.doesNotMatch(body, /OK Bot REST identity is available/u)
+  assert.equal(unknown.find((check) => check.id === 'bot')?.state, 'warn')
+
+  const ready = buildDiagChecks({
+    botReady: true,
+    workspaceCount: 1,
+    persistenceMounted: true,
+    storageFlushOk: true,
+    providerConfigured: true,
+    recentFailures: [],
+  }, 'en-US')
+  assert.equal(ready.find((check) => check.id === 'bot')?.state, 'ok')
+})
+
 test('operator cards reuse the shared Card 2.0 style', () => {
   const card = renderOperatorCard({
     locale: 'en-US',

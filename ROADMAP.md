@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.14 are implemented in the current release line. The next planned independently reviewable capability is 0.9.15.
+Milestones through 0.9.15 are implemented in the current release line. The next planned independently reviewable capability is 0.9.16.
 
 ## 0.1.1 — Reliability
 
@@ -219,19 +219,25 @@ Milestones through 0.9.14 are implemented in the current release line. The next 
 - Intersect scoped policy with the global fail-closed configuration so a local rule can only narrow access unless an explicit administrator-controlled policy says otherwise.
 - Apply policy before listing protected names or IDs as well as before execution, and persist no secret values in the policy document.
 
-## 0.9.15 — Runtime supervision and safe recovery
+## 0.9.15 — Policy and diagnostic follow-ups
+
+- Apply conversation-scoped policy to interactive Card callbacks, not only to inbound messages, so a narrowed conversation cannot be driven through a button.
+- Report an unconfirmed bot connection when the client exposes no health probe, instead of reporting a healthy identity from the absence of a failure.
+- Separate a full policy list from an invalid policy mutation, and label every counted line on the policy Card with its unit.
+
+## 0.9.16 — Runtime supervision and safe recovery
 
 - Ship optional, reviewable service-manager templates with graceful shutdown, bounded restart, stable logs, credential-environment guidance, and readiness checks for supported hosts.
 - Detect a failed or non-ready DSH profile from outside that process and provide a minimal recovery path without loading the failing third-party profile graph.
 - Prevent split-brain channel ownership through a heartbeat or lease, and require explicit operator action before any recovery component changes plugins, profiles, or durable state.
 
-## 0.9.16 — Explicit parallel tasks
+## 0.9.17 — Explicit parallel tasks
 
 - Let a user explicitly create, list, inspect, and stop bounded parallel tasks, each with its own DSH session, run ID, reply target, lifecycle card, and durable conversation association.
 - Keep ordinary consecutive messages serialized; never reinterpret them as implicit parallel work.
 - Define project-level write-collision policy and concurrency limits so parallel tasks cannot silently modify the same Workspace without an explicit safe configuration.
 
-## 0.9.17 — Optional document handoff
+## 0.9.18 — Optional document handoff
 
 - Read only an explicitly supplied, authorized Lark document link through a separately permissioned tool with bounded content and clear source attribution.
 - Publish a long final report as a document on explicit request, then return its link in the originating conversation while preserving the normal chat answer and delivery receipt.

@@ -263,8 +263,8 @@ export function formatPolicyBody(
     `Proactive notify: ${policy.notify ? 'allowed' : 'off'}`,
     `Group mention: ${policy.mention === 'always' ? 'always required' : 'default'}`,
     `Extra allowlist: ${policy.allowFrom === undefined ? 'none (global only)' : `${policy.allowFrom.length} users`}`,
-    `Visible projects: ${policy.workspaceIds === undefined ? 'all registered' : `${policy.workspaceIds.length}`}`,
-    `Selectable models: ${policy.models === undefined ? 'all resolvable' : `${policy.models.length}`}`,
+    `Visible projects: ${policy.workspaceIds === undefined ? 'all registered' : `${policy.workspaceIds.length} projects`}`,
+    `Selectable models: ${policy.models === undefined ? 'all resolvable' : `${policy.models.length} routes`}`,
   ].join('\n')
 }
 
