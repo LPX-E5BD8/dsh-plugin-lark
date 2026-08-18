@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import Storage from '@deepseek-ai/dsh-storage'
@@ -16,6 +17,7 @@ import { apply } from '../src/index.ts'
 import * as LarkPlugin from '../src/index.ts'
 import {
   LarkSdkClient,
+  LarkResourceError,
   neutralizeTextMentions,
   normalizeInboundText,
   splitText,
@@ -887,6 +889,244 @@ test('SDK inbound maps text and keeps unsupported content metadata-only', async 
     prototype.request = request
     Lark.WSClient.prototype.start = start
   }
+})
+
+test('SDK inbound parses only opted-in file references and never accepts malformed keys', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  const start = Lark.WSClient.prototype.start
+  let receiveMessage: ((data: unknown) => Promise<void>) | undefined
+  const received: LarkInbound[] = []
+  prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  Lark.WSClient.prototype.start = async function captureDispatcher({ eventDispatcher }) {
+    const dispatcher = eventDispatcher as unknown as {
+      handles: Map<string, (data: unknown) => Promise<void>>
+    }
+    receiveMessage = dispatcher.handles.get('im.message.receive_v1')
+    ;(this as unknown as { onReady?: () => void }).onReady?.()
+  }
+  const client = new LarkSdkClient({
+    appId: 'test-app-id',
+    appSecret: 'test-only-secret',
+    inboundTextFiles: true,
+  })
+  ;(client as unknown as { prepareLoadingImage: () => Promise<void> }).prepareLoadingImage = async () => {}
+  client.onMessage(async (message) => { received.push(message) })
+  try {
+    await client.start()
+    assert.ok(receiveMessage)
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        content: JSON.stringify({ file_key: 'file_v3_private_key', file_name: 'change.diff' }),
+        message_id: 'om_file',
+        message_type: 'file',
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_sender' } },
+    })
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_chat',
+        chat_type: 'p2p',
+        content: JSON.stringify({ file_key: '../private-key', file_name: 'secret.txt' }),
+        message_id: 'om_malformed',
+        message_type: 'file',
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_sender' } },
+    })
+
+    assert.deepEqual(received[0], {
+      chatId: 'oc_chat',
+      chatType: 'p2p',
+      openId: 'ou_sender',
+      text: '',
+      messageType: 'file',
+      messageId: 'om_file',
+      rootId: undefined,
+      parentId: undefined,
+      threadId: undefined,
+      mentioned: false,
+      resource: { kind: 'file', key: 'file_v3_private_key', name: 'change.diff' },
+    })
+    assert.deepEqual(received[1], {
+      chatId: 'oc_chat',
+      chatType: 'p2p',
+      openId: 'ou_sender',
+      text: '',
+      messageType: 'file',
+      messageId: 'om_malformed',
+      rootId: undefined,
+      parentId: undefined,
+      threadId: undefined,
+      mentioned: false,
+    })
+    assert.doesNotMatch(JSON.stringify(received[1]), /private-key|secret\.txt/)
+  } finally {
+    await client.stop()
+    prototype.request = request
+    Lark.WSClient.prototype.start = start
+  }
+})
+
+function clientWithResourceRequest(
+  request: (options: Record<string, unknown>) => Promise<unknown>,
+): LarkSdkClient {
+  const client = new LarkSdkClient({ appId: 'test-app-id', appSecret: 'test-only-secret' })
+  ;(client as unknown as { rest: unknown }).rest = { request }
+  return client
+}
+
+test('SDK resource download uses one fixed-domain bounded stream and preserves MIME parameters', async () => {
+  let request: Record<string, unknown> | undefined
+  const stream = Readable.from([Buffer.from('hello '), Buffer.from('world')])
+  const client = clientWithResourceRequest(async (options) => {
+    request = options
+    return {
+      data: stream,
+      headers: { 'content-length': '11', 'content-type': 'text/plain; charset=UTF-8' },
+    }
+  })
+  const result = await client.downloadMessageResource('message-v4', {
+    kind: 'file', key: 'asset-v4', name: 'notes.txt',
+  }, {
+    maxBytes: 11,
+    signal: new AbortController().signal,
+  })
+
+  assert.equal(new TextDecoder().decode(result.data), 'hello world')
+  assert.equal(result.mediaType, 'text/plain; charset=UTF-8')
+  assert.equal(request?.url, '/open-apis/im/v1/messages/message-v4/resources/asset-v4')
+  assert.deepEqual(request?.params, { type: 'file' })
+  assert.equal(request?.responseType, 'stream')
+  assert.equal(request?.maxRedirects, 0)
+  assert.equal(request?.$return_headers, true)
+})
+
+test('SDK resource download rejects declared and chunked overflow and destroys each stream', async () => {
+  const declared = Readable.from([Buffer.from('not consumed')])
+  const declaredClient = clientWithResourceRequest(async () => ({
+    data: declared,
+    headers: { 'content-length': '6', 'content-type': 'text/plain' },
+  }))
+  await assert.rejects(
+    declaredClient.downloadMessageResource('om_message', {
+      kind: 'file', key: 'file_resource', name: 'notes.txt',
+    }, { maxBytes: 5, signal: new AbortController().signal }),
+    (error) => error instanceof LarkResourceError && error.code === 'too_large',
+  )
+  assert.equal(declared.destroyed, true)
+
+  const chunked = Readable.from([Buffer.alloc(3), Buffer.alloc(3)])
+  const chunkedClient = clientWithResourceRequest(async () => ({
+    data: chunked,
+    headers: { 'content-type': 'application/octet-stream' },
+  }))
+  await assert.rejects(
+    chunkedClient.downloadMessageResource('om_message', {
+      kind: 'file', key: 'file_resource', name: 'notes.txt',
+    }, { maxBytes: 5, signal: new AbortController().signal }),
+    (error) => error instanceof LarkResourceError && error.code === 'too_large',
+  )
+  assert.equal(chunked.destroyed, true)
+})
+
+test('SDK resource download aborts an open stream and sanitizes transport failures', async () => {
+  const stream = new Readable({ read() {} })
+  const controller = new AbortController()
+  const client = clientWithResourceRequest(async () => ({
+    data: stream,
+    headers: { 'content-type': 'text/plain' },
+  }))
+  const pending = client.downloadMessageResource('om_message', {
+    kind: 'file', key: 'file_resource', name: 'notes.txt',
+  }, { maxBytes: 5, signal: controller.signal })
+  await new Promise((resolve) => setImmediate(resolve))
+  controller.abort()
+  await assert.rejects(
+    pending,
+    (error) => error instanceof LarkResourceError && error.code === 'aborted',
+  )
+  assert.equal(stream.destroyed, true)
+
+  const lateStream = new Readable({ read() {} })
+  const lateResponse = Promise.withResolvers<unknown>()
+  const lateController = new AbortController()
+  const lateClient = clientWithResourceRequest(() => lateResponse.promise)
+  const latePending = lateClient.downloadMessageResource('message-v4', {
+    kind: 'file', key: 'asset-v4', name: 'notes.txt',
+  }, { maxBytes: 5, signal: lateController.signal })
+  lateController.abort()
+  await assert.rejects(
+    latePending,
+    (error) => error instanceof LarkResourceError && error.code === 'aborted',
+  )
+  lateResponse.resolve({ data: lateStream, headers: { 'content-type': 'text/plain' } })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(lateStream.destroyed, true)
+
+  const failed = clientWithResourceRequest(async () => {
+    throw new Error('credential-marker resource-key-marker')
+  })
+  const error = await failed.downloadMessageResource('om_message', {
+    kind: 'file', key: 'file_resource', name: 'notes.txt',
+  }, { maxBytes: 5, signal: new AbortController().signal }).catch((reason: unknown) => reason)
+  assert.ok(error instanceof LarkResourceError)
+  assert.equal(error.code, 'unavailable')
+  assert.doesNotMatch(`${error.message} ${String(error.cause)}`, /credential-marker|resource-key-marker/)
+
+  const rejectedStream = new Readable({ read() {} })
+  const rejected = clientWithResourceRequest(async () => {
+    throw Object.assign(new Error('private redirect marker'), {
+      response: { status: 302, data: rejectedStream },
+    })
+  })
+  const rejectedError = await rejected.downloadMessageResource('message-v4', {
+    kind: 'file', key: 'asset-v4', name: 'notes.txt',
+  }, { maxBytes: 5, signal: new AbortController().signal }).catch((reason: unknown) => reason)
+  assert.ok(rejectedError instanceof LarkResourceError)
+  assert.equal(rejectedError.code, 'unavailable')
+  assert.equal(rejectedStream.destroyed, true)
+  assert.doesNotMatch(`${rejectedError.message} ${String(rejectedError.cause)}`, /private redirect marker/)
+})
+
+test('SDK resource download rejects malformed headers and references without exposing them', async () => {
+  let requests = 0
+  const client = clientWithResourceRequest(async () => {
+    requests += 1
+    return {
+      data: Readable.from([Buffer.from('safe')]),
+      headers: { 'content-length': '-1', 'content-type': 'text/plain' },
+    }
+  })
+  const headerError = await client.downloadMessageResource('om_message', {
+    kind: 'file', key: 'file_resource', name: 'notes.txt',
+  }, { maxBytes: 5, signal: new AbortController().signal }).catch((reason: unknown) => reason)
+  assert.ok(headerError instanceof LarkResourceError)
+  assert.equal(headerError.code, 'invalid')
+
+  const referenceError = await client.downloadMessageResource('bad\nmessage', {
+    kind: 'file', key: 'file_private_marker', name: 'notes.txt',
+  }, { maxBytes: 5, signal: new AbortController().signal }).catch((reason: unknown) => reason)
+  assert.ok(referenceError instanceof LarkResourceError)
+  assert.equal(referenceError.code, 'invalid')
+  for (const [messageId, key] of [
+    ['..', 'safe-key'],
+    ['safe-message', '..'],
+    ['safe/message', 'safe-key'],
+    ['safe-message', 'safe\\key'],
+  ]) {
+    await assert.rejects(
+      client.downloadMessageResource(messageId, {
+        kind: 'file', key, name: 'notes.txt',
+      }, { maxBytes: 5, signal: new AbortController().signal }),
+      (error) => error instanceof LarkResourceError && error.code === 'invalid',
+    )
+  }
+  assert.equal(requests, 1)
+  assert.doesNotMatch(referenceError.message, /private_marker|bad/)
 })
 
 test('SDK Card callback preserves form values and returns a raw terminal Card unchanged', async () => {

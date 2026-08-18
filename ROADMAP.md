@@ -160,44 +160,56 @@ This roadmap records intended outcomes rather than release dates. Priorities may
 - Register each known terminal human-input Card close synchronously inside first-wins settlement, then seal delivery admission before REST stops; shorten an in-flight close to two seconds during shutdown so it fits inside the rc.6 CLI's five-second whole-process grace.
 - Best-effort advance Agent/Session quiescence alongside Card delivery, verify actual root-fiber disposal rather than only direct `bridge.stop()`, and repeat the real Feishu create/busy/SIGTERM/terminal-PATCH evidence path. Do not claim rc.6 commits the pending `tool/result` inside host grace: an unmatched call still cold-repairs after restart.
 
-## 0.9.6 — Secure attachment and artifact exchange
+## 0.9.6 — Secure inbound text attachments
 
-- Add opt-in inbound support for bounded text, log, patch, diff, and image resources using strict MIME, byte, count, and permission checks; isolate downloads per session and remove them through a documented retention policy.
-- Pass text content or image inputs only through a capability-aware Harness request shape, and fail clearly when the active provider cannot consume that media type.
-- Add an explicit Agent tool for sending generated files and images from approved workspace or temporary roots, with safe names and size limits; never infer arbitrary local paths from model-authored text or `file:` URLs.
-- Keep resource keys, credentials, private paths, and attachment contents out of logs, receipts, durable bindings, and error replies.
+- Add opt-in direct-chat support for one bounded `.txt`, `.log`, `.patch`, or `.diff` resource using strict filename, MIME, byte, UTF-8, authorization, and replay checks before Agent admission; keep group attachments fail-closed because standalone platform file messages cannot carry the required bot mention.
+- Download only the exact authenticated message resource from the fixed Feishu/Lark API, stream it into bounded memory without redirects or temporary files, and cancel the stream during shutdown.
+- Frame accepted content as untrusted user data in the ordinary durable Session transcript; keep resource keys, credentials, private paths, raw SDK failures, and rejected contents out of logs, receipts, bindings, and error replies.
+- Leave images, outbound artifacts, URLs, archives, standalone active-markup documents, audio, video, and generic binary files unsupported in this release; preserve markup inside a recognizable unified diff as code.
 
-## 0.9.7 — Reliable proactive delivery
+## 0.9.7 — Durable inbound images
+
+- Accept only opt-in PNG, JPEG, WebP, and GIF messages after authorization, exact-model image-capability confirmation, deployment attachment limits, and fully decoded image validation all succeed.
+- Commit bytes through the Harness attachment service before publishing an image block, persist only its content-addressed reference in the Session, and preserve cold-resume/fork readability.
+- Fail closed when image capability or the durable attachment service is absent; document rc.6's shared-object retention and possible pre-followup orphan rather than deleting referenced content from the channel.
+
+## 0.9.8 — Approved outbound artifacts
+
+- Add an explicit Agent-scoped tool for sending a bounded generated text file or raster image from the exact registered Workspace serving the active Lark turn.
+- Require one-shot approval, canonical containment, regular-file and final-symlink checks, safe names and extensions, and an exact active chat/user/turn route; reject URLs, `file:` URIs, absolute paths, subagents, nested Code Mode, and Web-originated calls.
+- Upload and deliver without exposing local paths, platform keys, destination identifiers, file content, or credentials in the tool result, logs, Session sidecars, or error reply; do not retry an ambiguous send.
+
+## 0.9.9 — Reliable proactive delivery
 
 - Let an Agent send a completion or attention notification to a previously registered conversation scope, including a bounded explicit mention list, without accepting arbitrary destination IDs from model output.
 - Persist a bounded outbox with idempotency keys, retry state, expiry, rate limits, and terminal delivery outcomes so process restarts cannot silently lose or duplicate admitted notifications.
 - Leave scheduling to Harness or an external scheduler; keep the channel responsible only for authorization, durable delivery, and observability.
 
-## 0.9.8 — Operator status and diagnostics
+## 0.9.10 — Operator status and diagnostics
 
 - Add an operator-only status command covering the current plugin version, uptime, connection state, conversation/session identity, project, model, active work, and bounded context/usage information.
 - Add a sanitized diagnostic command that checks Bot REST identity, required scopes, Workspace registration count, session persistence, storage-domain write/flush participation, provider configuration, and recent categorized failures.
 - Return actionable remediation without revealing credentials, platform identifiers, prompts, message/session IDs, private paths, provider endpoints, or raw errors.
 
-## 0.9.9 — Conversation-scoped policy
+## 0.9.11 — Conversation-scoped policy
 
 - Support per-chat and per-group policy for authorized users, mention requirements, visible/selectable Workspaces, selectable provider/model routes, and allowed tool or approval classes.
 - Intersect scoped policy with the global fail-closed configuration so a local rule can only narrow access unless an explicit administrator-controlled policy says otherwise.
 - Apply policy before listing protected names or IDs as well as before execution, and persist no secret values in the policy document.
 
-## 0.9.10 — Runtime supervision and safe recovery
+## 0.9.12 — Runtime supervision and safe recovery
 
 - Ship optional, reviewable service-manager templates with graceful shutdown, bounded restart, stable logs, credential-environment guidance, and readiness checks for supported hosts.
 - Detect a failed or non-ready DSH profile from outside that process and provide a minimal recovery path without loading the failing third-party profile graph.
 - Prevent split-brain channel ownership through a heartbeat or lease, and require explicit operator action before any recovery component changes plugins, profiles, or durable state.
 
-## 0.9.11 — Explicit parallel tasks
+## 0.9.13 — Explicit parallel tasks
 
 - Let a user explicitly create, list, inspect, and stop bounded parallel tasks, each with its own DSH session, run ID, reply target, lifecycle card, and durable conversation association.
 - Keep ordinary consecutive messages serialized; never reinterpret them as implicit parallel work.
 - Define project-level write-collision policy and concurrency limits so parallel tasks cannot silently modify the same Workspace without an explicit safe configuration.
 
-## 0.9.12 — Optional document handoff
+## 0.9.14 — Optional document handoff
 
 - Read only an explicitly supplied, authorized Lark document link through a separately permissioned tool with bounded content and clear source attribution.
 - Publish a long final report as a document on explicit request, then return its link in the originating conversation while preserving the normal chat answer and delivery receipt.

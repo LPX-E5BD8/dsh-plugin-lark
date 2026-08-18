@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import type { Readable } from 'node:stream'
 import { DEFAULT_CONFIG } from './config.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
@@ -16,6 +17,36 @@ export interface LarkInbound {
   parentId?: string
   threadId?: string
   mentioned: boolean
+  resource?: LarkInboundResource
+}
+
+export interface LarkInboundResource {
+  kind: 'file'
+  key: string
+  name: string
+}
+
+export interface LarkDownloadedResource {
+  data: Uint8Array
+  mediaType: string
+}
+
+export interface LarkResourceDownloadOptions {
+  maxBytes: number
+  signal: AbortSignal
+}
+
+export type LarkResourceErrorCode = 'aborted' | 'invalid' | 'too_large' | 'unavailable'
+
+export class LarkResourceError extends Error {
+  constructor(
+    readonly code: LarkResourceErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = 'LarkResourceError'
+  }
 }
 
 export interface LarkCardAction {
@@ -74,6 +105,11 @@ export interface LarkClientLike {
   stopReceiving?(): Promise<void>
   stop(): Promise<void>
   sendText(chatId: string, text: string, options?: LarkDeliveryOptions): Promise<void>
+  downloadMessageResource?(
+    messageId: string,
+    resource: LarkInboundResource,
+    options: LarkResourceDownloadOptions,
+  ): Promise<LarkDownloadedResource>
   onMessage(handler: (msg: LarkInbound) => Promise<void>): void
   sendCard?(chatId: string, card: unknown, options?: LarkDeliveryOptions): Promise<string | void>
   updateCard?(messageId: string, card: unknown, options?: Pick<LarkDeliveryOptions, 'signal'>): Promise<void>
@@ -86,11 +122,14 @@ export interface LarkSdkOptions {
   /** feishu = open.feishu.cn, lark = open.larksuite.com */
   domain?: 'feishu' | 'lark'
   locale?: LarkLocale
+  inboundTextFiles?: boolean
 }
 
 const TEXT_LIMIT = 4000
 const START_TIMEOUT_MS = 15_000
 const REST_REQUEST_TIMEOUT_MS = 15_000
+const RESOURCE_ID_CONTROL_PATTERN = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const MAX_RESOURCE_DOWNLOAD_BYTES = 256 * 1_024
 
 const discardSdkLog = (..._messages: unknown[]): void => {}
 const PRIVATE_SDK_LOGGER = Object.freeze({
@@ -143,6 +182,30 @@ function parseTextContent(content: string): string {
     return typeof parsed.text === 'string' ? parsed.text : ''
   } catch {
     return ''
+  }
+}
+
+function validResourceId(value: string): boolean {
+  return value !== ''
+    && value !== '.'
+    && value !== '..'
+    && value.length <= 512
+    && value.isWellFormed()
+    && !value.includes('/')
+    && !value.includes('\\')
+    && !RESOURCE_ID_CONTROL_PATTERN.test(value)
+}
+
+function parseInboundFileResource(content: string): LarkInboundResource | undefined {
+  try {
+    const parsed = asRecord(JSON.parse(content))
+    const key = parsed.file_key
+    const name = parsed.file_name
+    if (typeof key !== 'string' || !validResourceId(key)) return undefined
+    if (typeof name !== 'string' || name === '' || name.length > 1_024) return undefined
+    return { kind: 'file', key, name }
+  } catch {
+    return undefined
   }
 }
 
@@ -241,6 +304,7 @@ interface LarkMessageResponse {
 type LarkApiOperation =
   | 'bot.info'
   | 'message.create'
+  | 'message.resource'
   | 'message.reply'
   | 'message.patch'
   | 'message.update'
@@ -314,6 +378,106 @@ async function callSignalBoundLarkApi(
   } finally {
     clearTimeout(timer)
     signal.removeEventListener('abort', onAbort)
+  }
+}
+
+function resourceHeader(headers: unknown, name: string): unknown {
+  if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) return undefined
+  const getter = (headers as { get?: unknown }).get
+  if (typeof getter === 'function') {
+    try {
+      return getter.call(headers, name)
+    } catch {
+      return undefined
+    }
+  }
+  const lowerName = name.toLowerCase()
+  const match = Object.entries(headers).find(([key]) => key.toLowerCase() === lowerName)
+  return match?.[1]
+}
+
+function resourceContentLength(headers: unknown): number | undefined {
+  const raw = resourceHeader(headers, 'content-length')
+  if (raw === undefined || raw === null || raw === '') return undefined
+  const value = Array.isArray(raw) && raw.length === 1 ? raw[0] : raw
+  const text = typeof value === 'number' ? String(value) : value
+  if (typeof text !== 'string' || !/^(0|[1-9][0-9]*)$/u.test(text)) {
+    throw new LarkResourceError('invalid', 'lark: message.resource returned an invalid byte length')
+  }
+  const length = Number(text)
+  if (!Number.isSafeInteger(length)) {
+    throw new LarkResourceError('invalid', 'lark: message.resource returned an invalid byte length')
+  }
+  return length
+}
+
+function resourceMediaType(headers: unknown): string {
+  const raw = resourceHeader(headers, 'content-type')
+  const value = Array.isArray(raw) && raw.length === 1 ? raw[0] : raw
+  if (value === undefined || value === null || value === '') return 'application/octet-stream'
+  if (typeof value !== 'string') {
+    throw new LarkResourceError('invalid', 'lark: message.resource returned an invalid media type')
+  }
+  const mediaType = value.trim()
+  const base = mediaType.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+  if (mediaType === ''
+    || mediaType.length > 200
+    || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(mediaType)
+    || !/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(base)) {
+    throw new LarkResourceError('invalid', 'lark: message.resource returned an invalid media type')
+  }
+  return mediaType
+}
+
+function readableResource(value: unknown): Readable | undefined {
+  if (value === null || typeof value !== 'object') return undefined
+  const candidate = value as Partial<Readable> & { [Symbol.asyncIterator]?: unknown }
+  return typeof candidate.destroy === 'function'
+    && typeof candidate[Symbol.asyncIterator] === 'function'
+    ? candidate as Readable
+    : undefined
+}
+
+function resourceChunk(value: unknown): Buffer | undefined {
+  if (Buffer.isBuffer(value)) return value
+  if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+  return undefined
+}
+
+async function readResourceStream(
+  stream: Readable,
+  signal: AbortSignal,
+  maxBytes: number,
+): Promise<Uint8Array> {
+  const chunks: Buffer[] = []
+  let bytes = 0
+  const abort = (): void => {
+    stream.destroy()
+  }
+  if (signal.aborted) {
+    abort()
+    throw new LarkResourceError('aborted', 'lark: message.resource request aborted')
+  }
+  signal.addEventListener('abort', abort, { once: true })
+  if (signal.aborted) abort()
+  try {
+    for await (const raw of stream) {
+      if (signal.aborted) throw new LarkResourceError('aborted', 'lark: message.resource request aborted')
+      const chunk = resourceChunk(raw)
+      if (chunk === undefined) {
+        throw new LarkResourceError('invalid', 'lark: message.resource returned invalid bytes')
+      }
+      if (chunk.byteLength > maxBytes - bytes) {
+        stream.destroy()
+        throw new LarkResourceError('too_large', 'lark: message.resource exceeds the configured byte limit')
+      }
+      chunks.push(chunk)
+      bytes += chunk.byteLength
+    }
+    if (signal.aborted) throw new LarkResourceError('aborted', 'lark: message.resource request aborted')
+    return new Uint8Array(Buffer.concat(chunks, bytes))
+  } finally {
+    signal.removeEventListener('abort', abort)
   }
 }
 
@@ -479,6 +643,9 @@ export class LarkSdkClient implements LarkClientLike {
             const normalized = messageType === 'text'
               ? normalizeInboundText(message.content ?? '', mentions, botOpenId)
               : { text: '', mentioned }
+            const resource = self.options.inboundTextFiles === true && messageType === 'file'
+              ? parseInboundFileResource(message.content ?? '')
+              : undefined
             if (messageType === 'text' && normalized.text === '') return
             if (self.handler === undefined) return
             await self.handler({
@@ -492,6 +659,7 @@ export class LarkSdkClient implements LarkClientLike {
               parentId: message.parent_id,
               threadId: message.thread_id,
               mentioned: normalized.mentioned,
+              ...(resource === undefined ? {} : { resource }),
             })
           },
           'card.action.trigger': async (data: unknown) => {
@@ -524,6 +692,100 @@ export class LarkSdkClient implements LarkClientLike {
   async sendText(chatId: string, text: string, options?: LarkDeliveryOptions): Promise<void> {
     for (const chunk of splitText(neutralizeTextMentions(text))) {
       await this.deliver(chatId, 'text', JSON.stringify({ text: chunk }), options)
+    }
+  }
+
+  async downloadMessageResource(
+    messageId: string,
+    resource: LarkInboundResource,
+    options: LarkResourceDownloadOptions,
+  ): Promise<LarkDownloadedResource> {
+    if (resource.kind !== 'file'
+      || !validResourceId(messageId)
+      || !validResourceId(resource.key)) {
+      throw new LarkResourceError('invalid', 'lark: message.resource reference is invalid')
+    }
+    if (!Number.isSafeInteger(options.maxBytes)
+      || options.maxBytes <= 0
+      || options.maxBytes > MAX_RESOURCE_DOWNLOAD_BYTES) {
+      throw new RangeError('lark: message.resource byte limit is invalid')
+    }
+    if (this.rest === undefined) {
+      throw new LarkResourceError('unavailable', 'lark: message.resource client is unavailable')
+    }
+
+    const deadline = new AbortController()
+    const signal = AbortSignal.any([options.signal, deadline.signal])
+    let rejectAbort: ((error: LarkResourceError) => void) | undefined
+    const aborted = new Promise<never>((_resolve, reject) => {
+      rejectAbort = reject
+    })
+    const onAbort = (): void => {
+      rejectAbort?.(new LarkResourceError('aborted', 'lark: message.resource request aborted'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    const timer = setTimeout(() => {
+      deadline.abort(new Error('lark: message.resource request timed out'))
+    }, REST_REQUEST_TIMEOUT_MS)
+    const rawRequest = signal.aborted
+      ? Promise.reject(new LarkResourceError('aborted', 'lark: message.resource request aborted'))
+      : Promise.resolve().then(() => this.rest!.request({
+          url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(resource.key)}`,
+          method: 'GET',
+          params: { type: resource.kind },
+          responseType: 'stream',
+          maxRedirects: 0,
+          signal,
+          timeout: REST_REQUEST_TIMEOUT_MS,
+          $return_headers: true,
+        }))
+    const request = rawRequest.then((response) => {
+      if (!signal.aborted) return response
+      readableResource(asRecord(response).data)?.destroy()
+      throw new LarkResourceError('aborted', 'lark: message.resource request aborted')
+    })
+    let stream: Readable | undefined
+    let consumed = false
+    try {
+      let response: unknown
+      try {
+        response = await Promise.race([request, aborted])
+      } catch (error) {
+        if (error instanceof LarkResourceError) throw error
+        readableResource(asRecord(asRecord(error).response).data)?.destroy()
+        if (signal.aborted) {
+          throw new LarkResourceError('aborted', 'lark: message.resource request aborted')
+        }
+        throw new LarkResourceError(
+          'unavailable',
+          'lark: message.resource request failed',
+          { cause: rejectedLarkApiCall('message.resource', error) },
+        )
+      }
+      const record = asRecord(response)
+      stream = readableResource(record.data)
+      if (stream === undefined) {
+        throw new LarkResourceError('invalid', 'lark: message.resource returned a malformed response')
+      }
+      const contentLength = resourceContentLength(record.headers)
+      if (contentLength !== undefined && contentLength > options.maxBytes) {
+        stream.destroy()
+        throw new LarkResourceError('too_large', 'lark: message.resource exceeds the configured byte limit')
+      }
+      const mediaType = resourceMediaType(record.headers)
+      const data = await readResourceStream(stream, signal, options.maxBytes)
+      consumed = true
+      return { data, mediaType }
+    } catch (error) {
+      if (error instanceof LarkResourceError) throw error
+      if (signal.aborted) {
+        throw new LarkResourceError('aborted', 'lark: message.resource request aborted')
+      }
+      throw new LarkResourceError('unavailable', 'lark: message.resource read failed')
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      if (!consumed || signal.aborted) stream?.destroy()
     }
   }
 

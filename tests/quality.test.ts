@@ -13,7 +13,11 @@ import {
 } from '../src/cards.ts'
 import { DEFAULT_CONFIG } from '../src/config.ts'
 import { nonCatalogPolicyTypes, projectActivity, unclassifiedKnownEventTypes } from '../src/events.ts'
-import { apply, inject } from '../src/index.ts'
+import {
+  DEFAULT_INBOUND_TEXT_RESOURCE_BYTES,
+  MAX_INBOUND_TEXT_RESOURCE_BYTES,
+} from '../src/inbound-resource.ts'
+import { apply, Config, inject } from '../src/index.ts'
 import { LARK_LOCALES } from '../src/locale.ts'
 
 const MAX_CONTROL_DEPTH = 3
@@ -73,6 +77,22 @@ test('quality: project management configuration stays fail-closed through the bu
   assert.match(source, /projectManageFrom: Schema\.array\(Schema\.string\(\)\)\.default\(\[\]\)/u)
   assert.match(source, /projectManageFrom: config\.projectManageFrom \?\? \[\]/u)
   assert.equal((patch.match(/^\s+projectManageFrom: \[\]$/gmu) ?? []).length, 1)
+})
+
+test('quality: inbound text files stay opt-in and bounded through the bundle seam', () => {
+  const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8')
+  const patch = readFileSync(join(process.cwd(), 'cordis.patch.yml'), 'utf8')
+  assert.equal(DEFAULT_CONFIG.inboundTextFiles, false)
+  assert.equal(DEFAULT_CONFIG.maxInboundTextFileBytes, DEFAULT_INBOUND_TEXT_RESOURCE_BYTES)
+  assert.equal(DEFAULT_INBOUND_TEXT_RESOURCE_BYTES, 128 * 1024)
+  assert.equal(MAX_INBOUND_TEXT_RESOURCE_BYTES, 256 * 1024)
+  assert.match(source, /inboundTextFiles: Schema\.boolean\(\)\.default\(DEFAULT_CONFIG\.inboundTextFiles\)/u)
+  assert.match(source, /maxInboundTextFileBytes: Schema\.natural\(\)\s+\.min\(1\)/u)
+  assert.match(source, /\.max\(MAX_INBOUND_TEXT_RESOURCE_BYTES\)/u)
+  assert.equal((patch.match(/^\s+inboundTextFiles: false$/gmu) ?? []).length, 1)
+  assert.equal((patch.match(/^\s+maxInboundTextFileBytes: 131072$/gmu) ?? []).length, 1)
+  assert.throws(() => Config({ maxInboundTextFileBytes: 0 }), TypeError)
+  assert.equal(Config({ maxInboundTextFileBytes: 1 }).maxInboundTextFileBytes, 1)
 })
 
 test('quality: malformed app ids fail before startup', () => {
