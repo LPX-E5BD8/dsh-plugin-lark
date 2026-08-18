@@ -14,6 +14,16 @@ import {
 import { DEFAULT_CONFIG } from '../src/config.ts'
 import { nonCatalogPolicyTypes, projectActivity, unclassifiedKnownEventTypes } from '../src/events.ts'
 import {
+  DEFAULT_CONVERSATION_IMAGE_BYTES,
+  DEFAULT_CONVERSATION_IMAGES,
+  DEFAULT_INBOUND_IMAGE_BYTES,
+  DEFAULT_INBOUND_IMAGE_PIXELS,
+  MAX_CONVERSATION_IMAGE_BYTES,
+  MAX_CONVERSATION_IMAGES,
+  MAX_INBOUND_IMAGE_BYTES,
+  MAX_INBOUND_IMAGE_PIXELS,
+} from '../src/inbound-image.ts'
+import {
   DEFAULT_INBOUND_TEXT_RESOURCE_BYTES,
   MAX_INBOUND_TEXT_RESOURCE_BYTES,
 } from '../src/inbound-resource.ts'
@@ -95,6 +105,40 @@ test('quality: inbound text files stay opt-in and bounded through the bundle sea
   assert.equal(Config({ maxInboundTextFileBytes: 1 }).maxInboundTextFileBytes, 1)
 })
 
+test('quality: inbound static images stay opt-in and independently bounded through the bundle seam', () => {
+  const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8')
+  const patch = readFileSync(join(process.cwd(), 'cordis.patch.yml'), 'utf8')
+  assert.equal(DEFAULT_CONFIG.inboundImages, false)
+  assert.equal(DEFAULT_CONFIG.maxInboundImageBytes, DEFAULT_INBOUND_IMAGE_BYTES)
+  assert.equal(DEFAULT_CONFIG.maxInboundImagePixels, DEFAULT_INBOUND_IMAGE_PIXELS)
+  assert.equal(DEFAULT_CONFIG.maxConversationImages, DEFAULT_CONVERSATION_IMAGES)
+  assert.equal(DEFAULT_CONFIG.maxConversationImageBytes, DEFAULT_CONVERSATION_IMAGE_BYTES)
+  assert.match(source, /inboundImages: Schema\.boolean\(\)\.default\(DEFAULT_CONFIG\.inboundImages\)/u)
+  for (const [field, max] of [
+    ['maxInboundImageBytes', 'MAX_INBOUND_IMAGE_BYTES'],
+    ['maxInboundImagePixels', 'MAX_INBOUND_IMAGE_PIXELS'],
+    ['maxConversationImages', 'MAX_CONVERSATION_IMAGES'],
+    ['maxConversationImageBytes', 'MAX_CONVERSATION_IMAGE_BYTES'],
+  ]) {
+    assert.match(source, new RegExp(`${field}: Schema\\.natural\\(\\)\\s+\\.min\\(1\\)\\s+\\.max\\(${max}\\)`, 'u'))
+  }
+  for (const line of [
+    'inboundImages: false',
+    'maxInboundImageBytes: 5242880',
+    'maxInboundImagePixels: 20000000',
+    'maxConversationImages: 4',
+    'maxConversationImageBytes: 20971520',
+  ]) {
+    assert.equal((patch.match(new RegExp(`^\\s+${line}$`, 'gmu')) ?? []).length, 1)
+  }
+  assert.throws(() => Config({ maxInboundImageBytes: 0 }), TypeError)
+  assert.throws(() => Config({ maxInboundImageBytes: MAX_INBOUND_IMAGE_BYTES + 1 }), TypeError)
+  assert.throws(() => Config({ maxInboundImagePixels: MAX_INBOUND_IMAGE_PIXELS + 1 }), TypeError)
+  assert.throws(() => Config({ maxConversationImages: MAX_CONVERSATION_IMAGES + 1 }), TypeError)
+  assert.throws(() => Config({ maxConversationImageBytes: MAX_CONVERSATION_IMAGE_BYTES + 1 }), TypeError)
+  assert.equal(Config({ inboundImages: true }).inboundImages, true)
+})
+
 test('quality: malformed app ids fail before startup', () => {
   const previousAppId = process.env.DSH_LARK_APP_ID
   const previousAppSecret = process.env.DSH_LARK_APP_SECRET
@@ -169,6 +213,7 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
   const expectedPeers = {
     '@deepseek-ai/cordis': cordisVersion,
     '@deepseek-ai/dsh-agent': harnessVersion,
+    '@deepseek-ai/dsh-attachment': harnessVersion,
     '@deepseek-ai/dsh-llm': harnessVersion,
     '@deepseek-ai/dsh-session': harnessVersion,
     '@deepseek-ai/dsh-storage-domain': harnessVersion,
@@ -177,8 +222,12 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
     '@deepseek-ai/schemastery': schemasteryVersion,
   }
   const expectedHarnessDevDependencies = {
+    '@deepseek-ai/dsh-attachment': harnessVersion,
+    '@deepseek-ai/dsh-attachment-local': harnessVersion,
     '@deepseek-ai/dsh-agent-loop': harnessVersion,
     '@deepseek-ai/dsh-code-runtime': harnessVersion,
+    '@deepseek-ai/dsh-home-paths': harnessVersion,
+    '@deepseek-ai/dsh-invariants': harnessVersion,
     '@deepseek-ai/dsh-session-checkpoint-policy': harnessVersion,
     '@deepseek-ai/dsh-session-persistence': harnessVersion,
     '@deepseek-ai/dsh-session-persistence-jsonl': harnessVersion,
@@ -206,6 +255,7 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
     expectedHarnessDevDependencies,
   )
   assert.deepEqual(manifest.peerDependenciesMeta, {
+    '@deepseek-ai/dsh-attachment': { optional: true },
     '@deepseek-ai/dsh-user-approval': { optional: true },
   })
   assert.deepEqual(root.peerDependencies, manifest.peerDependencies)
@@ -294,6 +344,7 @@ test('quality: upgrade guides track durable schemas and ship with the package', 
   const requiredMarkers = [
     '$DSH_HOME/sessions',
     '$DSH_HOME/storages',
+    '$DSH_HOME/attachments',
     '$DSH_HOME/profiles/web',
     'lark_inbound',
     'lark_conversations',

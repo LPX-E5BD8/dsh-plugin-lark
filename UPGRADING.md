@@ -9,7 +9,7 @@ This runbook covers `dsh-plugin-lark` on the supported DeepSeek Harness `0.1.0-r
 - Run only one Harness process against a state root. The JSON backend has no cross-process writer lock.
 - Stop Harness gracefully and wait for the process to exit before copying or restoring state. Do not take a live `cp`/`tar` snapshot, and do not use `kill -9` as a backup boundary.
 - Keep the same Lark app ID, state roots, launch workspace, `defaultSessionId`, JSONL compression, canonical Workspace paths, profile configuration, and credential source unless the migration explicitly changes them. The app ID participates in hashed storage keys; changing it makes prior receipts and bindings appear absent.
-- Snapshot sessions, storage domains, and the Web profile at one point in time. Never restore only `lark_conversations.json`, merge old and new JSON by hand, or edit hashes/schema fields manually.
+- Snapshot sessions, storage domains, attachments, and the Web profile at one point in time. Never restore only one referenced attachment or `lark_conversations.json`, merge old and new JSON by hand, or edit references/hashes/schema fields manually.
 - Treat every snapshot as sensitive. Session logs can contain prompts, tool results, and repository data; Workspace state contains paths; selected model route IDs are plaintext. Store snapshots outside the checkout with restrictive access, and never attach them to an issue.
 - A state rollback does not undo messages already sent, model/provider usage, tool side effects, or files changed in a Workspace. Protect project directories with their own version control or backup.
 
@@ -21,10 +21,11 @@ The stock rc.6 Web profile uses these paths:
 | --- | --- | --- |
 | Session persistence | `$DSH_HOME/sessions` | JSONL headers, events, generations, cwd, preset, and request headers |
 | Storage domains | `$DSH_HOME/storages` | `lark_inbound.json`, `lark_conversations.json`, `workspace.json`, and other host-domain state |
+| Attachment store | `$DSH_HOME/attachments` | Immutable image objects referenced by Session events; objects and logs must stay aligned |
 | Web profile installation | `$DSH_HOME/profiles/web` | Plugin specification, profile package graph, and local-checkout reference |
 | Plugin checkout | The absolute path passed to `dsh plugin --profile web add` | A local install can remain linked to that directory; keep the old checkout through the rollback window |
 
-An overlay can replace any stock path, so the composed local configuration is authoritative. Inspect it locally and do not paste it into a ticket. Credentials and project directories are not part of this three-directory state snapshot; preserve their service-manager/secret-store configuration and repository backups separately.
+An overlay can replace any stock path, so the composed local configuration is authoritative. Inspect it locally and do not paste it into a ticket. Credentials and project directories are not part of this four-directory state snapshot; preserve their service-manager/secret-store configuration and repository backups separately.
 
 ## Durable-state history
 
@@ -45,6 +46,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.6` | Adds no plugin-owned schema. Opted-in accepted text files become ordinary user text blocks in the Session log; resource keys, download state, and file metadata are not added to receipts or bindings. | v0.9.5 reads Sessions that contain these ordinary text blocks, but reverts every new file message to the generic unsupported path. Rolling back does not remove already committed attachment content from Session history. |
 | `0.9.7` | Adds no durable schema or image bytes. It reads the existing exact model-visible Session surface and exact adapter modality metadata before model/session routing; incompatible checks perform no binding mutation. | v0.9.6 reads the same bindings and Session events but removes the image-history guard. Existing image blocks from another surface remain stored and can again reach a text-only route, where the provider is expected to fail closed. |
 | `0.9.8` | Adds no durable schema. During graceful shutdown it makes a bounded attempt to terminalize every known running execution Card through a signal-aware final PATCH without appending a Session result or sending partial output. | v0.9.7 reads the same state but can leave an already delivered running Card with a stale Stop control after its process-local turn authority disappears. Stop v0.9.8 cleanly before rollback and treat any still-running older Card as stale. |
+| `0.9.9` | Adds no plugin-owned schema. Opted-in images publish immutable objects under the Harness attachment backend, while Session events store only validated content-addressed references and metadata. | v0.9.8 retains and reads the same Session image blocks when its deployment has an attachment service, but new Lark image messages return to the unsupported path. Rolling code back does not delete objects or orphans; keep the attachment backend aligned with Session logs. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -61,7 +63,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.8'
+target_tag='v0.9.9'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -107,32 +109,39 @@ test "$backup_parent" = "$backup_parent_input"
 case "$backup_parent" in
   "$dsh_state_root"|"$dsh_state_root"/*) exit 1 ;;
 esac
+umask 077
+test ! -L "$dsh_state_root/attachments"
+if test ! -e "$dsh_state_root/attachments"; then
+  install -d -m 700 -- "$dsh_state_root/attachments"
+fi
 test -d "$dsh_state_root/sessions"
 test -d "$dsh_state_root/storages"
+test -d "$dsh_state_root/attachments"
 test -d "$dsh_state_root/profiles/web"
 test -d "$backup_parent"
 test ! -L "$dsh_state_root/sessions"
 test ! -L "$dsh_state_root/storages"
+test ! -L "$dsh_state_root/attachments"
 test ! -L "$dsh_state_root/profiles"
 test ! -L "$dsh_state_root/profiles/web"
 command -v mountpoint >/dev/null
 ! mountpoint -q -- "$dsh_state_root/sessions"
 ! mountpoint -q -- "$dsh_state_root/storages"
+! mountpoint -q -- "$dsh_state_root/attachments"
 ! mountpoint -q -- "$dsh_state_root/profiles"
 ! mountpoint -q -- "$dsh_state_root/profiles/web"
 root_device="$(stat -c '%d' -- "$dsh_state_root")"
 root_mount="$(stat -c '%m' -- "$dsh_state_root")"
-for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
+for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/attachments" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
   test "$(stat -c '%d' -- "$active_unit")" = "$root_device"
   test "$(stat -c '%m' -- "$active_unit")" = "$root_mount"
 done
 
-required_kib="$(du -sk -- "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/profiles/web" | awk '{ total += $1 } END { print total }')"
+required_kib="$(du -sk -- "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/attachments" "$dsh_state_root/profiles/web" | awk '{ total += $1 } END { print total }')"
 available_kib="$(df -Pk -- "$backup_parent" | awk 'NR == 2 { print $4 }')"
 [[ "$required_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ ]]
 test "$available_kib" -gt "$required_kib"
 
-umask 077
 upgrade_snapshot="$(mktemp -d -- "$backup_parent/dsh-lark-pre-upgrade.XXXXXX")"
 test -d "$upgrade_snapshot"
 test ! -L "$upgrade_snapshot"
@@ -141,14 +150,16 @@ test "$(dirname -- "$upgrade_snapshot")" = "$backup_parent"
 case "$(basename -- "$upgrade_snapshot")" in dsh-lark-pre-upgrade.*) ;; *) exit 1 ;; esac
 cp -a -- "$dsh_state_root/sessions" "$upgrade_snapshot/sessions"
 cp -a -- "$dsh_state_root/storages" "$upgrade_snapshot/storages"
+cp -a -- "$dsh_state_root/attachments" "$upgrade_snapshot/attachments"
 cp -a -- "$dsh_state_root/profiles/web" "$upgrade_snapshot/web-profile"
 test -d "$upgrade_snapshot/sessions"
 test -d "$upgrade_snapshot/storages"
+test -d "$upgrade_snapshot/attachments"
 test -d "$upgrade_snapshot/web-profile"
 tree_digest() {
   tar --sort=name --format=posix \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
-    --numeric-owner -C "$1" -cf - sessions storages web-profile |
+    --numeric-owner -C "$1" -cf - sessions storages attachments web-profile |
     sha256sum | awk '{ print $1 }'
 }
 snapshot_digest="$(tree_digest "$upgrade_snapshot")"
@@ -164,7 +175,7 @@ printf 'completed snapshot: %s\n' "$upgrade_snapshot"
 )
 ```
 
-Only a private snapshot carrying `SNAPSHOT_SHA256` and `SNAPSHOT_COMPLETE` after all three copies is eligible for this restore template. The checksum detects accidental corruption while the protected directory supplies its trust boundary; it is not a signature against an attacker who can rewrite both files. Verify the snapshot before changing the profile. Do not move or delete the source state. If a custom backend spans databases, volumes, mountpoints, or top-level symlinks, replace the template with one backend-native snapshot that establishes a common consistency point.
+Only a private snapshot carrying `SNAPSHOT_SHA256` and `SNAPSHOT_COMPLETE` after all four copies is eligible for this restore template. The checksum detects accidental corruption while the protected directory supplies its trust boundary; it is not a signature against an attacker who can rewrite both files. Verify the snapshot before changing the profile. Do not move or delete the source state. If a custom backend spans databases, volumes, mountpoints, or top-level symlinks, replace the template with one backend-native snapshot that establishes a common consistency point.
 
 ## Upgrade and validate
 
@@ -200,18 +211,19 @@ Every handled validation message advances the inbound receipt state. A later sna
 
 A host move is a cold migration, not a blue/green rollout. Stop the source first and keep it stopped; no source and destination Harness processes may share the state or connect the same Lark app at once. This stock procedure is limited to a cold same-Linux move into an empty root that preserves numeric ownership, modes, symlink targets, and the exact absolute `DSH_HOME`, checkout, launch, and Workspace paths. Other layouts and backends remain unverified and require their native procedure.
 
-Prepare the destination with the exact rc.6 cohort, one Node.js line supported by both the source and target plugin versions, target and rollback plugin tags/commits, app ID, `defaultSessionId`, JSONL compression, launch workspace, and credential source. Do not change the Node.js line during this state transfer. Transfer one completed three-directory snapshot plus the required immutable checkouts over an authenticated channel, then recompute and verify `SNAPSHOT_SHA256` before installation. Copy Workspace repositories separately so their canonical paths and commits match; they are not inside the state snapshot. Never merge destination JSONL/JSON with existing state. Validate the destination while the source remains stopped, and stop the destination before any source rollback or retry.
+Prepare the destination with the exact rc.6 cohort, one Node.js line supported by both the source and target plugin versions, target and rollback plugin tags/commits, app ID, `defaultSessionId`, JSONL compression, launch workspace, and credential source. Do not change the Node.js line during this state transfer. Transfer one completed four-directory snapshot plus the required immutable checkouts over an authenticated channel, then recompute and verify `SNAPSHOT_SHA256` before installation. Copy Workspace repositories separately so their canonical paths and commits match; they are not inside the state snapshot. Never merge destination JSONL/JSON or attachment objects with existing state. Validate the destination while the source remains stopped, and stop the destination before any source rollback or retry.
 
 ## Rollback decision table
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.8 | State handling |
+| Rollback target from v0.9.9 | State handling |
 | --- | --- |
+| v0.9.8 | Uses the same bindings, Session logs, and image-routing guard but never downloads a new Lark image. Existing image blocks still require their referenced attachment objects and an image-capable route. No object or orphan is deleted; keep the attachment store with the snapshot. |
 | v0.9.7 | Uses the same durable state and image-routing guard, but removes graceful terminalization for ordinary running execution Cards. A Card still showing Running/Stop after process exit has no live Stop authority; inspect the Session after restart and retry as needed. |
 | v0.9.6 | Uses the same durable state but removes image-aware model and Session routing checks. Image blocks already present through another Harness surface remain in the Session; verify every affected conversation uses an image-capable route before serving ordinary prompts. |
 | v0.9.5 | Uses the same durable state and continues every accepted text attachment already committed as an ordinary user block, but new file messages return to the generic unsupported notice and are never downloaded. Stop cleanly first; no attachment sidecar or temporary-file cleanup exists. |
-| v0.9.4 | Uses the same durable state, but its constructible plugin entry can lose the async disposer during root unload. Pending questions may remain interactive-looking while their process state is gone, and their tool calls cold-repair as interrupted. Prefer roll-forward; if rollback is required, stop v0.9.8 cleanly first and treat every outstanding v0.9.4 Card as stale. |
+| v0.9.4 | Uses the same durable state, but its constructible plugin entry can lose the async disposer during root unload. Pending questions may remain interactive-looking while their process state is gone, and their tool calls cold-repair as interrupted. Prefer roll-forward; if rollback is required, stop v0.9.9 cleanly first and treat every outstanding v0.9.4 Card as stale. |
 | v0.9.3 | Uses the same v2 conversation binding, Workspace domain, and Session logs. Structured Card handling and its process-local pending state disappear; stop cleanly first. Already-sent Cards remain terminal or stale in chat, and every outstanding action is rejected. Completed answers already committed as ordinary tool results remain in the transcript. |
 | v0.9.2 | Uses the same v2 conversation binding, Workspace domain, and Session logs. A Session selected through v0.9.3 remains active because v0.9.2 follows that committed binding, but the `/session` list/resume command disappears and rollback does not restore the previously active Session. No archive, unarchive, delete, or search state was introduced by v0.9.3. |
 | v0.9.1 | No durable-state conversion is required. The older Card payload can be rejected by Feishu, so approvals may become unavailable while remaining fail-closed; retain the full snapshot and prefer roll-forward recovery. |
@@ -256,26 +268,30 @@ case "$upgrade_snapshot" in "$dsh_state_root"|"$dsh_state_root"/*) exit 1 ;; esa
 case "$dsh_state_root" in "$upgrade_snapshot"|"$upgrade_snapshot"/*) exit 1 ;; esac
 test -d "$upgrade_snapshot/sessions"
 test -d "$upgrade_snapshot/storages"
+test -d "$upgrade_snapshot/attachments"
 test -d "$upgrade_snapshot/web-profile"
 test -f "$upgrade_snapshot/SNAPSHOT_SHA256"
 test -f "$upgrade_snapshot/SNAPSHOT_COMPLETE"
 test -d "$dsh_state_root/sessions"
 test -d "$dsh_state_root/storages"
+test -d "$dsh_state_root/attachments"
 test -d "$dsh_state_root/profiles/web"
 test ! -L "$upgrade_snapshot/sessions"
 test ! -L "$upgrade_snapshot/storages"
+test ! -L "$upgrade_snapshot/attachments"
 test ! -L "$upgrade_snapshot/web-profile"
 test ! -L "$upgrade_snapshot/SNAPSHOT_SHA256"
 test ! -L "$upgrade_snapshot/SNAPSHOT_COMPLETE"
 test ! -L "$dsh_state_root/sessions"
 test ! -L "$dsh_state_root/storages"
+test ! -L "$dsh_state_root/attachments"
 test ! -L "$dsh_state_root/profiles"
 test ! -L "$dsh_state_root/profiles/web"
 
 root_device="$(stat -c '%d' -- "$dsh_state_root")"
 root_mount="$(stat -c '%m' -- "$dsh_state_root")"
 command -v mountpoint >/dev/null
-for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
+for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/attachments" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
   ! mountpoint -q -- "$active_unit"
   test "$(stat -c '%d' -- "$active_unit")" = "$root_device"
   test "$(stat -c '%m' -- "$active_unit")" = "$root_mount"
@@ -284,13 +300,13 @@ done
 tree_digest() {
   tar --sort=name --format=posix \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
-    --numeric-owner -C "$1" -cf - sessions storages web-profile |
+    --numeric-owner -C "$1" -cf - sessions storages attachments web-profile |
     sha256sum | awk '{ print $1 }'
 }
 expected_digest="$(< "$upgrade_snapshot/SNAPSHOT_SHA256")"
 [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
 test "$(tree_digest "$upgrade_snapshot")" = "$expected_digest"
-required_kib="$(du -sk -- "$upgrade_snapshot/sessions" "$upgrade_snapshot/storages" "$upgrade_snapshot/web-profile" | awk '{ total += $1 } END { print total }')"
+required_kib="$(du -sk -- "$upgrade_snapshot/sessions" "$upgrade_snapshot/storages" "$upgrade_snapshot/attachments" "$upgrade_snapshot/web-profile" | awk '{ total += $1 } END { print total }')"
 available_kib="$(df -Pk -- "$dsh_state_root" | awk 'NR == 2 { print $4 }')"
 [[ "$required_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ ]]
 test "$available_kib" -gt "$required_kib"
@@ -306,8 +322,9 @@ test "$(stat -c '%d' -- "$restore_stage")" = "$root_device"
 test "$(stat -c '%m' -- "$restore_stage")" = "$root_mount"
 cp -a -- "$upgrade_snapshot/sessions" "$restore_stage/sessions"
 cp -a -- "$upgrade_snapshot/storages" "$restore_stage/storages"
+cp -a -- "$upgrade_snapshot/attachments" "$restore_stage/attachments"
 cp -a -- "$upgrade_snapshot/web-profile" "$restore_stage/web-profile"
-for staged_unit in "$restore_stage/sessions" "$restore_stage/storages" "$restore_stage/web-profile"; do
+for staged_unit in "$restore_stage/sessions" "$restore_stage/storages" "$restore_stage/attachments" "$restore_stage/web-profile"; do
   test -d "$staged_unit"
   test ! -L "$staged_unit"
   test "$(stat -c '%d' -- "$staged_unit")" = "$root_device"
@@ -353,6 +370,7 @@ rollback_one() {
 rollback_all() {
   rollback_failed=0
   rollback_one "$dsh_state_root/profiles/web" "$rollback_hold/web-profile" "$restore_stage/web-profile" "$original_web_id" "$staged_web_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile profiles/web'; rollback_failed=1; }
+  rollback_one "$dsh_state_root/attachments" "$rollback_hold/attachments" "$restore_stage/attachments" "$original_attachments_id" "$staged_attachments_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile attachments'; rollback_failed=1; }
   rollback_one "$dsh_state_root/storages" "$rollback_hold/storages" "$restore_stage/storages" "$original_storages_id" "$staged_storages_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile storages'; rollback_failed=1; }
   rollback_one "$dsh_state_root/sessions" "$rollback_hold/sessions" "$restore_stage/sessions" "$original_sessions_id" "$staged_sessions_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile sessions'; rollback_failed=1; }
   return "$rollback_failed"
@@ -377,9 +395,11 @@ on_exit() {
 
 original_sessions_id="$(dir_id "$dsh_state_root/sessions")"
 original_storages_id="$(dir_id "$dsh_state_root/storages")"
+original_attachments_id="$(dir_id "$dsh_state_root/attachments")"
 original_web_id="$(dir_id "$dsh_state_root/profiles/web")"
 staged_sessions_id="$(dir_id "$restore_stage/sessions")"
 staged_storages_id="$(dir_id "$restore_stage/storages")"
+staged_attachments_id="$(dir_id "$restore_stage/attachments")"
 staged_web_id="$(dir_id "$restore_stage/web-profile")"
 rename_active=0
 rename_committed=0
@@ -391,28 +411,32 @@ trap 'exit 143' TERM
 rename_active=1
 rename_empty_target "$dsh_state_root/sessions" "$rollback_hold/sessions" "$original_sessions_id" || exit 1
 rename_empty_target "$dsh_state_root/storages" "$rollback_hold/storages" "$original_storages_id" || exit 1
+rename_empty_target "$dsh_state_root/attachments" "$rollback_hold/attachments" "$original_attachments_id" || exit 1
 rename_empty_target "$dsh_state_root/profiles/web" "$rollback_hold/web-profile" "$original_web_id" || exit 1
 rename_empty_target "$restore_stage/sessions" "$dsh_state_root/sessions" "$staged_sessions_id" || exit 1
 rename_empty_target "$restore_stage/storages" "$dsh_state_root/storages" "$staged_storages_id" || exit 1
+rename_empty_target "$restore_stage/attachments" "$dsh_state_root/attachments" "$staged_attachments_id" || exit 1
 rename_empty_target "$restore_stage/web-profile" "$dsh_state_root/profiles/web" "$staged_web_id" || exit 1
 test "$(dir_id "$dsh_state_root/sessions")" = "$staged_sessions_id"
 test "$(dir_id "$dsh_state_root/storages")" = "$staged_storages_id"
+test "$(dir_id "$dsh_state_root/attachments")" = "$staged_attachments_id"
 test "$(dir_id "$dsh_state_root/profiles/web")" = "$staged_web_id"
 test "$(dir_id "$rollback_hold/sessions")" = "$original_sessions_id"
 test "$(dir_id "$rollback_hold/storages")" = "$original_storages_id"
+test "$(dir_id "$rollback_hold/attachments")" = "$original_attachments_id"
 test "$(dir_id "$rollback_hold/web-profile")" = "$original_web_id"
-if path_present "$restore_stage/sessions" || path_present "$restore_stage/storages" || path_present "$restore_stage/web-profile"; then exit 1; fi
+if path_present "$restore_stage/sessions" || path_present "$restore_stage/storages" || path_present "$restore_stage/attachments" || path_present "$restore_stage/web-profile"; then exit 1; fi
 rename_committed=1
 trap - ERR EXIT HUP INT QUIT TERM
 printf 'active root: %s\nrollback hold: %s\nrestore stage: %s\n' "$dsh_state_root" "$rollback_hold" "$restore_stage"
 )
 ```
 
-The subshell fails closed on validation, copy, checksum, or rename errors. During the rename phase, its `EXIT`/`HUP`/`INT`/`QUIT`/`TERM` trap uses non-overwriting moves plus device/inode checks to restore the original three units. SIGKILL, host power loss, and kernel failure cannot run the trap. After any interrupted or incomplete result, keep Harness stopped and reconcile the printed active, hold, and stage paths against their recorded invariants; never overwrite or merge them.
+The subshell fails closed on validation, copy, checksum, or rename errors. During the rename phase, its `EXIT`/`HUP`/`INT`/`QUIT`/`TERM` trap uses non-overwriting moves plus device/inode checks to restore the original four units. SIGKILL, host power loss, and kernel failure cannot run the trap. After any interrupted or incomplete result, keep Harness stopped and reconcile the printed active, hold, and stage paths against their recorded invariants; never overwrite or merge them.
 
 The restored profile must find the immutable original checkout at the same absolute path and exact commit recorded before downtime. Do not point it at another directory or run `plugin add` as a substitute. Start the exact old plugin on the same rc.6 cohort. `/api/lark/health` exists only in v0.5.0 and newer; for v0.1.0–v0.4.0, require the historical `[ws] ws client ready` gate plus a disposable end-to-end reply and conversation-resume check, and do not treat HTTP 404 alone as plugin failure. Retain `rollback_hold`, `restore_stage`, the snapshot, and both immutable old/target checkouts until the incident closes.
 
-Restoring the snapshot rewinds transcripts, receipts, Workspace registration/order, project/model bindings, and mutation history to the snapshot time. Workspaces on disk and external side effects remain at their current time. Review that split explicitly before allowing new turns.
+Restoring the snapshot rewinds transcripts, referenced attachment objects, receipts, Workspace registration/order, project/model bindings, and mutation history to the snapshot time. Workspaces on disk, platform messages, provider calls, and other external side effects remain at their current time. Review that split explicitly before allowing new turns.
 
 ## Failure recovery
 

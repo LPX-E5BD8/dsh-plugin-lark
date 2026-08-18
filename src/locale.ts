@@ -149,6 +149,13 @@ interface LocaleCopy {
     readonly inboundTextFileInvalid: string
     readonly inboundTextFileUnavailable: string
     inboundTextFileTooLarge(maxBytes: number): string
+    readonly inboundImageInvalid: string
+    readonly inboundImageUnavailable: string
+    readonly inboundImageBusy: string
+    readonly inboundImageModelUnsupported: string
+    inboundImageTooLarge(maxBytes: number): string
+    inboundImageTooManyPixels(maxPixels: number): string
+    readonly inboundImageAggregateLimit: string
     readonly followupFailure: string
     readonly cardUnavailable: string
     readonly approvalUnauthorized: string
@@ -315,6 +322,13 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       inboundTextFileInvalid: '无法读取该附件。仅支持安全文件名的 UTF-8 .txt、.log、.patch 和 .diff 文本文件。',
       inboundTextFileUnavailable: '附件下载暂不可用，请重新发送或改用文字。',
       inboundTextFileTooLarge: (maxBytes) => `文本附件过大（上限 ${byteLimit(maxBytes, '字节')}）。`,
+      inboundImageInvalid: '无法安全读取该图片。仅支持单幅静态 PNG 或 JPEG。',
+      inboundImageUnavailable: '图片暂时无法安全接收，请稍后重试或改用文字。',
+      inboundImageBusy: '正在处理另一张图片，请稍后重新发送。',
+      inboundImageModelUnsupported: '当前模型未明确支持图片输入，请先用 /model 选择支持图片的模型。',
+      inboundImageTooLarge: (maxBytes) => `图片过大（上限 ${byteLimit(maxBytes, '字节')}）。`,
+      inboundImageTooManyPixels: (maxPixels) => `图片像素过多（上限 ${maxPixels} 像素）。`,
+      inboundImageAggregateLimit: '当前会话的图片数量或总字节数已达到上限；请先开始新会话或压缩历史。',
       followupFailure: '消息提交失败，请重试。',
       cardUnavailable: '卡片操作暂不可用。',
       approvalUnauthorized: '无权执行此操作。',
@@ -509,6 +523,13 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       inboundTextFileInvalid: 'This attachment cannot be read. Only UTF-8 .txt, .log, .patch, and .diff files with safe names are accepted.',
       inboundTextFileUnavailable: 'Attachment download is temporarily unavailable. Send it again or use text.',
       inboundTextFileTooLarge: (maxBytes) => `The text attachment is too large (limit: ${byteLimit(maxBytes, 'bytes')}).`,
+      inboundImageInvalid: 'This image cannot be read safely. Only one static PNG or JPEG is accepted.',
+      inboundImageUnavailable: 'The image cannot be admitted safely right now. Try again later or use text.',
+      inboundImageBusy: 'Another image is being processed. Resend this image later.',
+      inboundImageModelUnsupported: 'The current model does not explicitly support image input. Select an image-capable model with /model first.',
+      inboundImageTooLarge: (maxBytes) => `The image is too large (limit: ${byteLimit(maxBytes, 'bytes')}).`,
+      inboundImageTooManyPixels: (maxPixels) => `The image has too many pixels (limit: ${maxPixels} pixels).`,
+      inboundImageAggregateLimit: 'This conversation reached its image count or byte limit. Start a fresh Session or compact its history first.',
       followupFailure: 'Message submission failed. Please try again.',
       cardUnavailable: 'Card actions are temporarily unavailable.',
       approvalUnauthorized: 'You cannot perform this action.',

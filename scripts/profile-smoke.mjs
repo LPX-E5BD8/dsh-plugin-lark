@@ -328,6 +328,8 @@ async function assertHarnessFallback(home) {
     .sort()
   assert.ok(packageDirectories.length > 0, 'the profile fallback must contain DSH packages')
   for (const required of [
+    'dsh-attachment',
+    'dsh-attachment-local',
     'dsh-session-projection',
     'dsh-session-query',
     'dsh-session-query-sqlite',

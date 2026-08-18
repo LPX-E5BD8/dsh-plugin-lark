@@ -1,13 +1,25 @@
 import assert from 'node:assert/strict'
 import { setImmediate as yieldImmediate } from 'node:timers/promises'
 import { test } from 'node:test'
+import type {
+  ImageAttachmentLimits,
+  ImageAttachmentRef,
+  SaveImageAttachment,
+  StoredImageAttachment,
+} from '@deepseek-ai/dsh-attachment'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ImageBlock, LlmCallConfig, UserMessage } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import { LarkBridge } from '../src/bridge.ts'
 import type { ConversationBinding } from '../src/conversation-binding.ts'
-import type { LarkClientLike, LarkDeliveryOptions, LarkInbound } from '../src/lark.ts'
+import type {
+  LarkClientLike,
+  LarkDeliveryOptions,
+  LarkDownloadedResource,
+  LarkInbound,
+  LarkResourceDownloadOptions,
+} from '../src/lark.ts'
 
 interface SentText {
   readonly chatId: string
@@ -189,6 +201,16 @@ class ModelInbox {
     this.nextStep[index] = replacement
     return true
   }
+
+  remove(messageId: UserMessage['id']): boolean {
+    for (const inbox of [this.nextStep, this.nextTurn]) {
+      const index = inbox.findIndex(({ id }) => id === messageId)
+      if (index < 0) continue
+      inbox.splice(index, 1)
+      return true
+    }
+    return false
+  }
 }
 
 class ModelAgent {
@@ -212,6 +234,15 @@ class ModelAgent {
     this.host.followups.push({ agent: this, message })
     this.session.append('user/message', message as UserMessage, { surfaceOp: 'append' })
     if (this.maintenance) this.inbox.hasPending = true
+  }
+
+  send(message: UserMessage, target: 'next-step' | 'next-turn', _wakeup: boolean): void {
+    assert.equal(this.disposed, false, `send reached disposed agent ${this.id}`)
+    const failure = this.host.takeAgentSendFailure()
+    if (failure !== undefined) throw failure
+    this.host.agentSends.push({ agent: this, message, target })
+    const inbox = target === 'next-step' ? this.inbox.nextStep : this.inbox.nextTurn
+    inbox.push(message)
   }
 
   cancel(): void {}
@@ -249,8 +280,49 @@ function cloneBinding(binding: ConversationBinding): ConversationBinding {
   }
 }
 
+type ImageSavePlan = Error | ImageAttachmentRef | ((input: SaveImageAttachment) => Promise<ImageAttachmentRef>)
+
+class ModelAttachmentStore {
+  imageLimits: ImageAttachmentLimits = Object.freeze({
+    maxImageBytes: 5 * 1024 * 1024,
+    maxImagesPerMessage: 20,
+    maxMessageImageBytes: 100 * 1024 * 1024,
+    maxImagePixels: 40_000_000,
+    mediaTypes: Object.freeze(['image/png', 'image/jpeg', 'image/webp', 'image/gif']),
+  })
+  readonly saveCalls: SaveImageAttachment[] = []
+  readonly readCalls: ImageAttachmentRef[] = []
+  private readonly savePlans: ImageSavePlan[] = []
+
+  planSave(plan: ImageSavePlan): void {
+    this.savePlans.push(plan)
+  }
+
+  async validateImage(_input: SaveImageAttachment): Promise<void> {}
+
+  async saveImage(input: SaveImageAttachment): Promise<ImageAttachmentRef> {
+    this.saveCalls.push(input)
+    const plan = this.savePlans.shift()
+    if (plan instanceof Error) throw plan
+    if (typeof plan === 'function') return plan(input)
+    return plan ?? {
+      attachmentId: `sha256:${'c'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+    }
+  }
+
+  async readImage(ref: ImageAttachmentRef): Promise<StoredImageAttachment> {
+    this.readCalls.push(ref)
+    return { ref, data: new Uint8Array(ref.bytes) }
+  }
+}
+
 class ModelHost {
   readonly llm = new ModelRuntime()
+  attachments: ModelAttachmentStore | undefined = new ModelAttachmentStore()
   readonly liveAgents = new Map<string, ModelAgent>()
   readonly liveSessions = new Map<string, ModelSession>()
   readonly persisted = new Map<string, ModelSession>()
@@ -260,15 +332,23 @@ class ModelHost {
   readonly disposals: string[] = []
   readonly flushCalls: string[] = []
   readonly followups: Array<{ readonly agent: ModelAgent; readonly message: unknown }> = []
+  readonly agentSends: Array<{
+    readonly agent: ModelAgent
+    readonly message: UserMessage
+    readonly target: 'next-step' | 'next-turn'
+  }> = []
   readonly completedInboundKeys: string[] = []
   readonly warnings: unknown[][] = []
   readonly errors: unknown[][] = []
   readonly runtimeExecutions: string[] = []
   runtimeAvailable = false
+  private agentSendFailure: Error | undefined
   private inboundCompletionFailures = 0
   private readonly flushPlans: FlushPlan[] = []
   private bindingPutStart: (() => void) | undefined
   private bindingPutWait: Promise<void> | undefined
+  private agentOpenStart: (() => void) | undefined
+  private agentOpenWait: Promise<void> | undefined
 
   readonly ctx = {
     logger: {
@@ -279,6 +359,7 @@ class ModelHost {
     get: (name: string) => {
       if (name === 'approval') return {}
       if (name === 'llm') return this.llm
+      if (name === 'attachments') return this.attachments
       if (name === 'commands' && this.runtimeAvailable) {
         return {
           list: () => [
@@ -330,6 +411,16 @@ class ModelHost {
     this.inboundCompletionFailures += 1
   }
 
+  failNextAgentSend(error: Error): void {
+    this.agentSendFailure = error
+  }
+
+  takeAgentSendFailure(): Error | undefined {
+    const failure = this.agentSendFailure
+    this.agentSendFailure = undefined
+    return failure
+  }
+
   async completeInbound(key: string): Promise<void> {
     if (this.inboundCompletionFailures > 0) {
       this.inboundCompletionFailures -= 1
@@ -341,6 +432,11 @@ class ModelHost {
   holdNextBindingPut(start: () => void, wait: Promise<void>): void {
     this.bindingPutStart = start
     this.bindingPutWait = wait
+  }
+
+  holdNextAgentOpen(start: () => void, wait: Promise<void>): void {
+    this.agentOpenStart = start
+    this.agentOpenWait = wait
   }
 
   async putBinding(baseId: string, binding: ConversationBinding): Promise<void> {
@@ -371,6 +467,12 @@ class ModelHost {
   }
 
   private async open(kind: 'create' | 'resume', options: AgentOpenOptions) {
+    const openStart = this.agentOpenStart
+    const openWait = this.agentOpenWait
+    this.agentOpenStart = undefined
+    this.agentOpenWait = undefined
+    openStart?.()
+    await openWait
     const sessionId = String(options.sessionId)
     const agentOptions = {
       provider: options.agentOptions?.provider ?? '',
@@ -443,6 +545,11 @@ interface MountOptions {
   readonly provider?: string
   readonly model?: string
   readonly defaultSessionId?: string
+  readonly inboundImages?: boolean
+  readonly maxInboundImageBytes?: number
+  readonly maxInboundImagePixels?: number
+  readonly maxConversationImages?: number
+  readonly maxConversationImageBytes?: number
 }
 
 async function mount(
@@ -477,6 +584,11 @@ async function mountHost(
     provider: options.provider ?? 'default-provider',
     model: options.model ?? 'default-model',
     defaultSessionId: options.defaultSessionId,
+    inboundImages: options.inboundImages,
+    maxInboundImageBytes: options.maxInboundImageBytes,
+    maxInboundImagePixels: options.maxInboundImagePixels,
+    maxConversationImages: options.maxConversationImages,
+    maxConversationImageBytes: options.maxConversationImageBytes,
   })
   await bridge.start()
   t.after(() => bridge.stop())
@@ -508,6 +620,24 @@ const STANDARD_IMAGE_BLOCK: ImageBlock = Object.freeze({
     name: 'model-switch.png',
   }),
 })
+
+const INBOUND_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+)
+
+function inboundImage(chatId: string, messageId: string, key = 'img_v3_private_key'): LarkInbound {
+  return {
+    chatId,
+    chatType: 'p2p',
+    openId: 'owner',
+    text: '',
+    messageType: 'image',
+    messageId,
+    mentioned: false,
+    resource: { kind: 'image', key },
+  }
+}
 
 function appendImageSurface(session: ModelSession): number {
   return session.append('user/message', createUserMessage({
@@ -1134,6 +1264,591 @@ test('same-id inbox replacement during capability lookup prevents pending recove
   assert.deepEqual(currentBinding(host, baseId), before)
   assert.equal(agent.inbox.nextStep[0], replacement)
   assert.equal(host.liveAgents.get(baseId), agent)
+})
+
+test('an opted-in direct PNG is saved once and admitted as one image inbox message', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['text', 'image'])
+  const downloads: Array<{
+    messageId: string
+    kind: string
+    maxBytes: number
+    aborted: boolean
+  }> = []
+  client.downloadMessageResource = async (messageId, resource, options) => {
+    downloads.push({
+      messageId,
+      kind: resource.kind,
+      maxBytes: options.maxBytes,
+      aborted: options.signal.aborted,
+    })
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  await deliver(client, inboundImage('image-direct', 'image-success', 'img_v3_never_persist'))
+
+  const attachments = host.attachments
+  assert.ok(attachments !== undefined)
+  assert.deepEqual(downloads, [{
+    messageId: 'image-success',
+    kind: 'image',
+    maxBytes: 5 * 1024 * 1024,
+    aborted: false,
+  }])
+  assert.equal(attachments.saveCalls.length, 1)
+  assert.equal(attachments.saveCalls[0]?.mediaType, 'image/png')
+  assert.notEqual(attachments.saveCalls[0]?.data, INBOUND_PNG)
+  assert.deepEqual([...(attachments.saveCalls[0]?.data ?? [])], [...INBOUND_PNG])
+  assert.equal(host.agentSends.length, 1)
+  assert.equal(host.agentSends[0]?.target, 'next-turn')
+  assert.equal(host.agentSends[0]?.message.content[0]?.type, 'image')
+  assert.equal(JSON.stringify(host.agentSends.map(({ message, target }) => ({
+    message,
+    target,
+  }))).includes('img_v3_never_persist'), false)
+  assert.equal(JSON.stringify(host.warnings).includes('img_v3_never_persist'), false)
+  assert.deepEqual(host.llm.resolveModelInfoCalls, [
+    { provider: 'route', model: 'vision' },
+    { provider: 'route', model: 'vision' },
+  ])
+})
+
+test('inbound image admission owns downloaded bytes before asynchronous storage', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  const downloaded = Buffer.from(INBOUND_PNG)
+  client.downloadMessageResource = async () => ({ data: downloaded, mediaType: 'image/png' })
+  const service = host.attachments
+  assert.ok(service !== undefined)
+  const saveStarted = Promise.withResolvers<void>()
+  const releaseSave = Promise.withResolvers<void>()
+  service.planSave(async (input) => {
+    saveStarted.resolve()
+    await releaseSave.promise
+    assert.notEqual(input.data, downloaded)
+    assert.deepEqual([...input.data], [...INBOUND_PNG])
+    return {
+      attachmentId: `sha256:${'6'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+    }
+  })
+
+  const delivery = deliver(client, inboundImage('image-owned-bytes', 'image-owned-bytes-message'))
+  await saveStarted.promise
+  downloaded.fill(0)
+  releaseSave.resolve()
+  await delivery
+
+  assert.equal(service.saveCalls.length, 1)
+  assert.equal(host.agentSends.length, 1)
+  assert.equal(host.agentSends[0]?.message.content[0]?.type, 'image')
+})
+
+test('a text-only route rejects an inbound image before download or storage', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'text-only', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'text-only', ['text'])
+  let downloads = 0
+  client.downloadMessageResource = async () => {
+    downloads += 1
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  await deliver(client, inboundImage('image-text-only', 'image-rejected'))
+
+  assert.equal(downloads, 0)
+  assert.equal(host.attachments?.saveCalls.length, 0)
+  assert.deepEqual(host.agentSends, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /does not explicitly support image input/iu)
+})
+
+test('missing image capabilities or attachment storage reject before download', async (t) => {
+  const missingCapability = await mount(t, {
+    provider: 'route', model: 'unknown-input', inboundImages: true,
+  })
+  missingCapability.host.llm.setModelCapability('route', 'unknown-input', undefined)
+  let capabilityDownloads = 0
+  missingCapability.client.downloadMessageResource = async () => {
+    capabilityDownloads += 1
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  await deliver(
+    missingCapability.client,
+    inboundImage('image-missing-capability', 'image-missing-capability-message'),
+  )
+
+  assert.equal(capabilityDownloads, 0)
+  assert.equal(missingCapability.host.attachments?.saveCalls.length, 0)
+  assert.deepEqual(missingCapability.host.agentSends, [])
+  assert.match(
+    missingCapability.client.sent.at(-1)?.text ?? '',
+    /does not explicitly support image input/iu,
+  )
+
+  const missingStorage = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  missingStorage.host.llm.setModelCapability('route', 'vision', ['image'])
+  missingStorage.host.attachments = undefined
+  let storageDownloads = 0
+  missingStorage.client.downloadMessageResource = async () => {
+    storageDownloads += 1
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  await deliver(
+    missingStorage.client,
+    inboundImage('image-missing-storage', 'image-missing-storage-message'),
+  )
+
+  assert.equal(storageDownloads, 0)
+  assert.deepEqual(missingStorage.host.agentSends, [])
+  assert.match(missingStorage.client.sent.at(-1)?.text ?? '', /cannot be admitted safely/iu)
+})
+
+test('the global inbound-image slot rejects another chat without queueing a download', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  const firstDownload = Promise.withResolvers<void>()
+  const releaseFirst = Promise.withResolvers<void>()
+  const downloads: string[] = []
+  client.downloadMessageResource = async (messageId) => {
+    downloads.push(messageId)
+    firstDownload.resolve()
+    await releaseFirst.promise
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  const first = deliver(client, inboundImage('image-slot-a', 'image-slot-first'))
+  await firstDownload.promise
+  await deliver(client, inboundImage('image-slot-b', 'image-slot-second'))
+
+  assert.deepEqual(downloads, ['image-slot-first'])
+  assert.equal(host.opens.length, 1)
+  assert.match(client.sent.at(-1)?.text ?? '', /another image is being processed/iu)
+  releaseFirst.resolve()
+  await first
+  assert.equal(host.attachments?.saveCalls.length, 1)
+  assert.equal(host.agentSends.length, 1)
+})
+
+test('the global inbound-image slot rejects another chat while the first Agent cold-opens', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  const openStarted = Promise.withResolvers<void>()
+  const releaseOpen = Promise.withResolvers<void>()
+  host.holdNextAgentOpen(() => openStarted.resolve(), releaseOpen.promise)
+  const downloads: string[] = []
+  client.downloadMessageResource = async (messageId) => {
+    downloads.push(messageId)
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  const first = deliver(client, inboundImage('image-open-a', 'image-open-first'))
+  await openStarted.promise
+  await deliver(client, inboundImage('image-open-b', 'image-open-second'))
+
+  assert.deepEqual(downloads, [])
+  assert.deepEqual(host.opens, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /another image is being processed/iu)
+  releaseOpen.resolve()
+  await first
+  assert.deepEqual(downloads, ['image-open-first'])
+  assert.equal(host.opens.length, 1)
+  assert.equal(host.agentSends.length, 1)
+})
+
+test('shutdown during an inbound-image cold-open commits no notice, admission, or receipt', async (t) => {
+  const { host, client, bridge } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  const openStarted = Promise.withResolvers<void>()
+  const releaseOpen = Promise.withResolvers<void>()
+  host.holdNextAgentOpen(() => openStarted.resolve(), releaseOpen.promise)
+  let downloads = 0
+  client.downloadMessageResource = async () => {
+    downloads += 1
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  const delivery = deliver(client, inboundImage('image-open-stop', 'image-open-stop-message'))
+  await openStarted.promise
+  let stopped = false
+  const stopping = bridge.stop().then(() => { stopped = true })
+  await yieldImmediate()
+  assert.equal(stopped, false)
+  releaseOpen.resolve()
+  const error = await delivery.catch((reason: unknown) => reason)
+  await stopping
+
+  assert.ok(error instanceof Error)
+  assert.equal(downloads, 0)
+  assert.deepEqual(client.sent, [])
+  assert.deepEqual(host.agentSends, [])
+  assert.deepEqual(host.completedInboundKeys, [])
+  assert.equal((bridge as unknown as { inboundImageSlotTaken: boolean }).inboundImageSlotTaken, false)
+})
+
+test('a Session surface change during image download prevents save and admission', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  const downloadStarted = Promise.withResolvers<void>()
+  const releaseDownload = Promise.withResolvers<void>()
+  client.downloadMessageResource = async () => {
+    downloadStarted.resolve()
+    await releaseDownload.promise
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  const delivery = deliver(client, inboundImage('image-surface-race', 'image-surface'))
+  await downloadStarted.promise
+  const agent = host.opens[0]?.agent
+  assert.ok(agent !== undefined)
+  appendTextSurface(agent.session, 'external surface mutation during image download')
+  releaseDownload.resolve()
+  await delivery
+
+  assert.equal(host.attachments?.saveCalls.length, 0)
+  assert.deepEqual(host.agentSends, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /another image is being processed/iu)
+})
+
+test('shutdown after an abort-ignoring image download commits no notice, admission, or receipt', async (t) => {
+  const { host, client, bridge } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  const downloadStarted = Promise.withResolvers<void>()
+  const releaseDownload = Promise.withResolvers<void>()
+  client.downloadMessageResource = async () => {
+    downloadStarted.resolve()
+    await releaseDownload.promise
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  const delivery = deliver(client, inboundImage('image-download-stop', 'image-download-stop-message'))
+  await downloadStarted.promise
+  let stopped = false
+  const stopping = bridge.stop().then(() => { stopped = true })
+  await yieldImmediate()
+  assert.equal(stopped, false)
+  releaseDownload.resolve()
+  const error = await delivery.catch((reason: unknown) => reason)
+  await stopping
+
+  assert.ok(error instanceof Error)
+  assert.equal(host.attachments?.saveCalls.length, 0)
+  assert.deepEqual(client.sent, [])
+  assert.deepEqual(host.agentSends, [])
+  assert.deepEqual(host.completedInboundKeys, [])
+  assert.equal((bridge as unknown as { inboundImageSlotTaken: boolean }).inboundImageSlotTaken, false)
+})
+
+test('attachment service replacement after save leaves only an orphan and no ImageBlock', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  client.downloadMessageResource = async () => ({ data: INBOUND_PNG, mediaType: 'image/png' })
+  const original = host.attachments
+  assert.ok(original !== undefined)
+  const saveStarted = Promise.withResolvers<void>()
+  const releaseSave = Promise.withResolvers<void>()
+  original.planSave(async (input) => {
+    saveStarted.resolve()
+    await releaseSave.promise
+    return {
+      attachmentId: `sha256:${'d'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+    }
+  })
+
+  const delivery = deliver(client, inboundImage('image-service-race', 'image-service'))
+  await saveStarted.promise
+  host.attachments = new ModelAttachmentStore()
+  releaseSave.resolve()
+  await delivery
+
+  assert.equal(original.saveCalls.length, 1)
+  assert.equal(host.attachments.saveCalls.length, 0)
+  assert.deepEqual(host.agentSends, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /another image is being processed/iu)
+})
+
+test('attachment policy mutation during save leaves only an orphan and no ImageBlock', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  client.downloadMessageResource = async () => ({ data: INBOUND_PNG, mediaType: 'image/png' })
+  const service = host.attachments
+  assert.ok(service !== undefined)
+  const saveStarted = Promise.withResolvers<void>()
+  const releaseSave = Promise.withResolvers<void>()
+  service.planSave(async (input) => {
+    saveStarted.resolve()
+    await releaseSave.promise
+    return {
+      attachmentId: `sha256:${'7'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+    }
+  })
+
+  const delivery = deliver(client, inboundImage('image-policy-race', 'image-policy-message'))
+  await saveStarted.promise
+  service.imageLimits = Object.freeze({
+    ...service.imageLimits,
+    maxMessageImageBytes: service.imageLimits.maxMessageImageBytes - 1,
+  })
+  releaseSave.resolve()
+  await delivery
+
+  assert.equal(service.saveCalls.length, 1)
+  assert.deepEqual(host.agentSends, [])
+  assert.equal(host.completedInboundKeys.length, 1)
+  assert.match(client.sent.at(-1)?.text ?? '', /another image is being processed/iu)
+})
+
+test('conversation image count is enforced before another resource download', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true, maxConversationImages: 1,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  let downloads = 0
+  client.downloadMessageResource = async () => {
+    downloads += 1
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+  await deliver(client, inboundImage('image-count', 'image-count-first'))
+  const agent = host.opens[0]?.agent
+  assert.ok(agent !== undefined)
+  const admitted = agent.inbox.nextTurn.shift()
+  assert.ok(admitted !== undefined)
+  agent.session.append('user/message', admitted, { surfaceOp: 'append' })
+
+  await deliver(client, inboundImage('image-count', 'image-count-second'))
+
+  assert.equal(downloads, 1)
+  assert.equal(host.attachments?.saveCalls.length, 1)
+  assert.equal(host.agentSends.length, 1)
+  assert.match(client.sent.at(-1)?.text ?? '', /image count or byte limit/iu)
+})
+
+test('invalid image bytes and malformed attachment limits fail before save or admission', async (t) => {
+  const invalid = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  invalid.host.llm.setModelCapability('route', 'vision', ['image'])
+  invalid.client.downloadMessageResource = async () => ({
+    data: Buffer.from('GIF89a'),
+    mediaType: 'image/gif',
+  })
+  await deliver(invalid.client, inboundImage('image-invalid', 'image-invalid-gif'))
+  assert.equal(invalid.host.attachments?.saveCalls.length, 0)
+  assert.deepEqual(invalid.host.agentSends, [])
+  assert.match(invalid.client.sent.at(-1)?.text ?? '', /static PNG or JPEG/iu)
+
+  const malformed = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  malformed.host.llm.setModelCapability('route', 'vision', ['image'])
+  const service = malformed.host.attachments
+  assert.ok(service !== undefined)
+  service.imageLimits = { ...service.imageLimits, maxImageBytes: 0 }
+  let downloads = 0
+  malformed.client.downloadMessageResource = async () => {
+    downloads += 1
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+  await deliver(malformed.client, inboundImage('image-limits', 'image-malformed-limits'))
+  assert.equal(downloads, 0)
+  assert.equal(service.saveCalls.length, 0)
+  assert.match(malformed.client.sent.at(-1)?.text ?? '', /cannot be admitted safely/iu)
+})
+
+test('attachment service byte limits reduce the resource download cap', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  const service = host.attachments
+  assert.ok(service !== undefined)
+  service.imageLimits = { ...service.imageLimits, maxImageBytes: 32 }
+  let requestedMax = 0
+  client.downloadMessageResource = async (_messageId, _resource, options) => {
+    requestedMax = options.maxBytes
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+
+  await deliver(client, inboundImage('image-service-limit', 'image-service-limit-message'))
+
+  assert.equal(requestedMax, 32)
+  assert.equal(service.saveCalls.length, 0)
+  assert.match(client.sent.at(-1)?.text ?? '', /limit: 32 bytes/iu)
+})
+
+test('duplicate image delivery downloads, saves, and admits only once', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  let downloads = 0
+  client.downloadMessageResource = async () => {
+    downloads += 1
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+  const message = inboundImage('image-duplicate', 'image-duplicate-message')
+
+  await deliver(client, message)
+  await deliver(client, message)
+
+  assert.equal(downloads, 1)
+  assert.equal(host.attachments?.saveCalls.length, 1)
+  assert.equal(host.agentSends.length, 1)
+  assert.equal(host.completedInboundKeys.length, 1)
+})
+
+test('shutdown waits for non-cancellable image save and admits no late ImageBlock or receipt', async (t) => {
+  const { host, client, bridge } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  client.downloadMessageResource = async () => ({ data: INBOUND_PNG, mediaType: 'image/png' })
+  const service = host.attachments
+  assert.ok(service !== undefined)
+  const saveStarted = Promise.withResolvers<void>()
+  const releaseSave = Promise.withResolvers<void>()
+  service.planSave(async (input) => {
+    saveStarted.resolve()
+    await releaseSave.promise
+    return {
+      attachmentId: `sha256:${'e'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+    }
+  })
+  const delivery = deliver(client, inboundImage('image-shutdown', 'image-shutdown-message'))
+  await saveStarted.promise
+  let stopped = false
+  const stopping = bridge.stop().then(() => { stopped = true })
+  await yieldImmediate()
+  assert.equal(stopped, false)
+  releaseSave.resolve()
+  const error = await delivery.catch((reason: unknown) => reason)
+  await stopping
+
+  assert.ok(error instanceof Error)
+  assert.equal(service.saveCalls.length, 1)
+  assert.deepEqual(host.agentSends, [])
+  assert.deepEqual(host.completedInboundKeys, [])
+})
+
+test('a post-save followup failure leaves an orphan and exact redelivery remains retryable', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  client.downloadMessageResource = async () => ({ data: INBOUND_PNG, mediaType: 'image/png' })
+  host.failNextAgentSend(new Error('private image followup marker'))
+  const message = inboundImage('image-followup-failure', 'image-followup-failure-message')
+
+  const first = await deliver(client, message).catch((error: unknown) => error)
+  assert.ok(first instanceof Error)
+  assert.doesNotMatch(first.message, /private image followup marker/u)
+  assert.equal(host.attachments?.saveCalls.length, 1)
+  assert.deepEqual(host.agentSends, [])
+  assert.deepEqual(host.completedInboundKeys, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /submission failed/iu)
+  assert.equal(JSON.stringify(host.errors).includes('private image followup marker'), false)
+
+  await deliver(client, message)
+  assert.equal(host.attachments?.saveCalls.length, 2)
+  assert.equal(host.agentSends.length, 1)
+  assert.equal(host.completedInboundKeys.length, 1)
+})
+
+test('a malformed saved reference is unavailable and never enters the Agent inbox', async (t) => {
+  const { host, client } = await mount(t, {
+    provider: 'route', model: 'vision', inboundImages: true,
+  })
+  host.llm.setModelCapability('route', 'vision', ['image'])
+  client.downloadMessageResource = async () => ({ data: INBOUND_PNG, mediaType: 'image/png' })
+  const service = host.attachments
+  assert.ok(service !== undefined)
+  service.planSave({
+    attachmentId: `sha256:${'f'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+    mediaType: 'image/png',
+    bytes: INBOUND_PNG.length + 1,
+    width: 1,
+    height: 1,
+  })
+
+  await deliver(client, inboundImage('image-bad-ref', 'image-bad-ref-message'))
+
+  assert.equal(service.saveCalls.length, 1)
+  assert.deepEqual(host.agentSends, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /cannot be admitted safely/iu)
+})
+
+test('attachment save failures expose only bounded categories and no private cause', async (t) => {
+  const fixtures = [
+    { code: 'IMAGE_TOO_LARGE', reply: /limit: 5120 KiB/iu },
+    { code: 'IMAGE_TOO_MANY_PIXELS', reply: /limit: 20000000 pixels/iu },
+    { code: 'IMAGE_TYPE_MISMATCH', reply: /static PNG or JPEG/iu },
+    { code: undefined, reply: /cannot be admitted safely/iu },
+  ] as const
+
+  for (const [index, fixture] of fixtures.entries()) {
+    const { host, client } = await mount(t, {
+      provider: 'route', model: 'vision', inboundImages: true,
+    })
+    host.llm.setModelCapability('route', 'vision', ['image'])
+    client.downloadMessageResource = async () => ({ data: INBOUND_PNG, mediaType: 'image/png' })
+    const service = host.attachments
+    assert.ok(service !== undefined)
+    const privateMarker = `private-save-cause-${index}`
+    const failure = Object.assign(new Error(privateMarker), {
+      ...(fixture.code === undefined ? {} : { code: fixture.code }),
+    })
+    service.planSave(failure)
+
+    await deliver(client, inboundImage(`image-save-failure-${index}`, `image-save-message-${index}`))
+
+    assert.equal(service.saveCalls.length, 1)
+    assert.deepEqual(host.agentSends, [])
+    assert.match(client.sent.at(-1)?.text ?? '', fixture.reply)
+    assert.equal(JSON.stringify({
+      sent: client.sent,
+      warnings: host.warnings,
+      errors: host.errors,
+      receipts: host.completedInboundKeys,
+      bindings: [...host.bindings.values()],
+    }).includes(privateMarker), false)
+  }
 })
 
 test('oversized and control-character catalog fields are sanitized and globally bounded', async (t) => {

@@ -13,3 +13,8 @@
         maxConversationHandles: 32
         inboundTextFiles: false
         maxInboundTextFileBytes: 131072
+        inboundImages: false
+        maxInboundImageBytes: 5242880
+        maxInboundImagePixels: 20000000
+        maxConversationImages: 4
+        maxConversationImageBytes: 20971520

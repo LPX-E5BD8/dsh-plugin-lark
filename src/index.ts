@@ -4,6 +4,12 @@ import { LarkBridge } from './bridge.ts'
 import { DEFAULT_CONFIG, LARK_APP_ID_PATTERN } from './config.ts'
 import { DurableConversationBindingStore } from './conversation-binding.ts'
 import { installLarkHealthRoute } from './health.ts'
+import {
+  MAX_CONVERSATION_IMAGE_BYTES,
+  MAX_CONVERSATION_IMAGES,
+  MAX_INBOUND_IMAGE_BYTES,
+  MAX_INBOUND_IMAGE_PIXELS,
+} from './inbound-image.ts'
 import { MAX_INBOUND_TEXT_RESOURCE_BYTES } from './inbound-resource.ts'
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { LarkSdkClient } from './lark.ts'
@@ -26,6 +32,11 @@ export interface LarkConfig {
   maxConversationHandles?: number
   inboundTextFiles?: boolean
   maxInboundTextFileBytes?: number
+  inboundImages?: boolean
+  maxInboundImageBytes?: number
+  maxInboundImagePixels?: number
+  maxConversationImages?: number
+  maxConversationImageBytes?: number
 }
 
 export const Config: Schema = Schema.object({
@@ -46,6 +57,23 @@ export const Config: Schema = Schema.object({
     .min(1)
     .max(MAX_INBOUND_TEXT_RESOURCE_BYTES)
     .default(DEFAULT_CONFIG.maxInboundTextFileBytes),
+  inboundImages: Schema.boolean().default(DEFAULT_CONFIG.inboundImages),
+  maxInboundImageBytes: Schema.natural()
+    .min(1)
+    .max(MAX_INBOUND_IMAGE_BYTES)
+    .default(DEFAULT_CONFIG.maxInboundImageBytes),
+  maxInboundImagePixels: Schema.natural()
+    .min(1)
+    .max(MAX_INBOUND_IMAGE_PIXELS)
+    .default(DEFAULT_CONFIG.maxInboundImagePixels),
+  maxConversationImages: Schema.natural()
+    .min(1)
+    .max(MAX_CONVERSATION_IMAGES)
+    .default(DEFAULT_CONFIG.maxConversationImages),
+  maxConversationImageBytes: Schema.natural()
+    .min(1)
+    .max(MAX_CONVERSATION_IMAGE_BYTES)
+    .default(DEFAULT_CONFIG.maxConversationImageBytes),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -124,6 +152,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         domain: config.domain ?? DEFAULT_CONFIG.domain,
         locale: config.locale ?? DEFAULT_CONFIG.locale,
         inboundTextFiles: config.inboundTextFiles ?? DEFAULT_CONFIG.inboundTextFiles,
+        inboundImages: config.inboundImages ?? DEFAULT_CONFIG.inboundImages,
       })
       installLarkHealthRoute(ctx, () => client.connectionHealth())
       bridge = new LarkBridge(ctx, {
@@ -141,6 +170,11 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         maxConversationHandles: config.maxConversationHandles,
         inboundTextFiles: config.inboundTextFiles,
         maxInboundTextFileBytes: config.maxInboundTextFileBytes,
+        inboundImages: config.inboundImages,
+        maxInboundImageBytes: config.maxInboundImageBytes,
+        maxInboundImagePixels: config.maxInboundImagePixels,
+        maxConversationImages: config.maxConversationImages,
+        maxConversationImageBytes: config.maxConversationImageBytes,
         sessionReferenceNamespace: appId,
       })
       await bridge.start()

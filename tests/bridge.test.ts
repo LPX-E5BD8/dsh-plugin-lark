@@ -4,15 +4,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { test } from 'node:test'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
 import * as Lark from '@larksuiteoapi/node-sdk'
-import { LarkBridge } from '../src/bridge.ts'
+import { LarkBridge, serviceInstanceIdentity } from '../src/bridge.ts'
 import type { ConversationBinding } from '../src/conversation-binding.ts'
 import { LARK_HEALTH_PATH } from '../src/health.ts'
 import type { WebServerLike } from '../src/health.ts'
+import { MAX_INBOUND_IMAGE_BYTES } from '../src/inbound-image.ts'
+import { MAX_INBOUND_TEXT_RESOURCE_BYTES } from '../src/inbound-resource.ts'
 import { apply } from '../src/index.ts'
 import * as LarkPlugin from '../src/index.ts'
 import {
@@ -55,6 +57,31 @@ function fakeClient(): FakeClient {
   }
   return c
 }
+
+test('Cordis service identity follows the underlying instance across fresh proxies and remounts', async (t) => {
+  class IdentityProbe extends Service {
+    constructor(ctx: Context) {
+      super(ctx, 'identityProbe')
+    }
+  }
+  const ctx = new Context()
+  t.after(() => ctx.fiber.dispose())
+  const mount = () => ctx.plugin((ownerCtx: Context) => {
+    new IdentityProbe(ownerCtx)
+  })
+  const firstFiber = mount()
+  await firstFiber
+  const first = ctx.get('identityProbe' as never) as unknown as object
+  const firstAgain = ctx.get('identityProbe' as never) as unknown as object
+  assert.notEqual(first, firstAgain)
+  assert.equal(serviceInstanceIdentity(first), serviceInstanceIdentity(firstAgain))
+
+  await firstFiber.dispose()
+  const secondFiber = mount()
+  await secondFiber
+  const second = ctx.get('identityProbe' as never) as unknown as object
+  assert.notEqual(serviceInstanceIdentity(second), serviceInstanceIdentity(first))
+})
 
 function requestIdOf(card: unknown): string {
   const parsed = card as {
@@ -971,6 +998,67 @@ test('SDK inbound parses only opted-in file references and never accepts malform
   }
 })
 
+test('SDK inbound exposes opted-in direct image keys but never group or malformed keys', async () => {
+  const prototype = Lark.Client.prototype as unknown as {
+    request: (options: unknown) => Promise<unknown>
+  }
+  const request = prototype.request
+  const start = Lark.WSClient.prototype.start
+  let receiveMessage: ((data: unknown) => Promise<void>) | undefined
+  const received: LarkInbound[] = []
+  prototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  Lark.WSClient.prototype.start = async function captureDispatcher({ eventDispatcher }) {
+    const dispatcher = eventDispatcher as unknown as {
+      handles: Map<string, (data: unknown) => Promise<void>>
+    }
+    receiveMessage = dispatcher.handles.get('im.message.receive_v1')
+    ;(this as unknown as { onReady?: () => void }).onReady?.()
+  }
+  const client = new LarkSdkClient({
+    appId: 'test-app-id',
+    appSecret: 'test-only-secret',
+    inboundImages: true,
+  })
+  ;(client as unknown as { prepareLoadingImage: () => Promise<void> }).prepareLoadingImage = async () => {}
+  client.onMessage(async (message) => { received.push(message) })
+  try {
+    await client.start()
+    assert.ok(receiveMessage)
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_chat', chat_type: 'p2p', message_id: 'om_image', message_type: 'image',
+        content: JSON.stringify({ image_key: 'img_v3_private_key' }),
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_sender' } },
+    })
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_chat', chat_type: 'p2p', message_id: 'om_bad', message_type: 'image',
+        content: JSON.stringify({ image_key: '../private-image' }),
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_sender' } },
+    })
+    await receiveMessage({
+      message: {
+        chat_id: 'oc_group', chat_type: 'group', message_id: 'om_group', message_type: 'image',
+        content: JSON.stringify({ image_key: 'img_v3_group_private' }),
+        mentions: [{ key: '@_user_1', id: { open_id: 'test-bot' } }],
+      },
+      sender: { sender_type: 'user', sender_id: { open_id: 'ou_sender' } },
+    })
+
+    assert.deepEqual(received[0]?.resource, { kind: 'image', key: 'img_v3_private_key' })
+    assert.equal(received[1]?.resource, undefined)
+    assert.equal(received[2]?.resource, undefined)
+    assert.equal(received[2]?.mentioned, true)
+    assert.doesNotMatch(JSON.stringify(received.slice(1)), /private-image|group_private/u)
+  } finally {
+    await client.stop()
+    prototype.request = request
+    Lark.WSClient.prototype.start = start
+  }
+})
+
 function clientWithResourceRequest(
   request: (options: Record<string, unknown>) => Promise<unknown>,
 ): LarkSdkClient {
@@ -1003,6 +1091,35 @@ test('SDK resource download uses one fixed-domain bounded stream and preserves M
   assert.equal(request?.responseType, 'stream')
   assert.equal(request?.maxRedirects, 0)
   assert.equal(request?.$return_headers, true)
+})
+
+test('SDK image download uses the exact message resource with the image hard cap', async () => {
+  let request: Record<string, unknown> | undefined
+  const client = clientWithResourceRequest(async (options) => {
+    request = options
+    return {
+      data: Readable.from([Buffer.from([0x89, 0x50, 0x4e, 0x47])]),
+      headers: { 'content-length': '4', 'content-type': 'image/png' },
+    }
+  })
+  const result = await client.downloadMessageResource('om_image', {
+    kind: 'image', key: 'img_v3_image_key',
+  }, {
+    maxBytes: MAX_INBOUND_IMAGE_BYTES,
+    signal: new AbortController().signal,
+  })
+
+  assert.deepEqual([...result.data], [0x89, 0x50, 0x4e, 0x47])
+  assert.equal(result.mediaType, 'image/png')
+  assert.equal(request?.url, '/open-apis/im/v1/messages/om_image/resources/img_v3_image_key')
+  assert.deepEqual(request?.params, { type: 'image' })
+  assert.equal(request?.maxRedirects, 0)
+  await assert.rejects(client.downloadMessageResource('om_image', {
+    kind: 'image', key: 'img_v3_image_key',
+  }, {
+    maxBytes: MAX_INBOUND_IMAGE_BYTES + 1,
+    signal: new AbortController().signal,
+  }), RangeError)
 })
 
 test('SDK resource download rejects declared and chunked overflow and destroys each stream', async () => {
@@ -1106,6 +1223,22 @@ test('SDK resource download rejects malformed headers and references without exp
   }, { maxBytes: 5, signal: new AbortController().signal }).catch((reason: unknown) => reason)
   assert.ok(headerError instanceof LarkResourceError)
   assert.equal(headerError.code, 'invalid')
+
+  await assert.rejects(
+    client.downloadMessageResource('om_message', {
+      kind: 'video', key: 'file_resource',
+    } as never, { maxBytes: 5, signal: new AbortController().signal }),
+    (error) => error instanceof LarkResourceError && error.code === 'invalid',
+  )
+  await assert.rejects(
+    client.downloadMessageResource('om_message', {
+      kind: 'file', key: 'file_resource', name: 'notes.txt',
+    }, {
+      maxBytes: MAX_INBOUND_TEXT_RESOURCE_BYTES + 1,
+      signal: new AbortController().signal,
+    }),
+    RangeError,
+  )
 
   const referenceError = await client.downloadMessageResource('bad\nmessage', {
     kind: 'file', key: 'file_private_marker', name: 'notes.txt',

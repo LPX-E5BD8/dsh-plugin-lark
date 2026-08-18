@@ -489,6 +489,72 @@ test('e2e: unsupported p2p input replies once without creating an agent', async 
   await bridge.stop()
 })
 
+test('e2e: inbound images gate authorization, direct-chat scope, opt-in, and keys before download', async () => {
+  const cases: Array<{
+    readonly name: string
+    readonly options: ConstructorParameters<typeof LarkBridge>[1]
+    readonly message: LarkInbound
+    readonly reply: RegExp
+  }> = [
+    {
+      name: 'disabled',
+      options: { client: createClient(), allowFrom: ['owner'] },
+      message: {
+        ...inbound('chat-disabled', 'owner', ''),
+        messageType: 'image',
+        resource: { kind: 'image', key: 'img_v3_disabled_private' },
+      },
+      reply: /not supported|暂不支持/iu,
+    },
+    {
+      name: 'unauthorized',
+      options: { client: createClient(), allowFrom: ['owner'], inboundImages: true },
+      message: {
+        ...inbound('chat-denied', 'other', ''),
+        messageType: 'image',
+        resource: { kind: 'image', key: 'img_v3_denied_private' },
+      },
+      reply: /permission|权限/iu,
+    },
+    {
+      name: 'group',
+      options: { client: createClient(), allowFrom: ['owner'], inboundImages: true },
+      message: {
+        ...groupInbound({ chatId: 'group-image', text: '', messageId: 'group-image-message' }),
+        messageType: 'image',
+        resource: { kind: 'image', key: 'img_v3_group_private' },
+      },
+      reply: /not supported|暂不支持/iu,
+    },
+    {
+      name: 'malformed',
+      options: { client: createClient(), allowFrom: ['owner'], inboundImages: true },
+      message: {
+        ...inbound('chat-malformed', 'owner', ''),
+        messageType: 'image',
+      },
+      reply: /static PNG|静态 PNG/iu,
+    },
+  ]
+
+  for (const fixture of cases) {
+    const client = fixture.options.client as TestClient
+    let downloads = 0
+    client.downloadMessageResource = async () => {
+      downloads += 1
+      throw new Error('download must not run')
+    }
+    const host = createHost()
+    const bridge = new LarkBridge(host as never, fixture.options)
+    await bridge.start()
+    await client.messageHandler?.(fixture.message)
+    assert.equal(downloads, 0, fixture.name)
+    assert.equal(host.createCount(), 0, fixture.name)
+    assert.match(client.sent.at(-1)?.text ?? '', fixture.reply, fixture.name)
+    await bridge.stop()
+  }
+})
+
 test('e2e: inbound text files are opt-in and disabled mode never retains resource metadata', async () => {
   const client = createClient()
   let downloads = 0
