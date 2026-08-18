@@ -24,6 +24,7 @@
 - **本地化与可观测性：** 内置 `zh-CN`、`en-US` 界面文案，并可选提供脱敏的 WebSocket readiness 接口。
 - **运维状态与诊断：** `/status` 和 `/diag` 用 Card 2.0 向运维展示版本、运行时间、连接、会话范围、项目、模型与工作状态，以及脱敏修复建议，不含平台 ID 或秘密。
 - **会话级策略：** 运维可以为单个聊天或群单独收窄额外授权用户、提及要求、可见 Workspace、可选模型，以及允许的审批或出站工具类别。本地规则只与全局默认拒绝配置取交集。
+- **可选的运行时监管：** 连接之前先跨进程认领该机器人的归属，并发布一份外部探针无需加载 Harness profile 就能读取的状态文档，同时提供可审阅的 systemd 与就绪检查模板。
 - **失败时默认拒绝：** 授权默认拒绝、Lark 应用凭据仅允许来自启动环境；媒体摄入必须显式开启且全程有界，审批失败也绝不会放行。
 
 ## 环境要求
@@ -44,7 +45,7 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`；v0.9.14 增加会话级策略；v0.9.15 让卡片回调也走同一策略，并且不再因为缺少健康探针就判定机器人正常。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`；v0.9.14 增加会话级策略；v0.9.15 让卡片回调也走同一策略，并且不再因为缺少健康探针就判定机器人正常；v0.9.16 增加可选的运行时监管与跨进程通道归属。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
@@ -97,7 +98,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.15'
+version='0.9.16'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -198,6 +199,8 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
     allowFrom: []                # 已授权的飞书/Lark open_id
     projectManageFrom: []        # 允许在私聊中注册/移除项目的 open_id
     operatorFrom: []            # 允许使用 /status、/diag 和 /policy 的 open_id
+    runtimeDir: ''               # 绝对路径，设置后开启监管；留空为关闭
+    runtimeOwnerTtlMs: 30000     # 归属心跳预算
     defaultSessionId: ''         # 留空 = 按私聊/群聊范围隔离
     provider: deepseek-official # 会话没有已保存选择时的默认 provider
     model: deepseek-v4-flash    # 会话没有已保存选择时的默认 model
@@ -224,6 +227,8 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 `operatorFrom` 是独立且默认拒绝的运维 allowlist，默认值为空。列出的运维人员仍必须通过普通鉴权。`/status`、`/diag` 和 `/policy` 使用与执行卡相同的 Card 2.0 schema，且绝不包含凭据、聊天/消息/会话 ID、私有路径、哈希值或原始错误。
 
 `/policy` 仅限运维，并在 `lark_policy` storage-domain 单元中持久化一份以哈希为键的单聊天文档。一份文档覆盖一个单聊或一整个群（含群内所有回复串与原生话题），因此新开话题串无法绕过已收紧的群策略。设置 `defaultSessionId` 后所有聊天共享同一会话，也就共享同一份策略文档。本地规则只能收窄全局默认拒绝配置：额外的哈希用户名单与 `allowFrom` 取交集；`mention always` 让群里的命令也必须 @ 机器人；Workspace 与模型名单在列出和切换之前就过滤掉不允许的名称；审批、`send_lark_artifact` 与 `notify_lark` 只要全局开关或本地开关有一个关闭就保持关闭。清空某个本地名单会恢复全局默认，但无法开启全局已禁用的能力。名单收窄不会驱逐会话已经选中的项目或模型，只是不再展示被隐藏的名称。运维始终可以恢复自己锁紧的会话。存储的文档不含明文 open ID，也不含任何密钥。
+
+`runtimeDir` 默认为空，即不开启监管。指向一个已存在的绝对路径时，插件会在第一次连接之前在该目录认领机器人的跨进程归属；只要另一个存活实例还持有归属就拒绝启动，因此同一台主机上不会有两个进程同时服务一个机器人。归属通过文件的独占创建认领，因此启动中的实例绝不会删除别人的记录：存活记录会拒绝本次启动，超过 `runtimeOwnerTtlMs` 未心跳的遗留记录同样拒绝——因为“发现过期就删除”这个动作本身会与其他所有竞争者相互竞争。清理遗留记录是单一执行者的恢复步骤（`contrib/systemd/lark-clear-stale-owner.sh`，由 `ExecStartPre` 或运维手动执行），它拒绝删除心跳仍在 ttl 之内的记录。万一归属仍被他人夺走，旧实例会停止服务而不是继续竞争。同一目录下还有一份 `status.json`，包含组件、实例、pid、版本、状态、就绪与心跳，不含凭据、平台标识、会话范围或其他路径，外部探针无需加载 Harness profile 图即可判断通道状态。该保证的边界是同一个运行目录；两个使用不同运行目录却指向同一机器人的部署仍属于不受支持的配置。可审阅的 systemd 与就绪检查模板位于 `contrib/systemd/`。
 
 `projectManageFrom` 是独立且默认拒绝的项目管理 allowlist，默认值为空。管理员仍必须通过普通 `allowFrom`/`allowAllUsers` 鉴权，注册与移除命令只接受私聊；`allowAllUsers: true` 绝不会自动授予项目管理权限。项目管理要求标准可写 Workspace Registry 同时提供 `create`、`delete` 和 `resolveByPath`；只读自定义 Registry 仍只能列出和选择。
 

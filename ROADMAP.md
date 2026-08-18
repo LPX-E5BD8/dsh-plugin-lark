@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.15 are implemented in the current release line. The next planned independently reviewable capability is 0.9.16.
+Milestones through 0.9.16 are implemented in the current release line. The next planned independently reviewable capability is 0.9.17.
 
 ## 0.1.1 — Reliability
 
@@ -229,7 +229,7 @@ Milestones through 0.9.15 are implemented in the current release line. The next 
 
 - Ship optional, reviewable service-manager templates with graceful shutdown, bounded restart, stable logs, credential-environment guidance, and readiness checks for supported hosts.
 - Detect a failed or non-ready DSH profile from outside that process and provide a minimal recovery path without loading the failing third-party profile graph.
-- Prevent split-brain channel ownership through a heartbeat or lease, and require explicit operator action before any recovery component changes plugins, profiles, or durable state.
+- Prevent split-brain channel ownership through an exclusively created heartbeat record, and require explicit operator action before any recovery component changes plugins, profiles, or durable state.
 
 ## 0.9.17 — Explicit parallel tasks
 
