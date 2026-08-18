@@ -11,3 +11,5 @@
         projectManageFrom: []
         defaultSessionId: ""
         maxConversationHandles: 32
+        inboundTextFiles: false
+        maxInboundTextFileBytes: 131072

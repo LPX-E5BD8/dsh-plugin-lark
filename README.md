@@ -12,12 +12,13 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 - **Project registration and selection:** project managers can register the active Session directory or remove a registration from a direct chat; every authorized conversation can list and select registered Workspaces without accepting arbitrary paths from chat.
 - **Conversation model selection:** lists live providers and their advertised models, accepts exact adapter-resolved provider/model routes, and preserves each conversation's choice across fresh generations and recovery.
 - **Structured human input:** renders the official `ask_user_question` tool as a bounded native single-choice, multiple-choice, or free-text Card and returns the authorized answer to the same running turn.
+- **Opt-in direct-chat text attachments:** admits one bounded UTF-8 `.txt`, `.log`, `.patch`, or `.diff` message through strict authorization, filename, MIME, byte, and content gates, without URLs or temporary files.
 - **Live execution cards:** streams reasoning, todos, retries, compaction, hooks, workflows, tool calls, results, token usage, and the final answer into one bounded Card 2.0 message.
 - **Safe tool approval and cancellation:** approval and stop actions are bound to the originating session, chat, and user, with stale or cross-chat actions failing closed.
 - **Reliable reply delivery:** keeps cards and fallbacks attached to the triggering message or native thread, continues long answers in full, and durably suppresses normal WebSocket redelivery duplicates.
 - **Bounded process residency:** releases durably checkpointed least-recently-used idle Agents and cold-resumes their exact session without deleting transcripts.
 - **Localized and observable:** includes `zh-CN` and `en-US` UI copy plus an optional, sanitized WebSocket readiness endpoint.
-- **Fail-closed boundaries:** authorization defaults to deny, Lark app credentials stay launch-environment-only, non-text payloads are never ingested, and approval failures never grant access.
+- **Fail-closed boundaries:** authorization defaults to deny, Lark app credentials stay launch-environment-only, non-text payloads remain rejected unless the bounded text-file option is enabled, and approval failures never grant access.
 
 ## Requirements
 
@@ -35,13 +36,13 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds bounded exact-scope Session navigation; v0.9.4 adds direct Native structured human input; v0.9.5 makes Cordis own the async disposer, registers terminal Cards synchronously, and bounds them below the host shutdown grace. |
+| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds bounded exact-scope Session navigation; v0.9.4 adds direct Native structured human input; v0.9.5 makes Cordis own the async disposer and bounds terminal Card shutdown; v0.9.6 adds opt-in bounded inbound UTF-8 text files. |
 | `0.8.7`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 produces the canonical archive; Node 22 and 24 run adjacent-upgrade profile gates. GitHub-hosted macOS 26 arm64 additionally verifies Node 22 and 24 package/runtime compatibility, not Web-profile deployment. |
 | `0.8.6` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Ubuntu support; macOS 26 arm64 package/runtime evidence covers Node 22 only. |
 | `0.8.5` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
 | `0.8.0`–`0.8.4` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x` | Supported on the original Node 22/Linux baseline; v0.8.4 adds the boot-free Web-profile package lifecycle gate. |
 
-The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, semantic checkpoint policy, Session Title, SQLite Session Query exact-read path, JSONL persistence, JSON storage-domain, Tools, User Questions, Approval, and Workspace services. Platform connection, model provider, and browser behavior use controlled doubles; project mutation also has a real Registry persistence lifecycle test. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.9.4 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
+The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, semantic checkpoint policy, Session Title, SQLite Session Query exact-read path, JSONL persistence, JSON storage-domain, Tools, User Questions, Approval, and Workspace services. Platform connection, model provider, and browser behavior use controlled doubles; project mutation also has a real Registry persistence lifecycle test. CI packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.9.5 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
 
 The profile gate also pins npm resolution to the registry snapshot immediately after the rc.6 cohort was published. Harness prerelease packages use caret ranges internally, so an exact top-level `dsh@0.1.0-rc.6` alone can otherwise drift to a later prerelease in a clean npm-exec environment; every resolved DSH package is still checked as exactly rc.6.
 
@@ -77,7 +78,7 @@ In the Feishu/Lark developer console:
 2. Subscribe to `im.message.receive_v1`.
 3. Register the `card.action.trigger` callback.
 4. Grant the bot `im:message` send/receive access.
-5. Optionally grant `im:resource` to enable the bundled animated loading indicator; without it, the card uses a static icon.
+5. Grant `im:resource` when `inboundTextFiles` is enabled. Without that option, the scope remains optional and only enables the bundled animated loading indicator; the card otherwise uses a static icon.
 
 ## Release provenance
 
@@ -88,7 +89,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.9.5'
+version='0.9.6'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -193,6 +194,8 @@ The bundled Cordis patch uses these defaults:
     model: deepseek-v4-flash    # default when the conversation has no saved choice
     streamUpdateIntervalMs: 1000
     maxConversationHandles: 32  # steady-state live conversation-handle target
+    inboundTextFiles: false     # opt in to bounded UTF-8 text-file messages
+    maxInboundTextFileBytes: 131072 # default 128 KiB; hard maximum 256 KiB
 ```
 
 The baseline requires `agents`, `sessions`, `tools`, and durable `storageDomain` services. Durable reset, project/model/session selection, cold recovery, and structured Lark questions also require `sessionPersistence`; `/project` requires `workspaceRegistry`, `/session` additionally requires `sessionQuery` plus durable conversation bindings, and `/model` requires the Harness `llm` service. Structured input requires the exact compatible rc.6 `ask_user_question` definition to remain visible to the Agent. A missing or incompatible definition is diagnosed and delegated rather than replaced by a second provider. A missing Session Query or Workspace capability makes session navigation return an unavailable result; a plain `/session` listing does not create an Agent. Approval cards and the readiness route depend on the optional `approval` and `webServer` services. The verified matrix uses the stock JSON/JSONL and SQLite exact-read implementations; alternative implementations remain unverified.
@@ -200,6 +203,8 @@ The baseline requires `agents`, `sessions`, `tools`, and durable `storageDomain`
 `allowFrom` is fail-closed: an empty list with `allowAllUsers: false` denies everyone. Use `allowAllUsers: true` only for an intentionally public bot. Use `domain: lark` for apps hosted on `open.larksuite.com`.
 
 `projectManageFrom` is a separate, fail-closed management allowlist and defaults to empty. A listed manager must still pass ordinary `allowFrom`/`allowAllUsers` authorization, and register/remove commands are accepted only in a direct chat. `allowAllUsers: true` never grants project-management authority. Management requires the stock mutable Workspace Registry capabilities (`create`, `delete`, and `resolveByPath`); a read-only custom Registry remains list/select-only.
+
+`inboundTextFiles` is deliberately off by default. When enabled, `maxInboundTextFileBytes` accepts a positive integer up to the hard 256 KiB ceiling; its default is 128 KiB. The feature requires the bot's `im:resource` scope and accepts files only in a direct chat. Authorization, durable message deduplication, and a safe filename/extension check all run before download. The client then reads only the exact file key attached to that authenticated message from the configured Feishu/Lark OpenAPI domain, disables redirects, enforces both declared and streamed byte counts, and never accepts a URL or local path.
 
 The `0.1.0` release was credential-smoke-tested against Feishu. The Lark domain path uses the official SDK domain switch and automated coverage. The release runbook covers credential-backed checks for both domains; a recorded Lark run is still required before claiming that domain as credential-smoke-tested.
 
@@ -269,9 +274,13 @@ Every event in the installed DSH session catalog has an explicit render, consume
 
 ## Scope
 
-The bridge sends only text to the Agent. Images, files, audio, and other non-text messages are classified from the platform message type, but the plugin never parses or copies their serialized content, resource keys, names, or resource metadata into its logs, storage, or Agent input. An authorized direct message, or a group message that explicitly mentions the bot, receives a generic localized text-only notice; other group attachments remain silent. This boundary requires no media-download permission.
+The bridge sends text blocks to the Agent. With `inboundTextFiles: false`, images, files, audio, and every other non-text message remain metadata-only classifications: the plugin does not parse their serialized content or retain resource keys, names, or metadata. An authorized direct message, or a group message that explicitly mentions the bot, receives a generic localized notice; other group attachments remain silent.
 
-Group messages require a bot mention or slash command. Attachment ingestion, an administration UI, and a generic card framework remain intentionally out of scope.
+With `inboundTextFiles: true`, one authenticated direct-chat platform `file` message may carry `.txt`, `.log`, `.patch`, or `.diff` content. The basename is limited to 120 Unicode code points and 255 UTF-8 bytes; paths, hidden/reserved names, controls, standalone active HTML/SVG markup, binary signatures (also after one UTF-8 BOM and leading text whitespace, with PDF headers checked throughout their valid first-1,024-byte window), unsafe control/bidi content, empty files, MIME/extension mismatches, invalid UTF-8, and data above the configured limit are rejected before Agent admission. Markup in `.patch`/`.diff` is preserved as code only when a recognizable unified-diff `---`/`+++`/`@@` envelope is present. Only `text/plain`, format-specific text MIME values, or the platform's `application/octet-stream` fallback are accepted. Bytes stay in bounded memory—no temporary file or cleanup timer is created—and shutdown aborts an open stream without committing its inbound receipt.
+
+An accepted file becomes an explicitly framed, untrusted user-data text block. Its safe basename, verified media type, byte count, and content intentionally enter the ordinary Harness Session transcript and therefore follow that backend's retention, export, fork, and access policy. They do not enter plugin logs, hashed receipt storage, conversation bindings, or error replies. The attachment path adds no platform resource key, file-message ID, sender ID, credential, raw header beyond the normalized media type, raw SDK error, or plugin/host-derived private path to the Session. The Session's pre-existing conversation identity follows the documented scope contract—compatible direct-chat Session IDs may already derive from the chat ID independently of attachments. User-supplied content itself is not redacted and may of course contain path-like text. A hard crash after Agent admission but before the receipt commit can cause platform redelivery, like any other inbound prompt.
+
+Images, outbound artifact sending, URLs, archives, generic binaries, audio, and video remain unsupported in v0.9.6 and are split into later reviewable Roadmap milestones. Group attachments also remain fail-closed: ordinary standalone file messages cannot carry the bot mention required by the channel, so unmentioned files stay silent and a synthetic/explicitly mentioned non-text event receives only the generic notice. An administration UI and generic card framework remain intentionally out of scope.
 
 ## Operations
 

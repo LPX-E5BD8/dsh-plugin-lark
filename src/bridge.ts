@@ -49,6 +49,12 @@ import {
   validateHumanInputAnswer,
 } from './human-input.ts'
 import type { HumanInputAnswer, HumanInputRequest } from './human-input.ts'
+import {
+  InboundTextResourceError,
+  prepareInboundTextResource,
+  resolveInboundTextResourceMaxBytes,
+  validateInboundTextResourceName,
+} from './inbound-resource.ts'
 import type { InboundDeduplicator } from './inbound-dedup.ts'
 import type {
   LarkCardAction,
@@ -57,6 +63,7 @@ import type {
   LarkDeliveryOptions,
   LarkInbound,
 } from './lark.ts'
+import { LarkResourceError } from './lark.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 
@@ -70,6 +77,8 @@ export interface LarkBridgeOptions {
   model?: string
   streamUpdateIntervalMs?: number
   maxConversationHandles?: number
+  inboundTextFiles?: boolean
+  maxInboundTextFileBytes?: number
   humanInputTimeoutMs?: number
   humanInputCardCloseTimeoutMs?: number
   cwd?: string
@@ -474,6 +483,13 @@ class BindingConfirmationInterruptedError extends Error {
   constructor(cause?: unknown) {
     super('lark: conversation binding confirmation was interrupted by shutdown', { cause })
     this.name = 'BindingConfirmationInterruptedError'
+  }
+}
+
+class InboundResourceInterruptedError extends Error {
+  constructor(cause?: unknown) {
+    super('lark: inbound resource handling was interrupted by shutdown', { cause })
+    this.name = 'InboundResourceInterruptedError'
   }
 }
 
@@ -1210,6 +1226,8 @@ export class LarkBridge {
   private readonly model: string
   private readonly streamUpdateIntervalMs: number
   private readonly maxConversationHandles: number
+  private readonly inboundTextFiles: boolean
+  private readonly maxInboundTextFileBytes: number
   private readonly humanInputTimeoutMs: number
   private readonly humanInputCardCloseTimeoutMs: number
   private readonly cwd: string
@@ -1294,6 +1312,10 @@ export class LarkBridge {
     if (!Number.isSafeInteger(this.maxConversationHandles) || this.maxConversationHandles < 0) {
       throw new RangeError('lark: maxConversationHandles must be a non-negative safe integer')
     }
+    this.inboundTextFiles = options.inboundTextFiles === true
+    this.maxInboundTextFileBytes = resolveInboundTextResourceMaxBytes(
+      options.maxInboundTextFileBytes ?? DEFAULT_CONFIG.maxInboundTextFileBytes,
+    )
     this.humanInputTimeoutMs = options.humanInputTimeoutMs ?? HUMAN_INPUT_LIMITS.timeoutMs
     if (!Number.isSafeInteger(this.humanInputTimeoutMs)
       || this.humanInputTimeoutMs <= 0
@@ -1414,7 +1436,8 @@ export class LarkBridge {
     const inboundResults = await Promise.allSettled([...this.activeInboundTasks])
     for (const result of inboundResults) {
       if (result.status === 'rejected'
-        && !(result.reason instanceof BindingConfirmationInterruptedError)) {
+        && !(result.reason instanceof BindingConfirmationInterruptedError)
+        && !(result.reason instanceof InboundResourceInterruptedError)) {
         failures.push(result.reason)
       }
     }
@@ -1526,6 +1549,10 @@ export class LarkBridge {
       return
     }
     if (!isTextMessage) {
+      if (msg.messageType === 'file' && msg.chatType === 'p2p' && this.inboundTextFiles) {
+        await this.handleInboundTextFile(route, msg)
+        return
+      }
       await this.safeSend(route.chatId, this.text.unsupportedInput, routeDeliveryOptions(route))
       return
     }
@@ -1534,24 +1561,91 @@ export class LarkBridge {
       return
     }
     await this.enqueueConversationOperation(route.sessionBaseId, () => (
-      this.withConversation(route.sessionBaseId, async (conversation) => {
-        await this.sessionOperations.get(conversation.baseId)
-        this.prepareWorkspaceAttachment(conversation)
-        const message = createUserMessage({
-          content: [{ type: 'text', text: msg.text.trim() }],
-          source: { kind: 'user' },
-        })
-        this.enqueueMessageRoute(conversation.sessionId, String(message.id), route)
-        try {
-          conversation.handle.agent.followup(message)
-        } catch (error) {
-          this.removeMessageRoute(String(message.id), route)
-          this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
-          await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
-          throw error
-        }
-      })
+      this.followupConversation(route, [{ type: 'text', text: msg.text.trim() }])
     ))
+  }
+
+  private async handleInboundTextFile(route: MessageRoute, msg: LarkInbound): Promise<void> {
+    const resource = msg.resource
+    const download = this.client.downloadMessageResource
+    if (resource === undefined || download === undefined) {
+      await this.sendInboundTextFileReply(route, this.text.inboundTextFileInvalid)
+      return
+    }
+    try {
+      validateInboundTextResourceName(resource.name)
+    } catch (error) {
+      await this.replyForInboundTextFileError(route, error)
+      return
+    }
+    await this.enqueueConversationOperation(route.sessionBaseId, async () => {
+      let prepared: ReturnType<typeof prepareInboundTextResource>
+      try {
+        const downloaded = await download.call(this.client, msg.messageId, resource, {
+          maxBytes: this.maxInboundTextFileBytes,
+          signal: this.commandAbort.signal,
+        })
+        prepared = prepareInboundTextResource({
+          name: resource.name,
+          mediaType: downloaded.mediaType,
+          data: downloaded.data,
+        }, this.maxInboundTextFileBytes)
+      } catch (error) {
+        if (this.stopping || this.commandAbort.signal.aborted) {
+          throw new InboundResourceInterruptedError(error)
+        }
+        await this.replyForInboundTextFileError(route, error)
+        return
+      }
+      if (this.stopping || this.commandAbort.signal.aborted) {
+        throw new InboundResourceInterruptedError()
+      }
+      await this.followupConversation(route, [prepared.block])
+    })
+  }
+
+  private async replyForInboundTextFileError(route: MessageRoute, error: unknown): Promise<void> {
+    const tooLarge = (error instanceof LarkResourceError && error.code === 'too_large')
+      || (error instanceof InboundTextResourceError && error.code === 'RESOURCE_TOO_LARGE')
+    const invalid = error instanceof InboundTextResourceError
+      || (error instanceof LarkResourceError && error.code === 'invalid')
+    const reply = tooLarge
+      ? this.text.inboundTextFileTooLarge(this.maxInboundTextFileBytes)
+      : invalid
+        ? this.text.inboundTextFileInvalid
+        : this.text.inboundTextFileUnavailable
+    await this.sendInboundTextFileReply(route, reply)
+  }
+
+  private async sendInboundTextFileReply(route: MessageRoute, text: string): Promise<void> {
+    try {
+      await this.client.sendText(route.chatId, text, routeDeliveryOptions(route))
+    } catch {
+      throw new Error('lark: inbound text file notice delivery failed')
+    }
+  }
+
+  private async followupConversation(
+    route: MessageRoute,
+    content: ContentBlock[],
+  ): Promise<void> {
+    await this.withConversation(route.sessionBaseId, async (conversation) => {
+      await this.sessionOperations.get(conversation.baseId)
+      this.prepareWorkspaceAttachment(conversation)
+      const message = createUserMessage({
+        content,
+        source: { kind: 'user' },
+      })
+      this.enqueueMessageRoute(conversation.sessionId, String(message.id), route)
+      try {
+        conversation.handle.agent.followup(message)
+      } catch (error) {
+        this.removeMessageRoute(String(message.id), route)
+        this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
+        await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
+        throw error
+      }
+    })
   }
 
   async handleCardAction(action: LarkCardAction): Promise<LarkCardActionResult> {

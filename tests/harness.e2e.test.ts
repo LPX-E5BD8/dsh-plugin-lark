@@ -396,6 +396,7 @@ async function mount(
   humanInputTimeoutMs?: number,
   humanInputCardCloseTimeoutMs?: number,
   rootOwnedCleanup = false,
+  inboundTextFiles = false,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
@@ -488,6 +489,7 @@ async function mount(
           maxConversationHandles,
           humanInputTimeoutMs,
           humanInputCardCloseTimeoutMs,
+          inboundTextFiles,
           cwd: realWorkspaceCwd,
         })
         bridge = candidate
@@ -530,6 +532,66 @@ async function mount(
     throw error
   }
 }
+
+test('harness e2e: an admitted text attachment reaches the model, persistence, and cold resume', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-text-attachment-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const firstAdapter = new ScriptedAdapter([textResponse('attachment received')])
+  const first = await mount(
+    root,
+    firstAdapter,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'none',
+    undefined,
+    undefined,
+    false,
+    true,
+  )
+  first.client.downloadMessageResource = async () => ({
+    data: new TextEncoder().encode('durable attachment marker'),
+    mediaType: 'text/plain; charset=utf-8',
+  })
+  await first.client.messageHandler?.({
+    chatId: 'chat-a',
+    chatType: 'p2p',
+    openId: 'owner',
+    text: '',
+    messageId: 'harness-file-message',
+    messageType: 'file',
+    mentioned: false,
+    resource: { kind: 'file', key: 'opaque-resource-key', name: 'evidence.txt' },
+  })
+  await waitFor(() => firstAdapter.requests.length === 1)
+  const firstAgent = first.ctx.agents.list()[0]
+  assert.ok(firstAgent !== undefined)
+  await firstAgent.whenIdle()
+  assert.equal(await first.ctx.sessions.flush(firstAgent.session), true)
+  const firstRequest = JSON.stringify(firstAdapter.requests[0]?.messages)
+  assert.match(firstRequest, /durable attachment marker/u)
+  assert.match(firstRequest, /untrusted-user-data/u)
+  assert.doesNotMatch(firstRequest, /opaque-resource-key|harness-file-message/u)
+  const persisted = JSON.stringify(
+    (await first.ctx.sessionPersistence.inspect(firstAgent.id)).events,
+  )
+  assert.match(persisted, /durable attachment marker/u)
+  assert.match(persisted, /evidence\.txt/u)
+  assert.doesNotMatch(persisted, /opaque-resource-key|harness-file-message/u)
+  await first.dispose()
+
+  const resumedAdapter = new ScriptedAdapter([textResponse('resumed')])
+  const resumed = await mount(root, resumedAdapter)
+  t.after(() => resumed.dispose())
+  await resumed.client.messageHandler?.(conversationCommand('chat-a', 'continue after attachment'))
+  await waitFor(() => resumedAdapter.requests.length === 1)
+  const resumedRequest = JSON.stringify(resumedAdapter.requests[0]?.messages)
+  assert.match(resumedRequest, /durable attachment marker/u)
+  assert.match(resumedRequest, /continue after attachment/u)
+  assert.doesNotMatch(resumedRequest, /opaque-resource-key|harness-file-message/u)
+})
 
 test('harness e2e: /new materializes and resumes its session across restart', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-lark-session-'))

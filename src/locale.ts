@@ -70,6 +70,10 @@ function modelRouteLabel(selection: ModelSelectionItem): string {
   return `${selection.provider} / ${selection.model}`
 }
 
+function byteLimit(bytes: number, byteUnit: string): string {
+  return bytes % 1024 === 0 ? `${bytes / 1024} KiB` : `${bytes} ${byteUnit}`
+}
+
 function currentModelLabel(
   current: ModelSelectionItem,
   groups: readonly ModelListGroup[],
@@ -142,6 +146,9 @@ interface LocaleCopy {
     readonly help: string
     readonly denied: string
     readonly unsupportedInput: string
+    readonly inboundTextFileInvalid: string
+    readonly inboundTextFileUnavailable: string
+    inboundTextFileTooLarge(maxBytes: number): string
     readonly followupFailure: string
     readonly cardUnavailable: string
     readonly approvalUnauthorized: string
@@ -299,6 +306,9 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       ].join('\n'),
       denied: '没有权限。',
       unsupportedInput: '暂不支持图片、文件或其他非文本消息，请改用文字发送。',
+      inboundTextFileInvalid: '无法读取该附件。仅支持安全文件名的 UTF-8 .txt、.log、.patch 和 .diff 文本文件。',
+      inboundTextFileUnavailable: '附件下载暂不可用，请重新发送或改用文字。',
+      inboundTextFileTooLarge: (maxBytes) => `文本附件过大（上限 ${byteLimit(maxBytes, '字节')}）。`,
       followupFailure: '消息提交失败，请重试。',
       cardUnavailable: '卡片操作暂不可用。',
       approvalUnauthorized: '无权执行此操作。',
@@ -484,6 +494,9 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       ].join('\n'),
       denied: "You don't have permission.",
       unsupportedInput: 'Images, files, and other non-text messages are not supported yet. Please send text.',
+      inboundTextFileInvalid: 'This attachment cannot be read. Only UTF-8 .txt, .log, .patch, and .diff files with safe names are accepted.',
+      inboundTextFileUnavailable: 'Attachment download is temporarily unavailable. Send it again or use text.',
+      inboundTextFileTooLarge: (maxBytes) => `The text attachment is too large (limit: ${byteLimit(maxBytes, 'bytes')}).`,
       followupFailure: 'Message submission failed. Please try again.',
       cardUnavailable: 'Card actions are temporarily unavailable.',
       approvalUnauthorized: 'You cannot perform this action.',

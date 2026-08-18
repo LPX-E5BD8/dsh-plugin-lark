@@ -4,6 +4,7 @@ import { LarkBridge } from './bridge.ts'
 import { DEFAULT_CONFIG, LARK_APP_ID_PATTERN } from './config.ts'
 import { DurableConversationBindingStore } from './conversation-binding.ts'
 import { installLarkHealthRoute } from './health.ts'
+import { MAX_INBOUND_TEXT_RESOURCE_BYTES } from './inbound-resource.ts'
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { LarkSdkClient } from './lark.ts'
 import { LARK_LOCALES } from './locale.ts'
@@ -23,6 +24,8 @@ export interface LarkConfig {
   model?: string
   streamUpdateIntervalMs?: number
   maxConversationHandles?: number
+  inboundTextFiles?: boolean
+  maxInboundTextFileBytes?: number
 }
 
 export const Config: Schema = Schema.object({
@@ -38,6 +41,11 @@ export const Config: Schema = Schema.object({
   maxConversationHandles: Schema.natural()
     .max(Number.MAX_SAFE_INTEGER)
     .default(DEFAULT_CONFIG.maxConversationHandles),
+  inboundTextFiles: Schema.boolean().default(DEFAULT_CONFIG.inboundTextFiles),
+  maxInboundTextFileBytes: Schema.natural()
+    .min(1)
+    .max(MAX_INBOUND_TEXT_RESOURCE_BYTES)
+    .default(DEFAULT_CONFIG.maxInboundTextFileBytes),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -115,6 +123,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         appSecret,
         domain: config.domain ?? DEFAULT_CONFIG.domain,
         locale: config.locale ?? DEFAULT_CONFIG.locale,
+        inboundTextFiles: config.inboundTextFiles ?? DEFAULT_CONFIG.inboundTextFiles,
       })
       installLarkHealthRoute(ctx, () => client.connectionHealth())
       bridge = new LarkBridge(ctx, {
@@ -130,6 +139,8 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         model: config.model,
         streamUpdateIntervalMs: config.streamUpdateIntervalMs,
         maxConversationHandles: config.maxConversationHandles,
+        inboundTextFiles: config.inboundTextFiles,
+        maxInboundTextFileBytes: config.maxInboundTextFileBytes,
         sessionReferenceNamespace: appId,
       })
       await bridge.start()
@@ -156,15 +167,19 @@ export {
   renderApprovalCard as approvalCard,
   renderApprovalDecisionCard as decidedCard,
 } from './cards.ts'
-export { LarkSdkClient, splitText, unwrapCardAction } from './lark.ts'
+export { LarkResourceError, LarkSdkClient, splitText, unwrapCardAction } from './lark.ts'
 export type {
   LarkCardAction,
   LarkCardActionResult,
   LarkClientLike,
   LarkConnectionHealth,
   LarkConnectionState,
+  LarkDownloadedResource,
   LarkDeliveryOptions,
   LarkInbound,
+  LarkInboundResource,
+  LarkResourceDownloadOptions,
+  LarkResourceErrorCode,
 } from './lark.ts'
 export { LARK_LOCALES } from './locale.ts'
 export type { LarkLocale } from './locale.ts'

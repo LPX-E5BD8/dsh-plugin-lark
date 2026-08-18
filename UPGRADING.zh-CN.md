@@ -42,6 +42,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.3` | Conversation binding schema v2 与 Workspace domain v2 均保持不变。`/session resume` 会先检查点当前 transcript，再把现有 binding 原子指向一条已持久化且在当前作用域可见的 Session，并沿用现有 mutation-hash 窗口。不透明引用由运行时派生而非持久化；命令不会写入归档状态，也不会复制或删除 transcript。 | v0.9.2 会读取同一 binding，并继续使用 v0.9.3 选中的 Session，但没有 `/session` 列出/恢复命令。回滚不会撤销这次选择；归档状态与 Session log 均无需转换。 |
 | `0.9.4` | 不新增插件自有持久化 schema。结构化问题使用现有工具调用/结果 Session 事件，并在投递卡片前检查点待处理调用；pending request token 与答案都不会进入插件 sidecar。 | v0.9.3 会读取相同 binding、Workspace 与 Session log，但不会在 Lark 中拦截结构化问题。pending 卡片状态只存在于进程内，任何重启都会让旧卡片失效。在 `tool/result` 提交前已确认接收的答案不具备跨崩溃耐久性，可能需要重新提问。 |
 | `0.9.5` | 不新增持久化 schema。把导出的 Cordis 入口改为不可构造，使 root shutdown 真正拥有异步 disposer；已知 message ID 时同步登记 human-input 终态投递，create 回包迟到时则在取得 ID 后立即登记，并把停机 Card close 预算限制在宿主 grace 内。 | v0.9.4 会读取相同状态，但真实 profile unload 可能丢失异步 teardown，使 pending form 留在聊天里，同时开放中的工具调用只能在冷恢复时修复。即使使用 v0.9.5，rc.6 也会并发销毁 Agent，因此优雅 SIGTERM 后开放调用仍可能冷修复；终态 Card 不等于持久化工具结果。 |
+| `0.9.6` | 不新增插件自有 schema。显式开启后，被接收的文本文件会成为 Session log 中的普通用户文本 block；resource key、下载状态与文件元数据不会加入回执或 binding。 | v0.9.5 可以读取包含这些普通文本 block 的 Session，但新文件消息会恢复为通用不支持路径。回滚不会从 Session 历史中删除已经提交的附件内容。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -58,7 +59,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.5'
+target_tag='v0.9.6'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -203,9 +204,10 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.5 回滚到 | 状态处理方式 |
+| 从 v0.9.6 回滚到 | 状态处理方式 |
 | --- | --- |
-| v0.9.4 | 使用相同持久化状态，但其可构造插件入口可能在 root unload 时丢失异步 disposer。pending 问题可能看似仍可交互，但进程内状态已经消失；对应工具调用会在冷恢复时按 interrupted 修复。优先前滚；必须回滚时，先优雅停止 v0.9.5，并把所有遗留 v0.9.4 卡片视为 stale。 |
+| v0.9.5 | 使用相同持久化状态，并会继续保留已经作为普通用户 block 提交的文本附件；但新文件消息会恢复为通用不支持提示，且绝不下载。必须先优雅停机；本功能没有附件 sidecar 或临时文件需要清理。 |
+| v0.9.4 | 使用相同持久化状态，但其可构造插件入口可能在 root unload 时丢失异步 disposer。pending 问题可能看似仍可交互，但进程内状态已经消失；对应工具调用会在冷恢复时按 interrupted 修复。优先前滚；必须回滚时，先优雅停止 v0.9.6，并把所有遗留 v0.9.4 卡片视为 stale。 |
 | v0.9.3 | 使用相同的 v2 conversation binding、Workspace domain 与 Session log。结构化卡片处理能力及其进程内 pending 状态会消失；必须先优雅停机。已发送卡片会留在聊天中并处于终态或 stale，所有未完成操作都会被拒绝。已经作为普通工具结果提交的答案仍保留在 transcript 中。 |
 | v0.9.2 | 使用相同的 v2 conversation binding、Workspace domain 与 Session log。v0.9.3 选中的 Session 会继续保持 active，因为 v0.9.2 会遵循该已提交 binding；但 `/session` 列出/恢复命令会消失，回滚也不会恢复先前 active 的 Session。v0.9.3 没有引入归档、取消归档、删除或搜索状态。 |
 | v0.9.1 | 无需转换持久化状态。旧版 Card payload 可能被飞书拒绝，因此审批可能不可用，但仍保持默认拒绝；必须保留完整快照，并优先通过前滚恢复。 |

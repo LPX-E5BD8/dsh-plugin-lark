@@ -12,12 +12,13 @@
 - **项目注册与按会话选择：** 项目管理员可在私聊中注册当前 Session 目录或移除注册；所有已授权会话都能列出和选择已注册 Workspace，聊天参数不能指定任意路径。
 - **按会话选择模型：** 列出已挂载 provider 及其公布的模型，接受 adapter 可解析的精确 provider/model 路由，并在新 generation 与恢复过程中保留每个会话的选择。
 - **结构化人工输入：** 把官方 `ask_user_question` 工具渲染为有界的原生单选、多选或自由文本卡片，并把已授权回答返回同一个运行中 turn。
+- **可选私聊文本附件：** 通过严格的鉴权、文件名、MIME、字节数与内容检查，接收一个有界的 UTF-8 `.txt`、`.log`、`.patch` 或 `.diff` 消息，不接受 URL，也不创建临时文件。
 - **实时执行卡片：** 将思考过程、待办、重试、上下文压缩、Hook、工作流、工具调用与结果、Token 用量和最终答案持续更新到一张有大小上限的 Card 2.0 卡片中。
 - **安全的工具审批与停止：** 审批和停止操作绑定到发起它们的会话、聊天和用户；过期或跨聊天操作默认拒绝。
 - **可靠的回复投递：** 卡片及降级文本始终回复触发消息或原生话题；长答案会完整续发，并通过持久化回执避免常规 WebSocket 重投造成重复执行。
 - **有界的进程内驻留：** 释放已完成持久化检查点的最近最少使用空闲 Agent；再次访问时精确冷恢复原会话，且不会删除历史记录。
 - **本地化与可观测性：** 内置 `zh-CN`、`en-US` 界面文案，并可选提供脱敏的 WebSocket readiness 接口。
-- **失败时默认拒绝：** 授权默认拒绝、Lark 应用凭据仅允许来自启动环境、不摄入非文本内容，审批失败也绝不会放行。
+- **失败时默认拒绝：** 授权默认拒绝、Lark 应用凭据仅允许来自启动环境；除非显式开启有界文本文件功能，否则非文本内容仍不摄入，审批失败也绝不会放行。
 
 ## 环境要求
 
@@ -35,13 +36,13 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer，同步登记终态 Card，并把其预算限制在宿主停机 grace 以内。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
 | `0.8.0`–`0.8.4` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持原有 Node 22/Linux 基线；v0.8.4 新增不启动应用的 Web profile package lifecycle 门禁。 |
 
-必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、语义 checkpoint policy、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、Tools、User Questions、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.4 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
+必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、语义 checkpoint policy、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、Tools、User Questions、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更另有真实 Registry 持久化生命周期测试。CI 会在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.5 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
 
 Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
 
@@ -77,7 +78,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 2. 订阅 `im.message.receive_v1`。
 3. 注册 `card.action.trigger` 回调。
 4. 为机器人授予 `im:message` 消息收发权限。
-5. 可选授予 `im:resource`，以启用内置动态加载图；缺少该权限时卡片会使用静态图标。
+5. 开启 `inboundTextFiles` 时必须授予 `im:resource`。未开启时该权限仍为可选，仅用于启用内置动态加载图；缺少它时卡片会使用静态图标。
 
 ## Release 来源证明
 
@@ -88,7 +89,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.5'
+version='0.9.6'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -193,6 +194,8 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
     model: deepseek-v4-flash    # 会话没有已保存选择时的默认 model
     streamUpdateIntervalMs: 1000
     maxConversationHandles: 32  # 进程内活跃会话句柄的稳态目标
+    inboundTextFiles: false     # 显式开启有界 UTF-8 文本文件消息
+    maxInboundTextFileBytes: 131072 # 默认 128 KiB；硬上限 256 KiB
 ```
 
 这组基线要求宿主提供 `agents`、`sessions`、`tools` 和持久化 `storageDomain` 服务。需要持久化的重置、项目/会话/模型选择、冷恢复与结构化 Lark 问题还要求 `sessionPersistence`；`/project` 依赖 `workspaceRegistry`，`/session` 还依赖 `sessionQuery` 与持久化会话绑定，`/model` 依赖 Harness `llm` 服务。结构化输入要求 Agent 仍能看到精确兼容的 rc.6 `ask_user_question` 定义；缺失或不兼容时会记录诊断并委派，而不会注册第二个 provider。缺少 Session Query 或 Workspace 能力时，会话导航会返回不可用；单独执行 `/session` 列表不会创建 Agent。审批卡片和 readiness 路由分别依赖可选的 `approval` 与 `webServer` 服务。已验证矩阵使用标准 JSON/JSONL 和 SQLite 精确读取实现，替代实现仍未验证。
@@ -200,6 +203,8 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 `allowFrom` 默认拒绝：当列表为空且 `allowAllUsers: false` 时，所有用户都无权访问。仅当机器人明确需要公开使用时才设置 `allowAllUsers: true`。托管在 `open.larksuite.com` 的应用应使用 `domain: lark`。
 
 `projectManageFrom` 是独立且默认拒绝的项目管理 allowlist，默认值为空。管理员仍必须通过普通 `allowFrom`/`allowAllUsers` 鉴权，注册与移除命令只接受私聊；`allowAllUsers: true` 绝不会自动授予项目管理权限。项目管理要求标准可写 Workspace Registry 同时提供 `create`、`delete` 和 `resolveByPath`；只读自定义 Registry 仍只能列出和选择。
+
+`inboundTextFiles` 默认关闭。开启后，`maxInboundTextFileBytes` 可设为不超过 256 KiB 硬上限的正整数，默认 128 KiB；机器人必须具备 `im:resource` 权限，且只在私聊中接收文件。鉴权、持久化消息去重及安全文件名/扩展名检查都会在下载前完成。客户端只会从当前配置的飞书/Lark OpenAPI 域名读取这条已认证消息携带的精确 file key，禁用重定向，同时限制声明长度与实际流长度；它不接受 URL 或本地路径。
 
 `0.1.0` 已使用真实飞书凭据完成冒烟测试。Lark 域名路径通过官方 SDK 的域名切换和自动化测试覆盖；在宣称 Lark 已完成真实凭据测试前，仍需按发布手册记录一次 Lark 实测。
 
@@ -269,9 +274,13 @@ Harness rc.6 的 Web 模型选择器尚未公开可供多个入口共享的 per-
 
 ## 范围与边界
 
-桥接器只向 Agent 发送文本。图片、文件、音频及其他非文本消息只按平台消息类型分类；插件不会解析它们的序列化内容，也不会把资源 key、名称或资源元数据复制到日志、存储或 Agent 输入。已授权的私聊消息，或明确 @ 机器人的群聊消息，会收到通用的本地化纯文本提示；其他群聊附件保持静默。这个边界不需要媒体下载权限。
+桥接器只向 Agent 发送文本 block。`inboundTextFiles: false` 时，图片、文件、音频及其他非文本消息仍只做元数据级分类：插件不会解析其序列化内容，也不会保留资源 key、名称或元数据。已授权私聊或明确 @ 机器人的群聊会收到通用本地化提示；其他群聊附件保持静默。
 
-群聊消息必须 @ 机器人或使用斜杠命令。附件摄入、管理界面和通用卡片框架明确不在当前范围内。
+`inboundTextFiles: true` 时，一条已认证的私聊平台 `file` 消息可携带 `.txt`、`.log`、`.patch` 或 `.diff`。basename 最多 120 个 Unicode 码点和 255 个 UTF-8 字节；路径、隐藏名/保留名、控制字符、独立的主动 HTML/SVG 文档、二进制签名（包括单个 UTF-8 BOM 与前导文本空白之后的签名，并会在 PDF 合法的前 1,024 字节窗口内查找 header）、不安全控制/双向文本、空文件、MIME/扩展名不匹配、无效 UTF-8 及超限内容都会在提交给 Agent 前被拒绝。`.patch`/`.diff` 中的标记只有处于可识别的 unified-diff `---`/`+++`/`@@` envelope 内时才按代码保留。只接受 `text/plain`、格式专用文本 MIME 或平台常见的 `application/octet-stream` fallback。字节始终留在有界内存中，不创建临时文件或清理定时器；停机会取消开放中的下载流，且不提交该消息的入站回执。
+
+接收成功的文件会变成显式标记的“不可信用户数据”文本 block。安全 basename、已验证 MIME、字节数与内容会按设计进入普通 Harness Session transcript，因此遵循该 backend 的保留、导出、fork 与访问策略。它们不会进入插件日志、哈希回执存储、conversation binding 或错误回复。附件链路不会向 Session 新增平台 resource key、文件 message ID、发送者 ID、凭据、除归一化 MIME 外的原始 headers、原始 SDK 错误或插件/宿主派生的私有路径。Session 原本的会话身份仍遵循已记录的范围契约——兼容的私聊 Session ID 可能独立于附件而由 chat ID 派生。用户提供的正文不会被自动脱敏，当然可能自行包含类似路径的文字。与其他入站 prompt 一样，Agent 接收后、回执提交前若硬崩溃，平台重投仍可能再次提交。
+
+v0.9.6 仍不支持图片、主动发送产物、URL、压缩包、通用二进制、音频和视频；这些能力已拆分为后续独立 Roadmap 里程碑。群附件也继续默认拒绝：普通独立文件消息无法携带本通道要求的机器人 @，因此未 @ 文件保持静默，人为构造或显式带 @ 的非文本事件也只收到通用提示。管理界面和通用卡片框架同样不在当前范围内。
 
 ## 运维
 
