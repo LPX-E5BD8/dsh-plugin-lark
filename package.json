@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-lark",
-  "description": "Feishu/Lark bridge for DeepSeek Harness with execution cards, structured input, and bounded media ingestion",
-  "version": "0.9.9",
+  "description": "Feishu/Lark bridge for DeepSeek Harness with execution cards, structured input, and approved bounded artifacts",
+  "version": "0.9.10",
   "author": "LPX-E5BD8",
   "type": "module",
   "repository": {
@@ -84,7 +84,7 @@
     }
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.64.0",
+    "@larksuiteoapi/node-sdk": "1.73.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

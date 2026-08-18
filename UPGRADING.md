@@ -47,6 +47,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.7` | Adds no durable schema or image bytes. It reads the existing exact model-visible Session surface and exact adapter modality metadata before model/session routing; incompatible checks perform no binding mutation. | v0.9.6 reads the same bindings and Session events but removes the image-history guard. Existing image blocks from another surface remain stored and can again reach a text-only route, where the provider is expected to fail closed. |
 | `0.9.8` | Adds no durable schema. During graceful shutdown it makes a bounded attempt to terminalize every known running execution Card through a signal-aware final PATCH without appending a Session result or sending partial output. | v0.9.7 reads the same state but can leave an already delivered running Card with a stale Stop control after its process-local turn authority disappears. Stop v0.9.8 cleanly before rollback and treat any still-running older Card as stale. |
 | `0.9.9` | Adds no plugin-owned schema. Opted-in images publish immutable objects under the Harness attachment backend, while Session events store only validated content-addressed references and metadata. | v0.9.8 retains and reads the same Session image blocks when its deployment has an attachment service, but new Lark image messages return to the unsupported path. Rolling code back does not delete objects or orphans; keep the attachment backend aligned with Session logs. |
+| `0.9.10` | Adds no plugin-owned schema. Approved outbound artifacts use existing `tool/call`, approval audit, and `tool/result` events; platform upload keys, destinations, paths, and bytes are never stored in plugin sidecars. | v0.9.9 reads the same Session log but no longer registers the send tool. Rollback cannot retract a delivered platform message or delete an uploaded orphan, and an open/unknown tool call follows ordinary rc.6 cold repair. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -63,7 +64,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.9'
+target_tag='v0.9.10'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -217,8 +218,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.9 | State handling |
+| Rollback target from v0.9.10 | State handling |
 | --- | --- |
+| v0.9.9 | Uses the same bindings, attachment store, approval audit, and Session vocabulary, but removes the outbound-artifact tool. Already delivered messages and uploaded platform orphans remain external; do not infer their state from a rolled-back `tool/result`. |
 | v0.9.8 | Uses the same bindings, Session logs, and image-routing guard but never downloads a new Lark image. Existing image blocks still require their referenced attachment objects and an image-capable route. No object or orphan is deleted; keep the attachment store with the snapshot. |
 | v0.9.7 | Uses the same durable state and image-routing guard, but removes graceful terminalization for ordinary running execution Cards. A Card still showing Running/Stop after process exit has no live Stop authority; inspect the Session after restart and retry as needed. |
 | v0.9.6 | Uses the same durable state but removes image-aware model and Session routing checks. Image blocks already present through another Harness surface remain in the Session; verify every affected conversation uses an image-capable route before serving ordinary prompts. |
@@ -436,7 +438,7 @@ The subshell fails closed on validation, copy, checksum, or rename errors. Durin
 
 The restored profile must find the immutable original checkout at the same absolute path and exact commit recorded before downtime. Do not point it at another directory or run `plugin add` as a substitute. Start the exact old plugin on the same rc.6 cohort. `/api/lark/health` exists only in v0.5.0 and newer; for v0.1.0–v0.4.0, require the historical `[ws] ws client ready` gate plus a disposable end-to-end reply and conversation-resume check, and do not treat HTTP 404 alone as plugin failure. Retain `rollback_hold`, `restore_stage`, the snapshot, and both immutable old/target checkouts until the incident closes.
 
-Restoring the snapshot rewinds transcripts, referenced attachment objects, receipts, Workspace registration/order, project/model bindings, and mutation history to the snapshot time. Workspaces on disk, platform messages, provider calls, and other external side effects remain at their current time. Review that split explicitly before allowing new turns.
+Restoring the snapshot rewinds transcripts, referenced attachment objects, receipts, Workspace registration/order, project/model bindings, and mutation history to the snapshot time. Workspaces on disk, outbound artifact uploads/messages, other platform messages, provider calls, and external side effects remain at their current time. Review that split explicitly before allowing new turns; never resend an artifact merely because its restored tool result is absent or unknown.
 
 ## Failure recovery
 

@@ -27,6 +27,14 @@ import {
   DEFAULT_INBOUND_TEXT_RESOURCE_BYTES,
   MAX_INBOUND_TEXT_RESOURCE_BYTES,
 } from '../src/inbound-resource.ts'
+import {
+  DEFAULT_OUTBOUND_IMAGE_BYTES,
+  DEFAULT_OUTBOUND_IMAGE_PIXELS,
+  DEFAULT_OUTBOUND_TEXT_BYTES,
+  MAX_OUTBOUND_IMAGE_BYTES,
+  MAX_OUTBOUND_IMAGE_PIXELS,
+  MAX_OUTBOUND_TEXT_BYTES,
+} from '../src/outbound-artifact.ts'
 import { apply, Config, inject } from '../src/index.ts'
 import { LARK_LOCALES } from '../src/locale.ts'
 
@@ -77,7 +85,40 @@ function assertControlDepth(source: ts.SourceFile): void {
 
 test('quality: public defaults fail closed', () => {
   assert.equal(DEFAULT_CONFIG.allowAllUsers, false)
+  assert.equal(DEFAULT_CONFIG.outboundArtifacts, false)
   assert.deepEqual(inject, ['agents', 'storageDomain', 'sessions', 'tools'])
+})
+
+test('quality: outbound artifacts stay opt-in and independently bounded through the bundle seam', () => {
+  const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8')
+  const patch = readFileSync(join(process.cwd(), 'cordis.patch.yml'), 'utf8')
+  assert.equal(DEFAULT_CONFIG.outboundArtifacts, false)
+  assert.equal(DEFAULT_CONFIG.maxOutboundTextFileBytes, DEFAULT_OUTBOUND_TEXT_BYTES)
+  assert.equal(DEFAULT_CONFIG.maxOutboundImageBytes, DEFAULT_OUTBOUND_IMAGE_BYTES)
+  assert.equal(DEFAULT_CONFIG.maxOutboundImagePixels, DEFAULT_OUTBOUND_IMAGE_PIXELS)
+  assert.equal(MAX_OUTBOUND_TEXT_BYTES, 256 * 1024)
+  assert.equal(MAX_OUTBOUND_IMAGE_BYTES, 5 * 1024 * 1024)
+  assert.equal(MAX_OUTBOUND_IMAGE_PIXELS, 20_000_000)
+  assert.match(source, /outboundArtifacts: Schema\.boolean\(\)\.default\(DEFAULT_CONFIG\.outboundArtifacts\)/u)
+  for (const [field, max] of [
+    ['maxOutboundTextFileBytes', 'MAX_OUTBOUND_TEXT_BYTES'],
+    ['maxOutboundImageBytes', 'MAX_OUTBOUND_IMAGE_BYTES'],
+    ['maxOutboundImagePixels', 'MAX_OUTBOUND_IMAGE_PIXELS'],
+  ]) {
+    assert.match(source, new RegExp(`${field}: Schema\\.natural\\(\\)\\s+\\.min\\(1\\)\\s+\\.max\\(${max}\\)`, 'u'))
+  }
+  for (const line of [
+    'outboundArtifacts: false',
+    'maxOutboundTextFileBytes: 131072',
+    'maxOutboundImageBytes: 5242880',
+    'maxOutboundImagePixels: 20000000',
+  ]) {
+    assert.equal((patch.match(new RegExp(`^\\s+${line}$`, 'gmu')) ?? []).length, 1)
+  }
+  assert.throws(() => Config({ maxOutboundTextFileBytes: 0 }), TypeError)
+  assert.throws(() => Config({ maxOutboundImageBytes: MAX_OUTBOUND_IMAGE_BYTES + 1 }), TypeError)
+  assert.throws(() => Config({ maxOutboundImagePixels: MAX_OUTBOUND_IMAGE_PIXELS + 1 }), TypeError)
+  assert.equal(Config({ outboundArtifacts: true }).outboundArtifacts, true)
 })
 
 test('quality: project management configuration stays fail-closed through the bundle seam', () => {
@@ -193,12 +234,14 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
   const cordisVersion = '4.0.1'
   const schemasteryVersion = '3.18.1'
   const nodeRange = '>=22 <23 || >=24 <25'
+  const larkSdkVersion = '1.73.0'
   const manifest = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
     version: string
     engines?: { node?: string }
     peerDependencies?: Record<string, string>
     peerDependenciesMeta?: Record<string, { optional?: boolean }>
     devDependencies?: Record<string, string>
+    dependencies?: Record<string, string>
   }
   const lockfile = JSON.parse(readFileSync(join(process.cwd(), 'package-lock.json'), 'utf8')) as {
     packages?: Record<string, {
@@ -207,6 +250,7 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
       peerDependencies?: Record<string, string>
       peerDependenciesMeta?: Record<string, { optional?: boolean }>
       devDependencies?: Record<string, string>
+      dependencies?: Record<string, string>
     }>
   }
   const root = lockfile.packages?.['']
@@ -248,6 +292,12 @@ test('quality: compatibility contract matches the manifest, lockfile, docs, and 
   assert.ok(root !== undefined)
   assert.equal(manifest.engines?.node, nodeRange)
   assert.equal(root.engines?.node, nodeRange)
+  assert.equal(manifest.dependencies?.['@larksuiteoapi/node-sdk'], larkSdkVersion)
+  assert.equal(root.dependencies?.['@larksuiteoapi/node-sdk'], larkSdkVersion)
+  assert.equal(
+    lockfile.packages?.['node_modules/@larksuiteoapi/node-sdk']?.version,
+    larkSdkVersion,
+  )
   assert.deepEqual(manifest.peerDependencies, expectedPeers)
   assert.deepEqual(
     Object.fromEntries(Object.entries(manifest.devDependencies ?? {})

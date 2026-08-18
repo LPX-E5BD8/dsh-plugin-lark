@@ -156,6 +156,16 @@ interface LocaleCopy {
     inboundImageTooLarge(maxBytes: number): string
     inboundImageTooManyPixels(maxPixels: number): string
     readonly inboundImageAggregateLimit: string
+    readonly outboundArtifactCallTitle: string
+    readonly outboundArtifactSentTitle: string
+    readonly outboundArtifactFailedTitle: string
+    readonly outboundArtifactConfirmed: string
+    readonly outboundArtifactNotConfirmed: string
+    readonly outboundArtifactNotSent: string
+    readonly outboundArtifactUploadUnknown: string
+    readonly outboundArtifactDeliveryUnknown: string
+    readonly outboundArtifactSentBeforeInterrupt: string
+    outboundArtifactApprovalReason(kind: 'file' | 'image', name: string, bytes: number): string
     readonly followupFailure: string
     readonly cardUnavailable: string
     readonly approvalUnauthorized: string
@@ -329,6 +339,18 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       inboundImageTooLarge: (maxBytes) => `图片过大（上限 ${byteLimit(maxBytes, '字节')}）。`,
       inboundImageTooManyPixels: (maxPixels) => `图片像素过多（上限 ${maxPixels} 像素）。`,
       inboundImageAggregateLimit: '当前会话的图片数量或总字节数已达到上限；请先开始新会话或压缩历史。',
+      outboundArtifactCallTitle: '发送经审批的 Lark 产物',
+      outboundArtifactSentTitle: '产物已发送',
+      outboundArtifactFailedTitle: '产物未发送',
+      outboundArtifactConfirmed: '已确认产物发送到发起本轮的 Lark 会话。',
+      outboundArtifactNotConfirmed: '产物发送未确认，请勿自动重试。',
+      outboundArtifactNotSent: '产物因校验、审批或权限变化而未发送。',
+      outboundArtifactUploadUnknown: '产物未投递；平台可能保留了已上传对象，请勿自动重试。',
+      outboundArtifactDeliveryUnknown: '产物投递结果未知，请勿自动重试。',
+      outboundArtifactSentBeforeInterrupt: '产物在中断前已确认投递，请勿再次发送。',
+      outboundArtifactApprovalReason: (kind, name, bytes) => (
+        `将已审批的 Workspace ${kind === 'image' ? '图片' : '文件'}“${name}”（${bytes} 字节）发送到发起本轮的 Lark 会话。`
+      ),
       followupFailure: '消息提交失败，请重试。',
       cardUnavailable: '卡片操作暂不可用。',
       approvalUnauthorized: '无权执行此操作。',
@@ -530,6 +552,18 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       inboundImageTooLarge: (maxBytes) => `The image is too large (limit: ${byteLimit(maxBytes, 'bytes')}).`,
       inboundImageTooManyPixels: (maxPixels) => `The image has too many pixels (limit: ${maxPixels} pixels).`,
       inboundImageAggregateLimit: 'This conversation reached its image count or byte limit. Start a fresh Session or compact its history first.',
+      outboundArtifactCallTitle: 'Send approved Lark artifact',
+      outboundArtifactSentTitle: 'Artifact sent',
+      outboundArtifactFailedTitle: 'Artifact not sent',
+      outboundArtifactConfirmed: 'Artifact delivery to the originating Lark conversation was confirmed.',
+      outboundArtifactNotConfirmed: 'Artifact delivery was not confirmed. Do not retry automatically.',
+      outboundArtifactNotSent: 'Artifact was not sent because validation, approval, or authority failed.',
+      outboundArtifactUploadUnknown: 'Artifact was not delivered; an uploaded platform object may remain. Do not retry automatically.',
+      outboundArtifactDeliveryUnknown: 'Artifact delivery outcome is unknown. Do not retry automatically.',
+      outboundArtifactSentBeforeInterrupt: 'Artifact delivery was confirmed before interruption. Do not send it again.',
+      outboundArtifactApprovalReason: (kind, name, bytes) => (
+        `Send approved Workspace ${kind} "${name}" (${bytes} bytes) to the originating Lark conversation.`
+      ),
       followupFailure: 'Message submission failed. Please try again.',
       cardUnavailable: 'Card actions are temporarily unavailable.',
       approvalUnauthorized: 'You cannot perform this action.',

@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.9 are implemented in the current release line. The next planned independently reviewable capability is 0.9.10.
+Milestones through 0.9.10 are implemented in the current release line. The next planned independently reviewable capability is 0.9.11.
 
 ## 0.1.1 — Reliability
 
@@ -192,8 +192,8 @@ Milestones through 0.9.9 are implemented in the current release line. The next p
 
 ## 0.9.10 — Approved outbound artifacts
 
-- Add an explicit Agent-scoped tool for sending a bounded generated text file or raster image from the exact registered Workspace serving the active Lark turn.
-- Require one-shot approval, canonical containment, regular-file and final-symlink checks, safe names and extensions, and an exact active chat/user/turn route; reject URLs, `file:` URIs, absolute paths, subagents, nested Code Mode, and Web-originated calls.
+- Add an explicit Agent-scoped tool for sending one bounded, user-approved text file or static raster image from the exact registered Workspace serving the active Lark turn; rc.6 cannot prove which process originally generated a Workspace file.
+- Require one-shot approval, canonical containment, descriptor-resolved identity before and after reads, regular-file and final-symlink checks, safe raw/canonical names, platform image dimensions, and an exact active chat/user/turn route; reject URLs, `file:` URIs, absolute paths, subagents, nested Code Mode, and Web-originated calls.
 - Upload and deliver without exposing local paths, platform keys, destination identifiers, file content, or credentials in the tool result, logs, Session sidecars, or error reply; do not retry an ambiguous send.
 
 ## 0.9.11 — Reliable proactive delivery

@@ -1262,6 +1262,187 @@ test('SDK resource download rejects malformed headers and references without exp
   assert.doesNotMatch(referenceError.message, /private_marker|bad/)
 })
 
+test('SDK artifact upload owns bytes and one opaque token permits one exact reply', async () => {
+  const calls: Record<string, unknown>[] = []
+  const uploadStarted = Promise.withResolvers<void>()
+  const releaseUpload = Promise.withResolvers<void>()
+  const client = clientWithResourceRequest(async (options) => {
+    calls.push(options)
+    const url = String(options.url)
+    if (url === '/open-apis/im/v1/files') {
+      uploadStarted.resolve()
+      await releaseUpload.promise
+      return { data: { file_key: 'file_v3_smoke' } }
+    }
+    if (url.endsWith('/reply')) return { data: { message_id: 'om_artifact_reply' } }
+    throw new Error('unexpected request')
+  })
+  const source = Buffer.from('approved bytes')
+  const uploading = client.uploadArtifact({
+    kind: 'file',
+    name: 'report.txt',
+    data: source,
+  }, { signal: new AbortController().signal })
+  await uploadStarted.promise
+  source.fill(0)
+  const uploadedBytes = (calls[0]?.data as { file?: Buffer }).file
+  assert.ok(Buffer.isBuffer(uploadedBytes))
+  assert.equal(uploadedBytes.toString('utf8'), 'approved bytes')
+  releaseUpload.resolve()
+  const artifact = await uploading
+  assert.deepEqual(artifact, { kind: 'file' })
+  assert.doesNotMatch(JSON.stringify(artifact), /file_v3/u)
+
+  const sent = await client.sendArtifact('oc_artifact_chat', artifact, {
+    replyToMessageId: 'om_trigger',
+    replyInThread: true,
+    signal: new AbortController().signal,
+    idempotencyKey: 'artifact-call-1',
+  })
+  assert.equal(sent, 'om_artifact_reply')
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0]?.method, 'POST')
+  assert.equal(calls[0]?.maxRedirects, 0)
+  assert.equal(calls[0]?.headers !== undefined, true)
+  assert.equal(calls[1]?.url, '/open-apis/im/v1/messages/om_trigger/reply')
+  assert.equal(calls[1]?.maxRedirects, 0)
+  assert.deepEqual(calls[1]?.data, {
+    msg_type: 'file',
+    content: JSON.stringify({ file_key: 'file_v3_smoke' }),
+    uuid: 'artifact-call-1',
+    reply_in_thread: true,
+  })
+  await assert.rejects(
+    client.sendArtifact('oc_artifact_chat', artifact, {
+      replyToMessageId: 'om_trigger',
+      signal: new AbortController().signal,
+      idempotencyKey: 'artifact-call-1',
+    }),
+    /already consumed/u,
+  )
+  assert.equal(calls.length, 2)
+})
+
+test('SDK artifact abort reaches tenant-token acquisition and waits for its settlement', async () => {
+  const http = Lark.defaultHttpInstance as unknown as {
+    post: (
+      url: string,
+      data?: unknown,
+      options?: { signal?: AbortSignal; timeout?: number },
+    ) => Promise<unknown>
+    request: (options: Record<string, unknown>) => Promise<unknown>
+  }
+  const originalPost = http.post
+  const originalRequest = http.request
+  const originalStart = Lark.WSClient.prototype.start
+  let phase: 'start' | 'artifact' = 'start'
+  let artifactTokenCalls = 0
+  let artifactWrites = 0
+  let tokenOptions: { signal?: AbortSignal; timeout?: number } | undefined
+  const tokenStarted = Promise.withResolvers<void>()
+  const releaseToken = Promise.withResolvers<void>()
+  http.post = async (_url, _data, options) => {
+    if (phase === 'start') {
+      assert.equal(options?.timeout, 15_000)
+      return { tenant_access_token: 'tenant-token-for-start', expire: 7_200 }
+    }
+    artifactTokenCalls += 1
+    tokenOptions = options
+    tokenStarted.resolve()
+    await releaseToken.promise
+    options?.signal?.throwIfAborted()
+    return { tenant_access_token: 'must-not-be-used', expire: 7_200 }
+  }
+  http.request = async (options) => {
+    assert.equal(options.timeout, 15_000)
+    if (phase === 'artifact') {
+      artifactWrites += 1
+      return { data: { file_key: 'must_not_upload' } }
+    }
+    return { bot: { open_id: 'token-bound-bot' } }
+  }
+  Lark.WSClient.prototype.start = async function signalReady() {
+    ;(this as unknown as { onReady?: () => void }).onReady?.()
+  }
+  const client = new LarkSdkClient({
+    appId: 'artifact-token-bound-app-id',
+    appSecret: 'test-only-secret',
+  })
+  ;(client as unknown as { prepareLoadingImage: () => Promise<void> }).prepareLoadingImage = async () => {}
+  try {
+    await client.start()
+    const rest = (client as unknown as {
+      rest: {
+        tokenManager: {
+          cache: {
+            get(): Promise<undefined>
+            set(): Promise<boolean>
+          }
+        }
+      }
+    }).rest
+    rest.tokenManager.cache = {
+      async get() { return undefined },
+      async set() { return true },
+    }
+    phase = 'artifact'
+    const controller = new AbortController()
+    let settled = false
+    const uploading = client.uploadArtifact({
+      kind: 'file',
+      name: 'report.txt',
+      data: new TextEncoder().encode('approved artifact'),
+    }, { signal: controller.signal }).finally(() => { settled = true })
+    await tokenStarted.promise
+    controller.abort(new Error('stop during tenant token acquisition'))
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    assert.equal(tokenOptions?.timeout, 15_000)
+    assert.equal(tokenOptions?.signal?.aborted, true)
+    assert.equal(settled, false)
+    assert.equal(artifactWrites, 0)
+    releaseToken.resolve()
+    await assert.rejects(uploading, /artifact\.upload transport failure/u)
+    assert.equal(settled, true)
+    assert.equal(artifactTokenCalls, 1)
+    assert.equal(artifactWrites, 0)
+  } finally {
+    releaseToken.resolve()
+    await client.stop().catch(() => {})
+    http.post = originalPost
+    http.request = originalRequest
+    Lark.WSClient.prototype.start = originalStart
+  }
+})
+
+test('SDK image artifact uses the fixed upload endpoint and rejects malformed responses', async () => {
+  const calls: Record<string, unknown>[] = []
+  const client = clientWithResourceRequest(async (options) => {
+    calls.push(options)
+    return { data: { image_key: 'img_v3_smoke' } }
+  })
+  const artifact = await client.uploadArtifact({
+    kind: 'image',
+    data: Uint8Array.of(0x89, 0x50, 0x4e, 0x47),
+  }, { signal: new AbortController().signal })
+  assert.deepEqual(artifact, { kind: 'image' })
+  assert.equal(calls[0]?.url, '/open-apis/im/v1/images')
+  assert.deepEqual(
+    [...((calls[0]?.data as { image?: Buffer }).image ?? [])],
+    [0x89, 0x50, 0x4e, 0x47],
+  )
+
+  const malformed = clientWithResourceRequest(async () => ({
+    data: { image_key: '../private-image-key' },
+  }))
+  const error = await malformed.uploadArtifact({
+    kind: 'image',
+    data: Uint8Array.of(1),
+  }, { signal: new AbortController().signal }).catch((reason: unknown) => reason)
+  assert.ok(error instanceof Error)
+  assert.doesNotMatch(error.message, /private-image-key/u)
+})
+
 test('SDK Card callback preserves form values and returns a raw terminal Card unchanged', async () => {
   const prototype = Lark.Client.prototype as unknown as {
     request: (options: unknown) => Promise<unknown>

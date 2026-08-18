@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.9.8'
-const BASELINE_COMMIT = 'd0921e4d1186dc256bc3eff587cc929da5dc8bad'
-const BASELINE_DIGEST = 'sha256:796b73c23ff8a3cd9d2d58ce6edd5d8257f79986769bfd1cb1d99d0c4f218204'
+const BASELINE_TAG = 'v0.9.9'
+const BASELINE_COMMIT = 'da92fffc6d2fb2d6651a4f3ece6529a8221d0c15'
+const BASELINE_DIGEST = 'sha256:2d47b32191a1306f2bd4ded81f277d5695195a62ba9dad9a013c564a092f83fe'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 
@@ -235,6 +235,7 @@ test('profile smoke proves clean install and in-place upgrade composition', () =
     'dsh-session-query',
     'dsh-session-query-sqlite',
     'dsh-session-title',
+    'dsh-user-approval',
     'dsh-workspace',
   ]) {
     assert.match(profileSmoke, new RegExp(`'${required}'`, 'u'))

@@ -18,3 +18,7 @@
         maxInboundImagePixels: 20000000
         maxConversationImages: 4
         maxConversationImageBytes: 20971520
+        outboundArtifacts: false
+        maxOutboundTextFileBytes: 131072
+        maxOutboundImageBytes: 5242880
+        maxOutboundImagePixels: 20000000

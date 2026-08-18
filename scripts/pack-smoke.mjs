@@ -24,6 +24,8 @@ const temporary = await mkdtemp(join(tmpdir(), 'dsh-plugin-lark-pack-'))
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 const sourceLock = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'))
+const typescriptVersion = sourceLock.packages?.['node_modules/typescript']?.version
+assert.equal(typeof typescriptVersion, 'string')
 assert.equal(manifest.name, 'dsh-plugin-lark')
 assert.match(manifest.version, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
 const expectedArchiveName = `${manifest.name}-${manifest.version}.tgz`
@@ -54,6 +56,7 @@ async function verifyConsumer(archivePath) {
     '--ignore-scripts',
     '--no-package-lock',
     ...pinnedConsumerPackages,
+    `typescript@${typescriptVersion}`,
     archivePath,
   ], { cwd: consumer, env })
   const installedPackage = join(consumer, 'node_modules', manifest.name)
@@ -105,6 +108,49 @@ async function verifyConsumer(archivePath) {
     '',
   ].join('\n'))
   await run(process.execPath, [join(consumer, 'smoke.mjs')], { cwd: consumer, env })
+  await writeFile(join(consumer, 'smoke.ts'), [
+    "import type {",
+    "  LarkArtifactDeliveryOptions,",
+    "  LarkArtifactUploadInput,",
+    "  LarkArtifactUploadOptions,",
+    "  LarkClientLike,",
+    "  LarkUploadedArtifact,",
+    "} from 'dsh-plugin-lark'",
+    '',
+    'const client: LarkClientLike = {',
+    '  async start() {},',
+    '  async stop() {},',
+    '  async sendText() {},',
+    '  onMessage() {},',
+    '  uploadArtifact(',
+    '    input: LarkArtifactUploadInput,',
+    '    _options: LarkArtifactUploadOptions,',
+    '  ): Promise<LarkUploadedArtifact> {',
+    '    return Promise.resolve(Object.freeze({ kind: input.kind }))',
+    '  },',
+    '  sendArtifact(',
+    '    _chatId: string,',
+    '    _artifact: LarkUploadedArtifact,',
+    '    _options: LarkArtifactDeliveryOptions,',
+    '  ): Promise<string> {',
+    "    return Promise.resolve('om_pack_smoke')",
+    '  },',
+    '}',
+    'void client',
+    '',
+  ].join('\n'))
+  await writeFile(join(consumer, 'tsconfig.json'), JSON.stringify({
+    compilerOptions: {
+      target: 'ES2024',
+      module: 'NodeNext',
+      moduleResolution: 'NodeNext',
+      strict: true,
+      skipLibCheck: true,
+      noEmit: true,
+    },
+    files: ['smoke.ts'],
+  }))
+  await run(join(consumer, 'node_modules', '.bin', 'tsc'), [], { cwd: consumer, env })
 }
 
 const digest = async (path) => createHash('sha256').update(await readFile(path)).digest('hex')

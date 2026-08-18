@@ -1,5 +1,7 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { readFile } from 'node:fs/promises'
 import type { Readable } from 'node:stream'
+import type { HttpInstance, HttpRequestOptions } from '@larksuiteoapi/node-sdk'
 import { DEFAULT_CONFIG } from './config.ts'
 import { MAX_INBOUND_IMAGE_BYTES } from './inbound-image.ts'
 import { MAX_INBOUND_TEXT_RESOURCE_BYTES } from './inbound-resource.ts'
@@ -39,6 +41,28 @@ export interface LarkDownloadedResource {
 export interface LarkResourceDownloadOptions {
   maxBytes: number
   signal: AbortSignal
+}
+
+export type LarkArtifactKind = 'file' | 'image'
+
+export interface LarkArtifactUploadInput {
+  readonly kind: LarkArtifactKind
+  readonly data: Uint8Array
+  readonly name?: string
+}
+
+export interface LarkUploadedArtifact {
+  readonly kind: LarkArtifactKind
+}
+
+export interface LarkArtifactUploadOptions {
+  readonly signal: AbortSignal
+}
+
+export interface LarkArtifactDeliveryOptions extends LarkDeliveryOptions {
+  readonly replyToMessageId: string
+  readonly signal: AbortSignal
+  readonly idempotencyKey: string
 }
 
 export type LarkResourceErrorCode = 'aborted' | 'invalid' | 'too_large' | 'unavailable'
@@ -115,6 +139,15 @@ export interface LarkClientLike {
     resource: LarkInboundResource,
     options: LarkResourceDownloadOptions,
   ): Promise<LarkDownloadedResource>
+  uploadArtifact?(
+    input: LarkArtifactUploadInput,
+    options: LarkArtifactUploadOptions,
+  ): Promise<LarkUploadedArtifact>
+  sendArtifact?(
+    chatId: string,
+    artifact: LarkUploadedArtifact,
+    options: LarkArtifactDeliveryOptions,
+  ): Promise<string>
   onMessage(handler: (msg: LarkInbound) => Promise<void>): void
   sendCard?(chatId: string, card: unknown, options?: LarkDeliveryOptions): Promise<string | void>
   updateCard?(messageId: string, card: unknown, options?: Pick<LarkDeliveryOptions, 'signal'>): Promise<void>
@@ -135,6 +168,8 @@ const TEXT_LIMIT = 4000
 const START_TIMEOUT_MS = 15_000
 const REST_REQUEST_TIMEOUT_MS = 15_000
 const RESOURCE_ID_CONTROL_PATTERN = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
+const ARTIFACT_NAME_UNSAFE_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\/:*?"<>|]/u
+const ARTIFACT_IDEMPOTENCY_PATTERN = /^[A-Za-z0-9_-]{1,50}$/u
 
 const discardSdkLog = (..._messages: unknown[]): void => {}
 const PRIVATE_SDK_LOGGER = Object.freeze({
@@ -144,6 +179,71 @@ const PRIVATE_SDK_LOGGER = Object.freeze({
   debug: discardSdkLog,
   trace: discardSdkLog,
 })
+
+type SignalHttpRequestOptions<D = unknown> = HttpRequestOptions<D> & {
+  readonly signal?: AbortSignal
+}
+
+const larkHttpSignal = new AsyncLocalStorage<AbortSignal>()
+
+function boundedHttpTimeout(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.min(Math.max(1, Math.trunc(value)), REST_REQUEST_TIMEOUT_MS)
+    : REST_REQUEST_TIMEOUT_MS
+}
+
+function boundedHttpOptions<D>(
+  options: HttpRequestOptions<D> | undefined,
+): HttpRequestOptions<D> {
+  const input = (options ?? {}) as SignalHttpRequestOptions<D>
+  const ambient = larkHttpSignal.getStore()
+  const explicit = input.signal instanceof AbortSignal ? input.signal : undefined
+  const signal = ambient === undefined
+    ? explicit
+    : explicit === undefined || explicit === ambient
+      ? ambient
+      : AbortSignal.any([ambient, explicit])
+  return {
+    ...input,
+    timeout: boundedHttpTimeout(input.timeout),
+    ...(signal === undefined ? {} : { signal }),
+  } as HttpRequestOptions<D>
+}
+
+function boundedLarkHttpInstance(http: HttpInstance): HttpInstance {
+  return Object.freeze({
+    request: <T = unknown, R = T, D = unknown>(options: HttpRequestOptions<D>) => (
+      http.request<T, R, D>(boundedHttpOptions(options))
+    ),
+    get: <T = unknown, R = T, D = unknown>(url: string, options?: HttpRequestOptions<D>) => (
+      http.get<T, R, D>(url, boundedHttpOptions(options))
+    ),
+    delete: <T = unknown, R = T, D = unknown>(url: string, options?: HttpRequestOptions<D>) => (
+      http.delete<T, R, D>(url, boundedHttpOptions(options))
+    ),
+    head: <T = unknown, R = T, D = unknown>(url: string, options?: HttpRequestOptions<D>) => (
+      http.head<T, R, D>(url, boundedHttpOptions(options))
+    ),
+    options: <T = unknown, R = T, D = unknown>(url: string, options?: HttpRequestOptions<D>) => (
+      http.options<T, R, D>(url, boundedHttpOptions(options))
+    ),
+    post: <T = unknown, R = T, D = unknown>(
+      url: string,
+      data?: D,
+      options?: HttpRequestOptions<D>,
+    ) => http.post<T, R, D>(url, data, boundedHttpOptions(options)),
+    put: <T = unknown, R = T, D = unknown>(
+      url: string,
+      data?: D,
+      options?: HttpRequestOptions<D>,
+    ) => http.put<T, R, D>(url, data, boundedHttpOptions(options)),
+    patch: <T = unknown, R = T, D = unknown>(
+      url: string,
+      data?: D,
+      options?: HttpRequestOptions<D>,
+    ) => http.patch<T, R, D>(url, data, boundedHttpOptions(options)),
+  })
+}
 
 interface LarkMention {
   key?: string
@@ -199,6 +299,18 @@ function validResourceId(value: string): boolean {
     && !value.includes('/')
     && !value.includes('\\')
     && !RESOURCE_ID_CONTROL_PATTERN.test(value)
+}
+
+function validArtifactName(value: unknown): value is string {
+  return typeof value === 'string'
+    && value !== ''
+    && value.trim() === value
+    && value.isWellFormed()
+    && [...value].length <= 120
+    && new TextEncoder().encode(value).byteLength <= 255
+    && !value.startsWith('.')
+    && !value.endsWith('.')
+    && !ARTIFACT_NAME_UNSAFE_PATTERN.test(value)
 }
 
 function parseInboundFileResource(content: string): LarkInboundResource | undefined {
@@ -324,6 +436,8 @@ type LarkApiOperation =
   | 'message.reply'
   | 'message.patch'
   | 'message.update'
+  | 'artifact.upload'
+  | 'artifact.reply'
 
 function apiInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
@@ -385,7 +499,7 @@ async function callSignalBoundLarkApi(
   }, REST_REQUEST_TIMEOUT_MS)
   const request = signal.aborted
     ? Promise.reject(new Error(`lark: ${operation} request aborted`))
-    : Promise.resolve().then(() => call(signal))
+    : Promise.resolve().then(() => larkHttpSignal.run(signal, () => call(signal)))
   try {
     // The outer race also bounds SDK token acquisition, which happens before
     // Axios observes its own signal/timeout. A late SDK continuation sees the
@@ -394,6 +508,29 @@ async function callSignalBoundLarkApi(
   } finally {
     clearTimeout(timer)
     signal.removeEventListener('abort', onAbort)
+  }
+}
+
+async function callQuiescentSignalBoundLarkApi(
+  operation: LarkApiOperation,
+  callerSignal: AbortSignal,
+  call: (signal: AbortSignal) => Promise<unknown>,
+): Promise<Record<string, unknown>> {
+  const deadline = new AbortController()
+  const signal = AbortSignal.any([callerSignal, deadline.signal])
+  const timer = setTimeout(() => {
+    deadline.abort(new Error(`lark: ${operation} request timed out`))
+  }, REST_REQUEST_TIMEOUT_MS)
+  try {
+    if (signal.aborted) throw new Error(`lark: ${operation} request aborted`)
+    const response = await callLarkApi(
+      operation,
+      () => Promise.resolve().then(() => larkHttpSignal.run(signal, () => call(signal))),
+    )
+    if (signal.aborted) throw new Error(`lark: ${operation} request aborted`)
+    return response
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -563,6 +700,10 @@ function normalizeConnectionHealth(value: unknown): LarkConnectionHealth {
 /** Real WS long-connection client via official Node SDK. */
 export class LarkSdkClient implements LarkClientLike {
   loadingImageKey: string | undefined
+  private readonly uploadedArtifacts = new WeakMap<
+    LarkUploadedArtifact,
+    { readonly kind: LarkArtifactKind; readonly key: string }
+  >()
   private handler: ((msg: LarkInbound) => Promise<void>) | undefined
   private cardHandler: ((action: LarkCardAction) => Promise<LarkCardActionResult>) | undefined
   private ws: LarkWs | undefined
@@ -603,6 +744,7 @@ export class LarkSdkClient implements LarkClientLike {
       appSecret: this.options.appSecret,
       appType: Lark.AppType.SelfBuild,
       domain,
+      httpInstance: boundedLarkHttpInstance(Lark.defaultHttpInstance as unknown as HttpInstance),
       logger: PRIVATE_SDK_LOGGER,
     })
     const rest = client as unknown as LarkRest
@@ -752,16 +894,16 @@ export class LarkSdkClient implements LarkClientLike {
     }, REST_REQUEST_TIMEOUT_MS)
     const rawRequest = signal.aborted
       ? Promise.reject(new LarkResourceError('aborted', 'lark: message.resource request aborted'))
-      : Promise.resolve().then(() => this.rest!.request({
-          url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(resource.key)}`,
-          method: 'GET',
-          params: { type: resource.kind },
-          responseType: 'stream',
-          maxRedirects: 0,
-          signal,
-          timeout: REST_REQUEST_TIMEOUT_MS,
-          $return_headers: true,
-        }))
+      : Promise.resolve().then(() => larkHttpSignal.run(signal, () => this.rest!.request({
+            url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(resource.key)}`,
+            method: 'GET',
+            params: { type: resource.kind },
+            responseType: 'stream',
+            maxRedirects: 0,
+            signal,
+            timeout: REST_REQUEST_TIMEOUT_MS,
+            $return_headers: true,
+          })))
     const request = rawRequest.then((response) => {
       if (!signal.aborted) return response
       readableResource(asRecord(response).data)?.destroy()
@@ -810,6 +952,98 @@ export class LarkSdkClient implements LarkClientLike {
       signal.removeEventListener('abort', onAbort)
       if (!consumed || signal.aborted) stream?.destroy()
     }
+  }
+
+  async uploadArtifact(
+    input: LarkArtifactUploadInput,
+    options: LarkArtifactUploadOptions,
+  ): Promise<LarkUploadedArtifact> {
+    if ((input.kind !== 'file' && input.kind !== 'image')
+      || !(input.data instanceof Uint8Array)
+      || input.data.byteLength === 0
+      || input.data.byteLength > (input.kind === 'image'
+        ? MAX_INBOUND_IMAGE_BYTES
+        : MAX_INBOUND_TEXT_RESOURCE_BYTES)
+      || (input.kind === 'file' && !validArtifactName(input.name))
+      || (input.kind === 'image' && input.name !== undefined)) {
+      throw new TypeError('lark: outbound artifact upload input is invalid')
+    }
+    if (this.rest === undefined) throw new Error('lark: outbound artifact client is unavailable')
+    const data = input.kind === 'image'
+      ? { image_type: 'message', image: Buffer.from(input.data) }
+      : { file_type: 'stream', file_name: input.name, file: Buffer.from(input.data) }
+    const endpoint = input.kind === 'image'
+      ? '/open-apis/im/v1/images'
+      : '/open-apis/im/v1/files'
+    const response = await callQuiescentSignalBoundLarkApi(
+      'artifact.upload',
+      options.signal,
+      (signal) => this.rest!.request({
+        url: endpoint,
+        method: 'POST',
+        data,
+        headers: { 'Content-Type': 'multipart/form-data' },
+        maxRedirects: 0,
+        signal,
+        timeout: REST_REQUEST_TIMEOUT_MS,
+      }),
+    )
+    const nested = asRecord(response.data)
+    const key = input.kind === 'image'
+      ? nested.image_key ?? response.image_key
+      : nested.file_key ?? response.file_key
+    if (typeof key !== 'string' || !validResourceId(key)) {
+      throw new Error('lark: artifact.upload returned an invalid resource key')
+    }
+    const artifact = Object.freeze({ kind: input.kind })
+    this.uploadedArtifacts.set(artifact, { kind: input.kind, key })
+    return artifact
+  }
+
+  async sendArtifact(
+    chatId: string,
+    artifact: LarkUploadedArtifact,
+    options: LarkArtifactDeliveryOptions,
+  ): Promise<string> {
+    if (!validResourceId(chatId)
+      || (artifact.kind !== 'file' && artifact.kind !== 'image')
+      || !validResourceId(options.replyToMessageId)
+      || !ARTIFACT_IDEMPOTENCY_PATTERN.test(options.idempotencyKey)) {
+      throw new TypeError('lark: outbound artifact delivery input is invalid')
+    }
+    if (this.rest === undefined) throw new Error('lark: outbound artifact client is unavailable')
+    const staged = this.uploadedArtifacts.get(artifact)
+    if (staged === undefined || staged.kind !== artifact.kind || !validResourceId(staged.key)) {
+      throw new TypeError('lark: outbound artifact token is invalid or already consumed')
+    }
+    // Consume before the ambiguous external write so one process can never
+    // retry the same staged upload after an unknown reply outcome.
+    this.uploadedArtifacts.delete(artifact)
+    const content = artifact.kind === 'image'
+      ? JSON.stringify({ image_key: staged.key })
+      : JSON.stringify({ file_key: staged.key })
+    const response = asRecord(await callQuiescentSignalBoundLarkApi(
+      'artifact.reply',
+      options.signal,
+      (signal) => this.rest!.request({
+        url: `/open-apis/im/v1/messages/${encodeURIComponent(options.replyToMessageId)}/reply`,
+        method: 'POST',
+        data: {
+          msg_type: artifact.kind,
+          content,
+          uuid: options.idempotencyKey,
+          ...(options.replyInThread === true ? { reply_in_thread: true } : {}),
+        },
+        maxRedirects: 0,
+        signal,
+        timeout: REST_REQUEST_TIMEOUT_MS,
+      }),
+    ))
+    const messageId = asRecord(response.data).message_id
+    if (typeof messageId !== 'string' || !validResourceId(messageId)) {
+      throw new Error('lark: artifact.reply returned an invalid message id')
+    }
+    return messageId
   }
 
   private async prepareLoadingImage(rest: LarkRest): Promise<void> {

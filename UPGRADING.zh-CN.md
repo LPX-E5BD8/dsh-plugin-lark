@@ -47,6 +47,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.7` | 不新增持久化 schema 或图片字节；在模型/Session 路由前读取现有精确模型可见 surface 与精确 adapter modality 元数据，不兼容检查不会写 binding。 | v0.9.6 会读取相同 binding 与 Session 事件，但移除图片历史 guard。由其他 surface 写入的 image block 仍会保留，并可能再次进入纯文本路由；provider 应在此默认拒绝。 |
 | `0.9.8` | 不新增持久化 schema。优雅停机时会通过有界、感知 signal 的最终 PATCH 尝试终态化每一张已知的运行中执行卡，不追加 Session 结果，也不发送 partial 输出。 | v0.9.7 会读取相同状态，但进程内 turn authority 消失后，已经投递的运行卡可能仍保留失效的“停止执行”控件。回滚前必须优雅停止 v0.9.8，并把仍显示运行中的旧卡视为 stale。 |
 | `0.9.9` | 不新增插件自有 schema。显式开启后，图片会在 Harness 附件 backend 发布不可变对象；Session 事件只保存已验证的内容寻址引用与元数据。 | v0.9.8 在部署提供附件服务时仍能保留并读取相同的 Session image block，但新的 Lark 图片会回到不支持路径。回滚代码不会删除对象或 orphan；附件 backend 必须与 Session log 保持一致。 |
+| `0.9.10` | 不新增插件自有 schema。经审批的出站产物沿用现有 `tool/call`、approval audit 与 `tool/result` 事件；平台上传 key、目标、路径和字节绝不会进入插件 sidecar。 | v0.9.9 可读取相同 Session log，但不再注册发送工具。回滚无法撤回已投递平台消息或删除上传 orphan；开放中/未知工具调用遵循普通 rc.6 冷修复。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -63,7 +64,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.9'
+target_tag='v0.9.10'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -217,8 +218,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.9 回滚到 | 状态处理方式 |
+| 从 v0.9.10 回滚到 | 状态处理方式 |
 | --- | --- |
+| v0.9.9 | 使用相同 binding、附件存储、approval audit 与 Session 词汇，但移除出站产物工具。已经投递的消息和平台上传 orphan 仍是外部状态；不能根据回滚后的 `tool/result` 推断它们。 |
 | v0.9.8 | 使用相同 binding、Session log 与图片路由 guard，但不再下载新的 Lark 图片。已有 image block 仍要求其引用对象与支持图片的路由。任何对象或 orphan 都不会被删除；附件存储必须随快照保留。 |
 | v0.9.7 | 使用相同持久化状态与图片路由 guard，但移除普通运行中执行卡的优雅停机终态化。进程退出后仍显示“运行/停止执行”的卡片已经没有实时 Stop authority；重启后必须检查 Session，再按需重试。 |
 | v0.9.6 | 使用相同持久化状态，但移除图片感知的模型与 Session 路由检查。其他 Harness surface 已写入的 image block 仍保留；恢复普通 prompt 服务前，必须确认每条受影响会话使用支持图片的路由。 |
@@ -436,7 +438,7 @@ printf 'active root: %s\nrollback hold: %s\nrestore stage: %s\n' "$dsh_state_roo
 
 恢复后的 profile 必须在停机前记录的同一绝对路径找到 immutable 原 checkout，且 commit 必须精确匹配。不能把它指向另一个目录，也不能用 `plugin add` 替代。使用相同 rc.6 版本组启动精确旧插件。`/api/lark/health` 只存在于 v0.5.0 及更高版本；v0.1.0–v0.4.0 必须使用历史 `[ws] ws client ready` gate，再完成一条可丢弃的端到端回复与会话恢复检查，不能仅因 HTTP 404 就判定插件失败。事件关闭前应保留 `rollback_hold`、`restore_stage`、快照以及 old/target 两个 immutable checkout。
 
-恢复快照会把 transcript、被引用附件对象、回执、Workspace 注册/排序、项目/模型绑定和 mutation 历史全部倒退到快照时间；磁盘上的 Workspace、平台消息、provider 调用与其他外部副作用仍停留在当前时间。允许新 turn 前必须显式检查这种时间分裂。
+恢复快照会把 transcript、被引用附件对象、回执、Workspace 注册/排序、项目/模型绑定和 mutation 历史全部倒退到快照时间；磁盘上的 Workspace、出站产物上传/消息、其他平台消息、provider 调用与外部副作用仍停留在当前时间。允许新 turn 前必须显式检查这种时间分裂；不能仅因恢复后的工具结果缺失或未知就重新发送产物。
 
 ## 故障恢复
 
