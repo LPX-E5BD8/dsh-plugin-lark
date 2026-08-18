@@ -27,6 +27,8 @@ import ApprovalService from '@deepseek-ai/dsh-user-approval'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { LarkBridge } from '../src/bridge.ts'
+import { defaultConversationPolicy, DurableConversationPolicyStore } from '../src/conversation-policy.ts'
+import { DurableNotifyOutbox } from '../src/outbound-notify.ts'
 import { inject as larkInject } from '../src/index.ts'
 import { OUTBOUND_ARTIFACT_TOOL_NAME } from '../src/outbound-artifact.ts'
 import {
@@ -439,6 +441,7 @@ async function cleanupHarness(
   bridge: LarkBridge | undefined,
   deduplicator: DurableInboundDeduplicator | undefined,
   conversationBindings: DurableConversationBindingStore | undefined,
+  extraStores: readonly ({ close(): Promise<void> } | undefined)[] = [],
 ): Promise<unknown[]> {
   const failures: unknown[] = []
   if (bridge !== undefined) {
@@ -458,6 +461,14 @@ async function cleanupHarness(
   if (conversationBindings !== undefined) {
     try {
       await conversationBindings.close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  for (const store of extraStores) {
+    if (store === undefined) continue
+    try {
+      await store.close()
     } catch (error) {
       failures.push(error)
     }
@@ -513,11 +524,13 @@ async function mount(
   inboundTextFiles = false,
   inboundImages = false,
   outboundArtifacts = false,
+  proactiveDelivery = false,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
   client: HarnessClient
   workspaces: HarnessWorkspace[]
+  conversationPolicies?: DurableConversationPolicyStore
   remountAttachmentStore(): Promise<void>
   remountSessionPersistence(): Promise<void>
   dispose(): Promise<void>
@@ -526,6 +539,8 @@ async function mount(
   let bridge: LarkBridge | undefined
   let deduplicator: DurableInboundDeduplicator | undefined
   let conversationBindings: DurableConversationBindingStore | undefined
+  let notifyOutbox: DurableNotifyOutbox | undefined
+  let conversationPolicies: DurableConversationPolicyStore | undefined
   try {
     await ctx.plugin(Storage)
     await ctx.plugin(StorageJson, { root: join(root, 'inbound-dedup') })
@@ -602,6 +617,13 @@ async function mount(
       ctx.storageDomain,
       HARNESS_DEDUP_NAMESPACE,
     )
+    if (proactiveDelivery) {
+      notifyOutbox = await DurableNotifyOutbox.open(ctx.storageDomain, HARNESS_DEDUP_NAMESPACE)
+      conversationPolicies = await DurableConversationPolicyStore.open(
+        ctx.storageDomain,
+        HARNESS_DEDUP_NAMESPACE,
+      )
+    }
     const client = createClient()
     const bridgeReady = Promise.withResolvers<LarkBridge>()
     ctx.plugin({
@@ -623,6 +645,9 @@ async function mount(
           inboundTextFiles,
           inboundImages,
           outboundArtifacts,
+          proactiveDelivery,
+          notifyOutbox,
+          conversationPolicies,
           cwd: realWorkspaceCwd,
         })
         bridge = candidate
@@ -643,6 +668,7 @@ async function mount(
       bridge,
       client,
       workspaces,
+      conversationPolicies,
       async remountAttachmentStore() {
         await attachmentFiber.dispose()
         attachmentFiber = ctx.plugin(LocalAttachmentStore, attachmentConfig)
@@ -660,7 +686,7 @@ async function mount(
         disposal ??= (async () => {
           const failures = rootOwnedCleanup
             ? await cleanupRootOwnedHarness(ctx, deduplicator, conversationBindings)
-            : await cleanupHarness(ctx, bridge, deduplicator, conversationBindings)
+            : await cleanupHarness(ctx, bridge, deduplicator, conversationBindings, [notifyOutbox, conversationPolicies])
           if (failures.length > 0) {
             throw new AggregateError(failures, 'harness e2e cleanup failed')
           }
@@ -671,7 +697,7 @@ async function mount(
   } catch (error) {
     const failures = rootOwnedCleanup
       ? await cleanupRootOwnedHarness(ctx, deduplicator, conversationBindings)
-      : await cleanupHarness(ctx, bridge, deduplicator, conversationBindings)
+      : await cleanupHarness(ctx, bridge, deduplicator, conversationBindings, [notifyOutbox, conversationPolicies])
     if (failures.length > 0) {
       throw new AggregateError([error, ...failures], 'harness e2e mount and cleanup failed')
     }
@@ -905,6 +931,51 @@ test('harness e2e: /new materializes and resumes its session across restart', as
   assert.equal(second.ctx.agents.list()[0]?.id, freshSessionId)
   assert.equal(second.ctx.agents.list()[0]?.session.firstLiveSeq, 1)
   await second.dispose()
+})
+
+test('harness e2e: a conversation policy hides notify_lark from a reset generation', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-policy-tools-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const notifyArgs = { kind: 'completion', summary: 'Work finished.', idempotency_key: 'n_policy_1' }
+  const adapter = new ScriptedAdapter([
+    namedToolResponse('notify_lark', notifyArgs, 'notify-blocked'),
+    textResponse('narrowed run finished'),
+    namedToolResponse('notify_lark', { ...notifyArgs, idempotency_key: 'n_policy_2' }, 'notify-allowed'),
+    textResponse('open run finished'),
+  ])
+  const harness = await mount(
+    root, adapter, 'en-US', undefined, undefined, undefined, undefined,
+    'none', undefined, undefined, false, false, false, false, true,
+  )
+  t.after(() => harness.dispose())
+  const policies = harness.conversationPolicies
+  assert.ok(policies !== undefined)
+
+  // A reset opens a session id the conversation entry does not carry yet, so the
+  // policy has to bind to the conversation scope rather than to that id.
+  await policies.put('chat-a', { ...defaultConversationPolicy(), notify: false })
+  await harness.client.messageHandler?.(command('/new'))
+  const narrowedSessionId = harness.ctx.agents.list()[0]?.id
+  assert.ok(narrowedSessionId !== undefined)
+  assert.notEqual(narrowedSessionId, 'lark:chat-a')
+
+  await harness.client.messageHandler?.(command('report progress'))
+  await harness.ctx.agents.list()[0]?.whenIdle()
+  assert.match(
+    JSON.stringify(adapter.requests[1]?.messages),
+    /UNKNOWN_TOOL|unknown tool/iu,
+    'notify_lark stayed callable in a conversation whose policy disabled it',
+  )
+
+  await policies.put('chat-a', { ...defaultConversationPolicy(), notify: true })
+  await harness.client.messageHandler?.({ ...command('/new'), messageId: 'message-new-open' })
+  await harness.client.messageHandler?.(command('report progress again'))
+  await harness.ctx.agents.list()[0]?.whenIdle()
+  assert.doesNotMatch(
+    JSON.stringify(adapter.requests[3]?.messages),
+    /UNKNOWN_TOOL|unknown tool/iu,
+    'notify_lark was hidden even without a narrowing policy',
+  )
 })
 
 test('harness e2e: /model snapshots the same durable session and survives reset and restart', async (t) => {

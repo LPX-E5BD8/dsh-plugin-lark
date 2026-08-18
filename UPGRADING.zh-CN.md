@@ -51,6 +51,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.11` | 新增 `lark_notify` storage-domain 单元（`destinations` + `outbox`）。destination 行保存重启后投递所需的聊天/用户/消息 ID；outbox 行保存哈希键、类型、有界摘要、提及 token、重试/过期与终态。 | v0.9.10 会忽略该单元且不再注册 `notify_lark`。已投递的平台卡片仍会保留；未完成的 outbox 项在功能再次开启前不会被排空。回滚后不要重放已投递的幂等键。 |
 | `0.9.12` | 不新增 schema。notify drain worker 在每次排空后释放槽位，使后续受理或退避定时器可以再次发送；并关闭遗留 review thread：retirement maintenance 抛错时失败关闭，出站 `sent` 字段必填。 | v0.9.11 读取相同 `lark_notify` 单元，但第一次 drain 之后后续受理可能一直 pending。pending 行会保留；不要另造幂等键。 |
 | `0.9.13` | 不新增持久化 schema。运维 `/status` 与 `/diag` 是由 `operatorFrom` 门禁的进程内 Card 回复。 | v0.9.12 会忽略这些命令。无需 sidecar 迁移。 |
+| `0.9.14` | 新增 `lark_policy` storage-domain 单元（`policies`）。行以聊天或群的加盐哈希为键，只保存提及模式、工具/审批开关，以及有界的 Workspace、模型与加盐哈希用户名单。不保存明文 open ID、chat ID 或任何密钥。 | v0.9.13 会忽略该单元，不再应用会话级收窄，会话回到全局默认拒绝配置。不做任何迁移；再次升级后需要重新执行 `/policy`。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -67,7 +68,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.13'
+target_tag='v0.9.14'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -221,9 +222,10 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.13 回滚到 | 状态处理方式 |
+| 从 v0.9.14 回滚到 | 状态处理方式 |
 | --- | --- |
-| v0.9.12 | 相同持久化状态；`/status` 与 `/diag` 消失。 |
+| v0.9.13 | 保留 `lark_policy` 行但不再读取，所有会话回退到全局配置。原本被收窄的会话会放宽到全局门禁允许的范围；回滚前请重新确认 `allowFrom`、`operatorFrom`、`outboundArtifacts` 与 `proactiveDelivery`。 |
+| v0.9.12 | 与 v0.9.13 相同，且 `/status` 与 `/diag` 消失。 |
 | v0.9.11 | 使用相同 `lark_notify` 单元和工具，但第一次 drain 之后后续受理或退避重试可能一直 pending，直到重新挂载。 |
 | v0.9.10 | 使用相同 Session、binding 与产物工具，但忽略 `lark_notify` 且不注册 `notify_lark`。已经投递的通知卡片仍留在平台上；未完成的 outbox 行会一直保留到再次开启该功能。 |
 | v0.9.9 | 使用相同 binding、附件存储、approval audit 与 Session 词汇，但移除出站产物工具。已经投递的消息和平台上传 orphan 仍是外部状态；不能根据回滚后的 `tool/result` 推断它们。 |

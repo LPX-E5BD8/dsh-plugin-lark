@@ -601,6 +601,10 @@ test('quality: every Card 2.0 payload keeps platform element ids and column sets
       kind: 'diag',
       body: 'OK Bot REST identity is available.',
     }),
+    renderOperatorCard({
+      kind: 'policy',
+      body: 'Approvals: allowed\nExtra allowlist: 1 users',
+    }),
   ]
   const allowedColumnSetKeys = new Set([
     'columns',
