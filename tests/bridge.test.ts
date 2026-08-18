@@ -13,6 +13,7 @@ import type { ConversationBinding } from '../src/conversation-binding.ts'
 import { LARK_HEALTH_PATH } from '../src/health.ts'
 import type { WebServerLike } from '../src/health.ts'
 import { apply } from '../src/index.ts'
+import * as LarkPlugin from '../src/index.ts'
 import {
   LarkSdkClient,
   neutralizeTextMentions,
@@ -1193,6 +1194,80 @@ test('plugin construction failure releases its durable Lark domains', async (t) 
     assert.equal(ctx.storageDomain.get('lark_conversations'), undefined)
   } finally {
     await ctx.fiber.dispose()
+    if (previousAppId === undefined) delete process.env.DSH_LARK_APP_ID
+    else process.env.DSH_LARK_APP_ID = previousAppId
+    if (previousAppSecret === undefined) delete process.env.DSH_LARK_APP_SECRET
+    else process.env.DSH_LARK_APP_SECRET = previousAppSecret
+  }
+})
+
+test('the exported plugin entry is non-constructible and root disposal awaits its async teardown', async (t) => {
+  assert.equal(Object.hasOwn(apply, 'prototype'), false)
+  const previousAppId = process.env.DSH_LARK_APP_ID
+  const previousAppSecret = process.env.DSH_LARK_APP_SECRET
+  process.env.DSH_LARK_APP_ID = ['cli', '2'.repeat(16)].join('_')
+  process.env.DSH_LARK_APP_SECRET = 'test-only-secret'
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-root-disposer-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const ctx = new Context()
+  const clientPrototype = Lark.Client.prototype as unknown as {
+    request(options: unknown): Promise<unknown>
+  }
+  const wsPrototype = Lark.WSClient.prototype as unknown as {
+    start(options: unknown): Promise<void>
+    close(options?: unknown): void
+  }
+  const sdkPrototype = LarkSdkClient.prototype as unknown as {
+    prepareLoadingImage(rest: unknown): Promise<void>
+    stop(): Promise<void>
+  }
+  const request = clientPrototype.request
+  const wsStart = wsPrototype.start
+  const wsClose = wsPrototype.close
+  const prepareLoadingImage = sdkPrototype.prepareLoadingImage
+  const sdkStop = sdkPrototype.stop
+  let wsCloses = 0
+  let stopCompleted = false
+  clientPrototype.request = async () => ({ bot: { open_id: 'test-bot' } })
+  wsPrototype.start = async function startForRootDisposal() {
+    const client = this as unknown as { onReady?: () => void }
+    client.onReady?.()
+  }
+  wsPrototype.close = () => { wsCloses += 1 }
+  sdkPrototype.prepareLoadingImage = async () => {}
+  sdkPrototype.stop = async function delayedStop() {
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    await sdkStop.call(this)
+    stopCompleted = true
+  }
+  try {
+    await ctx.plugin(Storage)
+    await ctx.plugin(StorageJson, { root })
+    await ctx.plugin(StorageDomain, { backend: 'json' })
+    ctx.provide('agents', {} as never)
+    ctx.provide('sessions', {} as never)
+    ctx.provide('tools', {} as never)
+
+    const fiber = ctx.plugin(LarkPlugin as never, {})
+    await fiber.await()
+    const storageDomain = ctx.storageDomain
+    assert.ok(storageDomain.get('lark_inbound') !== undefined)
+    assert.ok(storageDomain.get('lark_conversations') !== undefined)
+
+    const startedAt = Date.now()
+    await ctx.fiber.dispose()
+    assert.ok(Date.now() - startedAt >= 35)
+    assert.equal(stopCompleted, true)
+    assert.equal(wsCloses, 1)
+    assert.equal(storageDomain.get('lark_inbound'), undefined)
+    assert.equal(storageDomain.get('lark_conversations'), undefined)
+  } finally {
+    await ctx.fiber.dispose()
+    clientPrototype.request = request
+    wsPrototype.start = wsStart
+    wsPrototype.close = wsClose
+    sdkPrototype.prepareLoadingImage = prepareLoadingImage
+    sdkPrototype.stop = sdkStop
     if (previousAppId === undefined) delete process.env.DSH_LARK_APP_ID
     else process.env.DSH_LARK_APP_ID = previousAppId
     if (previousAppSecret === undefined) delete process.env.DSH_LARK_APP_SECRET

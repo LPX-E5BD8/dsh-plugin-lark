@@ -94,7 +94,7 @@ async function openRuntimeStorage(ctx: Context, appId: string): Promise<{
   }
 }
 
-export function apply(ctx: Context, config: LarkConfig): Promise<() => Promise<void>> {
+export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<void>> => {
   const appId = firstNonEmpty(process.env.DSH_LARK_APP_ID)
   const appSecret = firstNonEmpty(
     process.env.DSH_LARK_APP_SECRET,

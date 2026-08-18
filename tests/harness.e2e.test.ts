@@ -356,6 +356,34 @@ async function cleanupHarness(
   return failures
 }
 
+async function cleanupRootOwnedHarness(
+  ctx: Context,
+  deduplicator: DurableInboundDeduplicator | undefined,
+  conversationBindings: DurableConversationBindingStore | undefined,
+): Promise<unknown[]> {
+  const failures: unknown[] = []
+  try {
+    await ctx.fiber.dispose()
+  } catch (error) {
+    failures.push(error)
+  }
+  if (deduplicator !== undefined) {
+    try {
+      await deduplicator.close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  if (conversationBindings !== undefined) {
+    try {
+      await conversationBindings.close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  return failures
+}
+
 async function mount(
   root: string,
   adapter?: LlmAdapter,
@@ -367,6 +395,7 @@ async function mount(
   sessionCompression: 'none' | 'zstd' = 'none',
   humanInputTimeoutMs?: number,
   humanInputCardCloseTimeoutMs?: number,
+  rootOwnedCleanup = false,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
@@ -469,6 +498,7 @@ async function mount(
           bridgeReady.reject(error)
           throw error
         }
+        if (rootOwnedCleanup) return () => candidate.stop()
       },
     })
     bridge = await bridgeReady.promise
@@ -480,7 +510,9 @@ async function mount(
       workspaces,
       dispose() {
         disposal ??= (async () => {
-          const failures = await cleanupHarness(ctx, bridge, deduplicator, conversationBindings)
+          const failures = rootOwnedCleanup
+            ? await cleanupRootOwnedHarness(ctx, deduplicator, conversationBindings)
+            : await cleanupHarness(ctx, bridge, deduplicator, conversationBindings)
           if (failures.length > 0) {
             throw new AggregateError(failures, 'harness e2e cleanup failed')
           }
@@ -489,7 +521,9 @@ async function mount(
       },
     }
   } catch (error) {
-    const failures = await cleanupHarness(ctx, bridge, deduplicator, conversationBindings)
+    const failures = rootOwnedCleanup
+      ? await cleanupRootOwnedHarness(ctx, deduplicator, conversationBindings)
+      : await cleanupHarness(ctx, bridge, deduplicator, conversationBindings)
     if (failures.length > 0) {
       throw new AggregateError([error, ...failures], 'harness e2e mount and cleanup failed')
     }
@@ -1743,6 +1777,154 @@ test('harness e2e: shutdown bounds and drains a terminal Card patch that never s
   await harness.dispose()
   assert.equal(terminalSignal?.aborted, true)
   assert.equal(harness.client.stopped, true)
+})
+
+test('harness e2e: root-fiber disposal registers and drains the terminal Card before stopping REST', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-root-dispose-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+  ])
+  const harness = await mount(
+    root,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'none',
+    undefined,
+    undefined,
+    true,
+  )
+  await harness.client.messageHandler?.(command('ask during root disposal'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const patchEntered = Promise.withResolvers<void>()
+  const releasePatch = Promise.withResolvers<void>()
+  const originalUpdateCard = harness.client.updateCard?.bind(harness.client)
+  assert.ok(originalUpdateCard !== undefined)
+  harness.client.updateCard = async (messageId, card, options) => {
+    if (messageId === questionCard.messageId) {
+      options?.signal?.throwIfAborted()
+      patchEntered.resolve()
+      await releasePatch.promise
+    }
+    return originalUpdateCard(messageId, card, options)
+  }
+
+  let disposed = false
+  const disposing = harness.dispose().then(() => { disposed = true })
+  await patchEntered.promise
+  assert.equal(disposed, false)
+  assert.equal(harness.client.stopped, false)
+  releasePatch.resolve()
+  await disposing
+
+  assert.equal(harness.client.stopped, true)
+  const terminal = harness.client.updated.findLast(({ messageId }) => messageId === questionCard.messageId)?.card
+  assert.match(JSON.stringify(terminal), /cancelled/u)
+})
+
+test('harness e2e: root-fiber disposal shortens a stalled Card close below the host grace budget', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-root-deadline-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+  ])
+  const harness = await mount(
+    root,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'none',
+    undefined,
+    undefined,
+    true,
+  )
+  await harness.client.messageHandler?.(command('ask during bounded root disposal'))
+  await waitFor(() => harness.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = harness.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  const originalUpdateCard = harness.client.updateCard?.bind(harness.client)
+  assert.ok(originalUpdateCard !== undefined)
+  let closeSignal: AbortSignal | undefined
+  harness.client.updateCard = (messageId, card, options) => {
+    if (messageId !== questionCard.messageId) return originalUpdateCard(messageId, card, options)
+    closeSignal = options?.signal
+    return new Promise((_resolve, reject) => {
+      if (closeSignal?.aborted === true) {
+        reject(closeSignal.reason)
+        return
+      }
+      closeSignal?.addEventListener('abort', () => reject(closeSignal?.reason), { once: true })
+    })
+  }
+
+  const startedAt = Date.now()
+  await harness.dispose()
+  const elapsed = Date.now() - startedAt
+
+  assert.equal(closeSignal?.aborted, true)
+  assert.ok(elapsed >= 1_500, `shutdown deadline fired too early: ${elapsed}ms`)
+  assert.ok(elapsed < 4_000, `shutdown exceeded the host grace budget: ${elapsed}ms`)
+  assert.equal(harness.client.stopped, true)
+})
+
+test('harness e2e: a root-disposed pending question cold-repairs and the Session continues', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-human-input-root-repair-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const first = await mount(
+    root,
+    new ScriptedAdapter([
+      askUserToolResponse([{ id: 'choice', question: 'Choose.', options: [{ label: 'A' }, { label: 'B' }] }]),
+    ]),
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'none',
+    undefined,
+    undefined,
+    true,
+  )
+  await first.client.messageHandler?.(command('ask before root repair'))
+  await waitFor(() => first.client.cards.some((entry) => isHumanInputCard(entry.card)))
+  const questionCard = first.client.cards.find((entry) => isHumanInputCard(entry.card))
+  assert.ok(questionCard !== undefined)
+  await first.dispose()
+  const terminal = first.client.updated.findLast(({ messageId }) => messageId === questionCard.messageId)?.card
+  assert.match(JSON.stringify(terminal), /cancelled/u)
+
+  const adapter = new ScriptedAdapter([textResponse('continued after root repair')])
+  const second = await mount(root, adapter, 'en-US')
+  t.after(() => second.dispose())
+  await second.client.messageHandler?.(command('/help'))
+  const agent = second.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  const repaired = JSON.stringify(agent.session.events)
+  assert.match(repaired, /TOOL_OUTCOME_UNKNOWN|LARK_HUMAN_INPUT_CANCELLED/u)
+  const stale = await second.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-a',
+    messageId: questionCard.messageId,
+    value: {},
+    tag: 'button',
+    name: 'human_input_submit',
+    formValue: { q0: 'q0_o0' },
+  })
+  assert.equal(stale?.toast.type, 'info')
+
+  await second.client.messageHandler?.(conversationCommand('chat-a', 'continue after root repair'))
+  await agent.whenIdle()
+  assert.equal(adapter.requests.length, 1)
+  assert.match(JSON.stringify(second.client.updated), /continued after root repair/u)
 })
 
 test('harness e2e: an external followup cannot steal a queued Lark reply route', async (t) => {
