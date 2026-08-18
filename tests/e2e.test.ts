@@ -215,6 +215,7 @@ function createHost(persistence?: TestPersistence) {
           agent: {
             session: {
               id: sessionId,
+              events: [],
               requestContext: () => runtimePersistence.contextWindow === undefined
                 ? undefined
                 : { provider: 'provider', model: 'model', contextWindow: runtimePersistence.contextWindow },

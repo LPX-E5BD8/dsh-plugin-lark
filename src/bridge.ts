@@ -6,8 +6,8 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, LlmCallConfig, TokenUsage } from '@deepseek-ai/dsh-llm'
+import { contentHasImage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, LlmCallConfig, TokenUsage, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import { foldRequestHeader, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
@@ -66,6 +66,12 @@ import type {
 import { LarkResourceError } from './lark.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
+import {
+  eventLogHasModelVisibleImage,
+  eventLogMayContainImage,
+  eventLogRequiresImageRouteRecovery,
+  sessionHasModelVisibleImage,
+} from './session-media.ts'
 
 export interface LarkBridgeOptions {
   locale?: LarkLocale
@@ -116,8 +122,8 @@ interface SessionPersistenceLike {
     agentPreset?: string
   }>>
   inspect?(id: ReturnType<typeof SessionId>, signal?: AbortSignal): Promise<{
-    readonly meta: { readonly agentPreset?: string }
-    readonly events: ReadonlyArray<{ readonly type: string; readonly data: unknown }>
+    readonly meta: SessionHeader
+    readonly events: readonly SessionEvent[]
   }>
 }
 
@@ -173,6 +179,7 @@ interface LlmRuntimeLike {
   listProviders(): LlmProviderInfoLike[]
   listModels(provider: string): Promise<LlmModelInfoLike[]>
   resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<LlmCallConfig>
+  resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<unknown>
 }
 
 interface ListedModel {
@@ -251,7 +258,7 @@ type SessionSwitchCommandResult = {
   readonly kind: 'resumed' | 'already-current'
   readonly candidate: ConversationSessionCandidate
 } | {
-  readonly kind: 'busy' | 'history-failed' | 'unavailable' | 'unknown' | 'failed'
+  readonly kind: 'busy' | 'history-failed' | 'image-unavailable' | 'image-unsupported' | 'unavailable' | 'unknown' | 'failed'
 }
 
 type SessionSwitchMaintenanceResult = {
@@ -260,7 +267,7 @@ type SessionSwitchMaintenanceResult = {
   readonly previousSessionId: string
   readonly previousHandle: AgentHandle
 } | {
-  readonly kind: 'busy' | 'history-failed' | 'unavailable' | 'unknown' | 'failed'
+  readonly kind: 'busy' | 'history-failed' | 'image-unavailable' | 'image-unsupported' | 'unavailable' | 'unknown' | 'failed'
 }
 
 type SessionCandidateCommitResult = {
@@ -268,7 +275,7 @@ type SessionCandidateCommitResult = {
   readonly candidate: ConversationSessionCandidate
   readonly workspace: RegisteredWorkspace
 } | {
-  readonly kind: 'busy' | 'unavailable' | 'unknown' | 'failed'
+  readonly kind: 'busy' | 'image-unavailable' | 'image-unsupported' | 'unavailable' | 'unknown' | 'failed'
 }
 
 interface ProjectSelection {
@@ -317,7 +324,53 @@ type ProjectSwitchMaintenanceResult = {
 
 type CurrentProjectMutationResult = 'recorded' | 'busy' | 'failed'
 
-type ModelSwitchMaintenanceResult = 'committed' | 'already-current' | 'busy' | 'unavailable' | 'failed'
+type ModelSwitchMaintenanceResult =
+  | 'committed'
+  | 'already-current'
+  | 'busy'
+  | 'image-unavailable'
+  | 'image-unsupported'
+  | 'unavailable'
+  | 'failed'
+
+type ImageRouteCompatibility =
+  | 'not-required'
+  | 'compatible'
+  | 'image-unsupported'
+  | 'stale'
+  | 'unavailable'
+
+type ReplayedModelWakeResult =
+  | 'recovered'
+  | 'not-applicable'
+  | 'busy'
+  | 'unavailable'
+  | 'wake-failed'
+
+type ReplayedModelWakePreflight = 'required' | 'not-applicable' | 'unavailable'
+
+interface ImageSurfaceSnapshot {
+  readonly seq: number
+  readonly replaceGeneration: number
+  readonly hasImage: boolean
+}
+
+interface ImageSurfaceCacheEntry {
+  readonly replaceGeneration: number
+  readonly messageCount: number
+  readonly hasImage: boolean
+}
+
+interface InboxSnapshotEntry {
+  readonly target: 'step' | 'turn'
+  readonly message: UserMessage
+}
+
+interface ImageRouteSnapshot {
+  readonly surface: ImageSurfaceSnapshot
+  readonly inbox: readonly InboxSnapshotEntry[]
+  readonly hasImage: boolean
+}
 
 type ResetMaintenanceResult = {
   readonly kind: 'committed'
@@ -490,6 +543,13 @@ class InboundResourceInterruptedError extends Error {
   constructor(cause?: unknown) {
     super('lark: inbound resource handling was interrupted by shutdown', { cause })
     this.name = 'InboundResourceInterruptedError'
+  }
+}
+
+class ModelWakeAfterCommitError extends Error {
+  constructor() {
+    super('lark: committed image-route recovery could not wake pending inbox')
+    this.name = 'ModelWakeAfterCommitError'
   }
 }
 
@@ -795,6 +855,14 @@ function sameModelSelection(
   return left?.provider === right?.provider && left?.model === right?.model
 }
 
+function modelSelectionRefMatches(
+  ref: ModelSelectionRef,
+  selection: ConversationModelSelection,
+): boolean {
+  return ref.current?.provider === selection.provider
+    && ref.current.model === selection.model
+}
+
 function validModelIdentifier(value: string, maxLength: number): boolean {
   return value !== ''
     && value.length <= maxLength
@@ -1013,7 +1081,8 @@ function llmRuntimeOf(ctx: Context): LlmRuntimeLike | undefined {
   const candidate = service as Partial<LlmRuntimeLike>
   if (typeof candidate.listProviders !== 'function'
     || typeof candidate.listModels !== 'function'
-    || typeof candidate.resolveCallConfig !== 'function') {
+    || typeof candidate.resolveCallConfig !== 'function'
+    || (candidate.resolveModelInfo !== undefined && typeof candidate.resolveModelInfo !== 'function')) {
     throw new TypeError('lark: llm service is invalid')
   }
   return candidate as LlmRuntimeLike
@@ -1240,6 +1309,7 @@ export class LarkBridge {
   private readonly conversationIdleWatchers = new Map<string, Promise<void>>()
   private readonly handles = new Map<string, Promise<AgentHandle>>()
   private readonly modelSelections = new WeakMap<Agent, ModelSelectionRef>()
+  private readonly imageSurfaceCache = new WeakMap<Session, ImageSurfaceCacheEntry>()
   private readonly handleRetirements = new Set<Promise<void>>()
   private readonly messageRoutes = new Map<string, PendingMessageRoute>()
   private readonly turnStarts = new Map<string, Map<number, number>>()
@@ -1631,6 +1701,7 @@ export class LarkBridge {
   ): Promise<void> {
     await this.withConversation(route.sessionBaseId, async (conversation) => {
       await this.sessionOperations.get(conversation.baseId)
+      if (!await this.ensureImageRouteInput(conversation, route)) return
       this.prepareWorkspaceAttachment(conversation)
       const message = createUserMessage({
         content,
@@ -1646,6 +1717,44 @@ export class LarkBridge {
         throw error
       }
     })
+  }
+
+  private async imageRouteBlockCopy(
+    conversation: ConversationSession,
+  ): Promise<string | undefined> {
+    const compatibility = await this.imageRouteCompatibility(
+      conversation.handle.agent,
+      conversation.modelSelection,
+      this.commandAbort.signal,
+    )
+    if (compatibility === 'not-required') return undefined
+    if (compatibility === 'compatible') {
+      return modelSelectionRefMatches(conversation.modelSelectionRef, conversation.modelSelection)
+        ? undefined
+        : this.text.imageHistoryUnavailable
+    }
+    if (compatibility === 'image-unsupported') return this.text.imageHistoryModelUnsupported
+    return compatibility === 'stale'
+      ? this.text.imageHistoryBusy
+      : this.text.imageHistoryUnavailable
+  }
+
+  private async ensureImageRouteInput(
+    conversation: ConversationSession,
+    route: MessageRoute,
+  ): Promise<boolean> {
+    const copy = await this.imageRouteBlockCopy(conversation)
+    if (copy === undefined) return true
+    await this.sendImageRouteNotice(route, copy)
+    return false
+  }
+
+  private async sendImageRouteNotice(route: MessageRoute, text: string): Promise<void> {
+    try {
+      await this.client.sendText(route.chatId, text, routeDeliveryOptions(route))
+    } catch {
+      throw new Error('lark: image-history compatibility notice delivery failed')
+    }
   }
 
   async handleCardAction(action: LarkCardAction): Promise<LarkCardActionResult> {
@@ -2337,9 +2446,13 @@ export class LarkBridge {
       case '/help':
         await this.enqueueConversationOperation(route.sessionBaseId, () => (
           this.withConversation(route.sessionBaseId, async (conversation) => {
+            const block = await this.imageRouteBlockCopy(conversation)
+            const help = block === undefined
+              ? this.commandHelp(conversation.handle.agent)
+              : `${this.text.help}\n\n${block}`
             await this.safeSend(
               route.chatId,
-              this.commandHelp(conversation.handle.agent),
+              help,
               routeDeliveryOptions(route),
             )
           })
@@ -3677,7 +3790,17 @@ export class LarkBridge {
               || !sameSessionSourceHeader(authorized.sourceHeader, handle.agent.session.header)) {
               return { kind: 'unknown' }
             }
+            const compatibility = await this.imageRouteCompatibility(
+              handle.agent,
+              modelSelection,
+              candidateSignal,
+            )
+            if (compatibility === 'image-unsupported') return { kind: compatibility }
+            if (compatibility === 'unavailable') return { kind: 'image-unavailable' }
+            if (compatibility === 'compatible'
+              && !modelSelectionRefMatches(modelSelectionRef, modelSelection)) return { kind: 'busy' }
             if (candidateSignal.aborted
+              || compatibility === 'stale'
               || handle.agent.inbox.hasPending
               || signal.aborted
               || previousHandle.agent.inbox.hasPending
@@ -3770,6 +3893,12 @@ export class LarkBridge {
         return
       case 'history-failed':
         await this.safeSend(route.chatId, this.text.sessionHistoryCheckpointFailed, options)
+        return
+      case 'image-unsupported':
+        await this.safeSend(route.chatId, this.text.sessionImageHistoryUnsupported, options)
+        return
+      case 'image-unavailable':
+        await this.safeSend(route.chatId, this.text.imageHistoryUnavailable, options)
         return
       case 'unknown':
         await this.safeSend(route.chatId, this.text.sessionUnknown, options)
@@ -3899,9 +4028,36 @@ export class LarkBridge {
         await this.safeSend(route.chatId, this.text.modelSwitchFailed, deliveryOptions)
         return
       }
+      const replayBinding = route.mutationHash === undefined
+        ? undefined
+        : store.read(route.sessionBaseId)
       if (route.mutationHash !== undefined
-        && store.read(route.sessionBaseId)?.mutationHashes.includes(route.mutationHash)) {
-        await this.safeSend(route.chatId, this.text.modelMutationReplayed, deliveryOptions)
+        && replayBinding?.mutationHashes.includes(route.mutationHash)) {
+        if (!sameModelSelection(replayBinding.modelSelection, requested)
+          || replayBinding.mutationHashes.at(-1) !== route.mutationHash) {
+          await this.safeSend(route.chatId, this.text.modelMutationReplayed, deliveryOptions)
+          return
+        }
+        const preflight = await this.replayedModelWakePreflight(
+          route.sessionBaseId,
+          replayBinding,
+        )
+        if (preflight === 'not-applicable') {
+          await this.safeSend(route.chatId, this.text.modelMutationReplayed, deliveryOptions)
+          return
+        }
+        if (preflight === 'unavailable') {
+          await this.safeSend(route.chatId, this.text.imageHistoryUnavailable, deliveryOptions)
+          return
+        }
+        const recovery = await this.recoverReplayedModelWake(route.sessionBaseId, requested)
+        if (recovery === 'wake-failed') throw new ModelWakeAfterCommitError()
+        const reply = recovery === 'busy'
+          ? this.text.modelBusy
+          : recovery === 'unavailable'
+            ? this.text.imageHistoryUnavailable
+            : this.text.modelMutationReplayed
+        await this.safeSend(route.chatId, reply, deliveryOptions)
         return
       }
 
@@ -3942,6 +4098,285 @@ export class LarkBridge {
     return selection
   }
 
+  private imageSurfaceSnapshot(session: Session): ImageSurfaceSnapshot {
+    const candidate = session as unknown as {
+      readonly deriveMessages?: unknown
+      readonly events?: unknown
+      readonly seq?: unknown
+      readonly surface?: { readonly replaceGeneration?: unknown }
+    }
+    if (typeof candidate.deriveMessages !== 'function') {
+      if (!Array.isArray(candidate.events)) {
+        throw new TypeError('lark: Session image surface is unavailable')
+      }
+      const events = candidate.events
+      const hasImage = eventLogMayContainImage(events)
+        ? eventLogHasModelVisibleImage(events as readonly SessionEvent[])
+        : false
+      return { seq: events.length, replaceGeneration: 0, hasImage }
+    }
+    const initialGeneration = candidate.surface?.replaceGeneration
+    if (typeof initialGeneration !== 'number'
+      || !Number.isSafeInteger(initialGeneration)
+      || initialGeneration < 0) {
+      throw new TypeError('lark: Session image surface metadata is invalid')
+    }
+    const cached = this.imageSurfaceCache.get(session)
+    const messages = session.deriveMessages()
+    const incremental = cached !== undefined
+      && cached.replaceGeneration === initialGeneration
+      && cached.messageCount <= messages.length
+    const hasImage = incremental
+      ? cached.hasImage || messages.slice(cached.messageCount).some((message) => (
+          contentHasImage(message.content)
+        ))
+      : sessionHasModelVisibleImage(session)
+    const seq = candidate.seq
+    const replaceGeneration = candidate.surface?.replaceGeneration
+    if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0
+      || typeof replaceGeneration !== 'number'
+      || !Number.isSafeInteger(replaceGeneration)
+      || replaceGeneration < 0
+      || replaceGeneration !== initialGeneration) {
+      throw new TypeError('lark: Session image surface changed during inspection')
+    }
+    this.imageSurfaceCache.set(session, {
+      replaceGeneration,
+      messageCount: messages.length,
+      hasImage,
+    })
+    return {
+      seq,
+      replaceGeneration,
+      hasImage,
+    }
+  }
+
+  private sameImageSurfaceSnapshot(
+    left: ImageSurfaceSnapshot,
+    right: ImageSurfaceSnapshot,
+  ): boolean {
+    return left.seq === right.seq
+      && left.replaceGeneration === right.replaceGeneration
+      && left.hasImage === right.hasImage
+  }
+
+  private async imageRouteCompatibility(
+    agent: Agent,
+    selection: ConversationModelSelection,
+    signal: AbortSignal,
+  ): Promise<ImageRouteCompatibility> {
+    let before: ImageRouteSnapshot
+    try {
+      before = this.imageRouteSnapshot(agent)
+    } catch {
+      return 'unavailable'
+    }
+    if (!before.hasImage) return 'not-required'
+    if (signal.aborted) return 'stale'
+    let runtime: LlmRuntimeLike | undefined
+    try {
+      runtime = llmRuntimeOf(this.ctx)
+    } catch {
+      return 'unavailable'
+    }
+    const resolve = runtime?.resolveModelInfo
+    if (runtime === undefined || typeof resolve !== 'function') return 'unavailable'
+    let info: unknown
+    try {
+      info = await resolve.call(runtime, selection.provider, selection.model, signal)
+    } catch {
+      return signal.aborted ? 'stale' : 'unavailable'
+    }
+    if (signal.aborted) return 'stale'
+    let after: ImageRouteSnapshot
+    try {
+      after = this.imageRouteSnapshot(agent)
+    } catch {
+      return 'unavailable'
+    }
+    if (!this.sameImageRouteSnapshot(before, after)) return 'stale'
+    if (info === null || typeof info !== 'object' || Array.isArray(info)) return 'unavailable'
+    const record = info as {
+      readonly provider?: unknown
+      readonly id?: unknown
+      readonly inputModalities?: unknown
+    }
+    if (record.provider !== selection.provider || record.id !== selection.model) return 'unavailable'
+    const modalities = record.inputModalities
+    if (modalities === undefined) return 'image-unsupported'
+    if (!Array.isArray(modalities)
+      || !modalities.every((modality) => typeof modality === 'string')) return 'unavailable'
+    return modalities.includes('image') ? 'compatible' : 'image-unsupported'
+  }
+
+  private inboxSnapshot(agent: Agent): readonly InboxSnapshotEntry[] {
+    const inbox = agent.inbox as unknown as {
+      readonly hasPending?: unknown
+      readonly nextStep?: unknown
+      readonly nextTurn?: unknown
+    }
+    if (!Array.isArray(inbox.nextStep) || !Array.isArray(inbox.nextTurn)) {
+      if (inbox.hasPending === false) return []
+      throw new TypeError('lark: Agent inbox projection is unavailable')
+    }
+    return [
+      ...(inbox.nextStep as readonly UserMessage[])
+        .map((message) => ({ target: 'step' as const, message })),
+      ...(inbox.nextTurn as readonly UserMessage[])
+        .map((message) => ({ target: 'turn' as const, message })),
+    ]
+  }
+
+  private sameInboxSnapshot(
+    left: readonly InboxSnapshotEntry[],
+    right: readonly InboxSnapshotEntry[],
+  ): boolean {
+    return left.length === right.length
+      && left.every((entry, index) => entry.target === right[index]?.target
+        && entry.message === right[index]?.message)
+  }
+
+  private inboxSnapshotHasImage(snapshot: readonly InboxSnapshotEntry[]): boolean {
+    return snapshot.some(({ message }) => contentHasImage(message.content))
+  }
+
+  private imageRouteSnapshot(agent: Agent): ImageRouteSnapshot {
+    const surface = this.imageSurfaceSnapshot(agent.session)
+    const inbox = this.inboxSnapshot(agent)
+    return {
+      surface,
+      inbox,
+      hasImage: surface.hasImage || this.inboxSnapshotHasImage(inbox),
+    }
+  }
+
+  private sameImageRouteSnapshot(
+    left: ImageRouteSnapshot,
+    right: ImageRouteSnapshot,
+  ): boolean {
+    return this.sameImageSurfaceSnapshot(left.surface, right.surface)
+      && this.sameInboxSnapshot(left.inbox, right.inbox)
+  }
+
+  private wakePendingInbox(agent: Agent): void {
+    if (!agent.inbox.hasPending) return
+    const wake = createUserMessage({
+      content: [{
+        type: 'text',
+        text: 'Resume pending work after an image-route recovery.',
+      }],
+      source: {
+        kind: 'plugin',
+        plugin: 'lark',
+        form: 'notice',
+        summary: 'Image-route recovery wake latch.',
+      },
+    })
+    agent.send(wake, 'next-step', true)
+    if (!agent.inbox.remove(wake.id)) {
+      throw new Error('lark: pending inbox wake could not remove its transient latch')
+    }
+  }
+
+  private async replayedModelWakePreflight(
+    baseId: string,
+    binding: ConversationBinding,
+  ): Promise<ReplayedModelWakePreflight> {
+    await this.sessionOperations.get(baseId)
+    const sessionId = String(boundSessionId(baseId, binding))
+    const live = this.conversations.get(baseId)
+    if (live !== undefined) {
+      if (live.sessionId !== sessionId
+        || !sameModelSelection(live.modelSelection, binding.modelSelection)) return 'unavailable'
+      try {
+        const snapshot = this.imageRouteSnapshot(live.handle.agent)
+        return live.handle.agent.inbox.hasPending && snapshot.hasImage
+          ? 'required'
+          : 'not-applicable'
+      } catch {
+        return 'unavailable'
+      }
+    }
+
+    let persistence: SessionPersistenceLike | undefined
+    try {
+      persistence = sessionPersistenceOf(this.ctx)
+    } catch {
+      return 'unavailable'
+    }
+    if (persistence?.inspect === undefined) return 'unavailable'
+    try {
+      const inspected = await persistence.inspect(SessionId(sessionId), this.commandAbort.signal)
+      if (String(inspected.meta.id) !== sessionId) return 'unavailable'
+      const seedLength = inspected.meta.seedLength ?? 0
+      return eventLogRequiresImageRouteRecovery(inspected.events, seedLength)
+        ? 'required'
+        : 'not-applicable'
+    } catch {
+      return 'unavailable'
+    }
+  }
+
+  private async recoverReplayedModelWake(
+    baseId: string,
+    requested: ConversationModelSelection,
+  ): Promise<ReplayedModelWakeResult> {
+    return this.withConversation(baseId, async (conversation) => {
+      await this.sessionOperations.get(conversation.baseId)
+      const handle = conversation.handle
+      const agent = handle.agent
+      if (!sameModelSelection(conversation.modelSelection, requested)
+        || !agent.inbox.hasPending) return 'not-applicable'
+      let maintenance: Promise<ReplayedModelWakeResult>
+      try {
+        maintenance = agent.runMaintenance(async (signal) => {
+          if (signal.aborted
+            || conversation.handle !== handle
+            || conversation.sessionId !== String(agent.id)
+            || !agent.inbox.hasPending) return 'busy'
+          let snapshot: ImageRouteSnapshot
+          try {
+            snapshot = this.imageRouteSnapshot(agent)
+          } catch {
+            return 'unavailable'
+          }
+          if (!snapshot.hasImage) return 'not-applicable'
+          const inbox = snapshot.inbox
+          const compatibility = await this.imageRouteCompatibility(
+            agent,
+            requested,
+            signal,
+          )
+          if (compatibility === 'image-unsupported' || compatibility === 'unavailable') {
+            return 'unavailable'
+          }
+          if (compatibility === 'stale'
+            || compatibility === 'not-required'
+            || signal.aborted
+            || conversation.handle !== handle
+            || conversation.sessionId !== String(agent.id)
+            || !sameModelSelection(conversation.modelSelection, requested)
+            || !modelSelectionRefMatches(conversation.modelSelectionRef, requested)
+            || !this.sameInboxSnapshot(this.inboxSnapshot(agent), inbox)) return 'busy'
+          try {
+            this.wakePendingInbox(agent)
+          } catch {
+            return 'wake-failed'
+          }
+          return 'recovered'
+        })
+      } catch {
+        return 'busy'
+      }
+      try {
+        return await maintenance
+      } catch {
+        return 'unavailable'
+      }
+    })
+  }
+
   private async switchModel(
     route: MessageRoute,
     conversation: ConversationSession,
@@ -3955,14 +4390,46 @@ export class LarkBridge {
     let maintenance: Promise<ModelSwitchMaintenanceResult>
     try {
       maintenance = previousHandle.agent.runMaintenance(async (signal) => {
-        if (signal.aborted || previousHandle.agent.inbox.hasPending) return 'busy'
+        if (signal.aborted
+          || conversation.handle !== previousHandle
+          || conversation.sessionId !== previousSessionId) return 'busy'
         try {
+          let pendingRecovery: readonly InboxSnapshotEntry[] | undefined
+          if (previousHandle.agent.inbox.hasPending) {
+            let snapshot: ImageRouteSnapshot
+            try {
+              snapshot = this.imageRouteSnapshot(previousHandle.agent)
+            } catch {
+              return 'image-unavailable'
+            }
+            if (!snapshot.hasImage) return 'busy'
+            pendingRecovery = snapshot.inbox
+          }
+          const inboxUnchanged = (): boolean => pendingRecovery === undefined
+            ? !previousHandle.agent.inbox.hasPending
+            : this.sameInboxSnapshot(this.inboxSnapshot(previousHandle.agent), pendingRecovery)
           this.materializeFreshHandle(previousHandle)
           const durable = await this.ctx.sessions.flush(previousHandle.agent.session)
           if (durable !== true) return 'failed'
           const revalidated = await this.resolveModelSelection(llm, selected, signal)
           if (!sameModelSelection(revalidated, selected)) return 'unavailable'
-          if (signal.aborted || previousHandle.agent.inbox.hasPending) return 'busy'
+          const compatibility = await this.imageRouteCompatibility(
+            previousHandle.agent,
+            selected,
+            signal,
+          )
+          if (compatibility === 'image-unsupported') return compatibility
+          if (compatibility === 'unavailable') return 'image-unavailable'
+          if (compatibility === 'compatible'
+            && !modelSelectionRefMatches(
+              conversation.modelSelectionRef,
+              conversation.modelSelection,
+            )) return 'busy'
+          if (compatibility === 'stale'
+            || signal.aborted
+            || !inboxUnchanged()
+            || conversation.handle !== previousHandle
+            || conversation.sessionId !== previousSessionId) return 'busy'
           await this.putConversationBinding(
             conversation.baseId,
             this.modelConversationBinding(
@@ -3977,9 +4444,17 @@ export class LarkBridge {
             provider: selected.provider,
             model: selected.model,
           }
+          if (pendingRecovery !== undefined) {
+            try {
+              this.wakePendingInbox(previousHandle.agent)
+            } catch {
+              throw new ModelWakeAfterCommitError()
+            }
+          }
           return alreadyCurrent ? 'already-current' : 'committed'
         } catch (error) {
-          if (error instanceof BindingConfirmationInterruptedError) throw error
+          if (error instanceof BindingConfirmationInterruptedError
+            || error instanceof ModelWakeAfterCommitError) throw error
           this.ctx.logger.warn('[lark] model switch checkpoint failed (%s)', modelFailureTag(error))
           return 'failed'
         }
@@ -3993,7 +4468,8 @@ export class LarkBridge {
     try {
       result = await maintenance
     } catch (error) {
-      if (error instanceof BindingConfirmationInterruptedError) throw error
+      if (error instanceof BindingConfirmationInterruptedError
+        || error instanceof ModelWakeAfterCommitError) throw error
       this.ctx.logger.warn('[lark] model switch maintenance failed (%s)', modelFailureTag(error))
       await this.safeSend(route.chatId, this.text.modelSwitchFailed, deliveryOptions)
       return
@@ -4004,6 +4480,14 @@ export class LarkBridge {
     }
     if (result === 'unavailable') {
       await this.safeSend(route.chatId, this.text.modelUnknown, deliveryOptions)
+      return
+    }
+    if (result === 'image-unsupported') {
+      await this.safeSend(route.chatId, this.text.modelImageHistoryUnsupported, deliveryOptions)
+      return
+    }
+    if (result === 'image-unavailable') {
+      await this.safeSend(route.chatId, this.text.imageHistoryUnavailable, deliveryOptions)
       return
     }
     if (result === 'failed') {
@@ -4063,6 +4547,7 @@ export class LarkBridge {
       await this.safeSend(route.chatId, this.text.unknownCommand(command), deliveryOptions)
       return
     }
+    if (!await this.ensureImageRouteInput(conversation, route)) return
     const runtime = this.commandRuntime()
     if (runtime === undefined) {
       await this.safeSend(route.chatId, this.text.unknownCommand(command), deliveryOptions)

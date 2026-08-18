@@ -9,7 +9,7 @@ import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import CodeRuntime from '@deepseek-ai/dsh-code-runtime'
 import type { CodeRunRequest, CodeRunResult } from '@deepseek-ai/dsh-code-runtime'
 import LlmRuntime, { CallId, createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, ImageBlock, ModelModality, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import * as SessionCheckpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -141,6 +141,49 @@ class ScriptedAdapter extends LlmAdapter {
     yield* response
   }
 }
+
+class ModalScriptedAdapter extends ScriptedAdapter {
+  private readonly modelModalities = new Map<string, readonly ModelModality[]>()
+  private readonly modelErrors = new Map<string, Error>()
+
+  constructor(
+    responses: StreamChunk[][],
+    public inputModalities: readonly ModelModality[],
+  ) {
+    super(responses)
+  }
+
+  setModelModalities(model: string, modalities: readonly ModelModality[]): void {
+    this.modelModalities.set(model, modalities)
+  }
+
+  setModelError(model: string, error: Error): void {
+    this.modelErrors.set(model, error)
+  }
+
+  override resolveModel(provider: string, model: string) {
+    const error = this.modelErrors.get(model)
+    if (error !== undefined) return Promise.reject(error)
+    return Promise.resolve({
+      provider,
+      id: model,
+      name: model,
+      inputModalities: this.modelModalities.get(model) ?? this.inputModalities,
+    })
+  }
+}
+
+const ROUTING_IMAGE_BLOCK: ImageBlock = Object.freeze({
+  type: 'image',
+  attachment: Object.freeze({
+    attachmentId: `sha256:${'b'.repeat(64)}` as ImageBlock['attachment']['attachmentId'],
+    mediaType: 'image/png',
+    bytes: 68,
+    width: 1,
+    height: 1,
+    name: 'routing.png',
+  }),
+})
 
 class NestedAskCodeRuntime extends CodeRuntime {
   readonly language = 'typescript'
@@ -2766,6 +2809,230 @@ test('harness e2e: first-command registry mutations survive cold owner-context r
   assert.equal(third.ctx.agents.list().length, 1)
   assert.equal(third.ctx.agents.list()[0]?.id, removalSession.id)
   await third.dispose()
+})
+
+test('harness e2e: Session resume preserves an image-capable route for image history', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-image-session-routing-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const projectPath = join(root, 'project')
+  await mkdir(projectPath)
+  const canonicalPath = await realpath(projectPath)
+  const adapter = new ModalScriptedAdapter(
+    [textResponse('project indexed'), textResponse('image turn complete')],
+    ['text', 'image'],
+  )
+  const harness = await mount(
+    root,
+    adapter,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => harness.dispose())
+
+  await harness.client.messageHandler?.(conversationCommand(
+    'chat-image-session-routing',
+    '/project register Image Routing Project',
+  ))
+  const imageAgent = harness.ctx.agents.list()[0]
+  assert.ok(imageAgent !== undefined)
+  await harness.client.messageHandler?.(conversationCommand(
+    'chat-image-session-routing',
+    'index this Session before the image',
+  ))
+  await waitFor(() => adapter.requests.length === 1)
+  await imageAgent.whenIdle()
+  const workspace = harness.ctx.workspaceRegistry.list()[0]
+  assert.ok(workspace !== undefined)
+  await waitFor(() => workspace.sessionIds.some((id) => id === imageAgent.id))
+  imageAgent.followup(createUserMessage({
+    content: [ROUTING_IMAGE_BLOCK],
+    source: { kind: 'user' },
+  }))
+  await waitFor(() => adapter.requests.length === 2)
+  await imageAgent.whenIdle()
+
+  await harness.client.messageHandler?.(conversationCommand('chat-image-session-routing', '/new'))
+  const textAgent = harness.ctx.agents.list().find(({ id }) => id !== imageAgent.id)
+  assert.ok(textAgent !== undefined)
+  await waitFor(() => harness.ctx.agents.get(imageAgent.id) === undefined)
+  await harness.client.messageHandler?.(conversationCommand('chat-image-session-routing', '/session'))
+  const catalog = harness.client.sent.at(-1) ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  assert.ok(currentLine !== undefined)
+  const historicalReference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([reference]) => reference)
+    .find((reference) => !currentLine.includes(reference))
+  assert.ok(historicalReference !== undefined)
+
+  adapter.inputModalities = ['text']
+  await harness.client.messageHandler?.(conversationCommand(
+    'chat-image-session-routing',
+    `/session resume ${historicalReference}`,
+  ))
+  assert.match(harness.client.sent.at(-1) ?? '', /目标会话包含图片/u)
+  assert.equal(harness.ctx.agents.list().some(({ id }) => id === textAgent.id), true)
+  await waitFor(() => harness.ctx.agents.get(imageAgent.id) === undefined)
+
+  await harness.dispose()
+  const unavailableAdapter = new ModalScriptedAdapter([], ['text', 'image'])
+  unavailableAdapter.setModelError('mock', new Error('private image capability marker'))
+  const unavailable = await mount(
+    root,
+    unavailableAdapter,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => unavailable.dispose())
+  await unavailable.client.messageHandler?.({
+    ...conversationCommand(
+      'chat-image-session-routing',
+      `/session resume ${historicalReference}`,
+    ),
+    messageId: 'image-session-routing-unavailable',
+  })
+  assert.match(unavailable.client.sent.at(-1) ?? '', /暂时无法确认图片历史与模型是否兼容/u)
+  assert.doesNotMatch(JSON.stringify(unavailable.client.sent), /private image capability marker/u)
+  await unavailable.dispose()
+
+  const recovered = await mount(
+    root,
+    new ModalScriptedAdapter([], ['text', 'image']),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    canonicalPath,
+    'zstd',
+  )
+  t.after(() => recovered.dispose())
+  await recovered.client.messageHandler?.({
+    ...conversationCommand(
+      'chat-image-session-routing',
+      `/session resume ${historicalReference}`,
+    ),
+    messageId: 'image-session-routing-retry',
+  })
+  assert.match(recovered.client.sent.at(-1) ?? '', /已恢复所选会话/u)
+  assert.equal(recovered.ctx.agents.list().some(({ id }) => id === imageAgent.id), true)
+})
+
+test('harness e2e: replayed /model recovers a commit-before-wake crash exactly once', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-image-pending-source-'))
+  const coldParent = await mkdtemp(join(tmpdir(), 'dsh-lark-image-pending-copy-'))
+  const coldRoot = join(coldParent, 'snapshot')
+  const retryParent = await mkdtemp(join(tmpdir(), 'dsh-lark-image-pending-retry-'))
+  const retryRoot = join(retryParent, 'snapshot')
+  t.after(() => rm(root, { recursive: true, force: true }))
+  t.after(() => rm(coldParent, { recursive: true, force: true }))
+  t.after(() => rm(retryParent, { recursive: true, force: true }))
+  const firstAdapter = new ModalScriptedAdapter([
+    textResponse('initial text turn'),
+  ], ['text', 'image'])
+  const first = await mount(root, firstAdapter, undefined, undefined, undefined, undefined, undefined, 'zstd')
+  t.after(() => first.dispose())
+
+  await first.client.messageHandler?.(conversationCommand(
+    'chat-image-pending-recovery',
+    'open the durable Session',
+  ))
+  await waitFor(() => firstAdapter.requests.length === 1)
+  const agent = first.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  agent.inject(createUserMessage({
+    content: [
+      { type: 'text', text: 'durable pending recovery marker' },
+      ROUTING_IMAGE_BLOCK,
+    ],
+    source: { kind: 'plugin', plugin: 'pending-fixture' },
+  }))
+  assert.equal(agent.inbox.hasPending, true)
+  assert.equal(await first.ctx.sessions.flush(agent.session), true)
+  await cp(root, coldRoot, { recursive: true })
+  await first.dispose()
+
+  const recoveredAdapter = new ModalScriptedAdapter(
+    [],
+    ['text'],
+  )
+  recoveredAdapter.setModelModalities('vision', ['text', 'image'])
+  const recovered = await mount(
+    coldRoot,
+    recoveredAdapter,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'zstd',
+  )
+  t.after(() => recovered.dispose())
+  let wakeFailed = false
+  const disposeWakeFailure = recovered.ctx.on('agent/created', ({ agent }) => {
+    const original = agent.send.bind(agent)
+    const mutable = agent as unknown as { send: typeof agent.send }
+    mutable.send = (message, target, wakeup) => {
+      if (!wakeFailed
+        && message.source.kind === 'plugin'
+        && message.source.plugin === 'lark') {
+        wakeFailed = true
+        throw new Error('simulated commit-before-wake crash')
+      }
+      original(message, target, wakeup)
+    }
+  })
+  const command = conversationCommand(
+    'chat-image-pending-recovery',
+    '/model mock vision',
+  )
+  const failure = await recovered.client.messageHandler?.(command).catch((error: unknown) => error)
+  disposeWakeFailure()
+  assert.ok(failure instanceof Error)
+  assert.equal(failure.message, 'lark: committed image-route recovery could not wake pending inbox')
+  assert.doesNotMatch(failure.message, /simulated commit-before-wake crash/u)
+  assert.equal(wakeFailed, true)
+  assert.equal(recoveredAdapter.requests.length, 0)
+  assert.equal(recovered.ctx.agents.list()[0]?.inbox.hasPending, true)
+  await cp(coldRoot, retryRoot, { recursive: true })
+  await recovered.dispose()
+
+  const replayAdapter = new ModalScriptedAdapter(
+    [textResponse('pending work recovered')],
+    ['text'],
+  )
+  replayAdapter.setModelModalities('vision', ['text', 'image'])
+  const replayed = await mount(
+    retryRoot,
+    replayAdapter,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'zstd',
+  )
+  t.after(() => replayed.dispose())
+  await replayed.client.messageHandler?.(command)
+  await waitFor(() => replayAdapter.requests.length === 1)
+  const replayedAgent = replayed.ctx.agents.list()[0]
+  assert.ok(replayedAgent !== undefined)
+  await replayedAgent.whenIdle()
+
+  assert.match(replayed.client.sent.at(-1) ?? '', /该模型切换已处理/u)
+  assert.equal(replayAdapter.requests[0]?.model, 'vision')
+  assert.match(
+    JSON.stringify(replayAdapter.requests[0]?.messages),
+    /durable pending recovery marker/u,
+  )
+  assert.equal(replayedAgent.inbox.hasPending, false)
 })
 
 test('harness e2e: scoped session navigation resumes committed history and preserves the lineage high-water mark', async (t) => {

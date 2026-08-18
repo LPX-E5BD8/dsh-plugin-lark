@@ -196,13 +196,18 @@ interface LocaleCopy {
     readonly sessionUnknown: string
     readonly sessionBusy: string
     readonly sessionHistoryCheckpointFailed: string
+    readonly sessionImageHistoryUnsupported: string
     readonly sessionResumeFailed: string
     readonly sessionMutationReplayed: string
     readonly modelUnavailable: string
     readonly modelUnknown: string
     readonly modelBusy: string
+    readonly modelImageHistoryUnsupported: string
     readonly modelSwitchFailed: string
     readonly modelMutationReplayed: string
+    readonly imageHistoryModelUnsupported: string
+    readonly imageHistoryUnavailable: string
+    readonly imageHistoryBusy: string
     projectList(
       currentId: string | undefined,
       projects: readonly ProjectListItem[],
@@ -356,13 +361,18 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       sessionUnknown: '当前会话范围内没有该可恢复会话引用。请重新发送 /session 获取列表。',
       sessionBusy: '当前会话仍有执行或待处理消息，未恢复其他会话；请等待完成后重试。',
       sessionHistoryCheckpointFailed: '无法确认当前会话历史已保存，未恢复其他会话；请检查持久化存储后重试。',
+      sessionImageHistoryUnsupported: '目标会话包含图片，但其保存模型未明确支持图片输入；当前会话保持不变。',
       sessionResumeFailed: '会话恢复失败，当前会话保持不变；请稍后重试。',
       sessionMutationReplayed: '该会话恢复操作已处理；当前会话保持最新状态。',
       modelUnavailable: '模型列表暂不可用，请稍后重试。',
       modelUnknown: '未找到该模型路由。发送 /model 查看可发现模型，或使用完整的提供方 ID 和模型 ID。',
       modelBusy: '当前会话仍有执行或待处理消息，请等待完成后重试。',
+      modelImageHistoryUnsupported: '当前会话包含图片，不能切换到未明确支持图片输入的模型。',
       modelSwitchFailed: '无法确认模型选择已保存，当前模型保持不变；请检查持久化存储后重试。',
       modelMutationReplayed: '该模型切换已处理；当前会话保持最新状态。',
+      imageHistoryModelUnsupported: '当前会话包含图片，但当前模型未明确支持图片输入。请先使用 /model 切换到兼容模型。',
+      imageHistoryUnavailable: '暂时无法确认图片历史与模型是否兼容，请检查模型服务后重试。',
+      imageHistoryBusy: '会话图片历史正在变化，请稍后重试。',
       projectList: (currentId, projects, canRegisterCurrent) => {
         const current = projects.find((project) => project.id === currentId)
         const currentLine = current === undefined
@@ -544,13 +554,18 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       sessionUnknown: 'No resumable session with that reference is visible in this conversation. Run /session again.',
       sessionBusy: 'This conversation still has running or pending work. No other session was resumed; wait and try again.',
       sessionHistoryCheckpointFailed: 'The current transcript could not be confirmed durable, so no other session was resumed. Check session storage and try again.',
+      sessionImageHistoryUnsupported: 'The target Session contains images, but its saved model does not explicitly support image input. The current Session is unchanged.',
       sessionResumeFailed: 'Session resume failed. The current session was left unchanged; try again later.',
       sessionMutationReplayed: 'That session resume was already handled. The conversation remains at its latest state.',
       modelUnavailable: 'The model list is unavailable. Please try again later.',
       modelUnknown: 'No model route matched. Send /model to list discoverable models, or use the full provider ID and model ID.',
       modelBusy: 'This conversation still has running or pending work. Wait for it to finish and try again.',
+      modelImageHistoryUnsupported: 'This conversation contains images and cannot switch to a model that does not explicitly support image input.',
       modelSwitchFailed: 'The model selection could not be confirmed durable. The current model was left unchanged; check session storage and try again.',
       modelMutationReplayed: 'That model switch was already handled. The conversation remains at its latest state.',
+      imageHistoryModelUnsupported: 'This conversation contains images, but the current model does not explicitly support image input. Use /model to select a compatible model first.',
+      imageHistoryUnavailable: 'Image-history compatibility cannot be confirmed right now. Check the model service and try again.',
+      imageHistoryBusy: 'The conversation image surface is changing. Try again shortly.',
       projectList: (currentId, projects, canRegisterCurrent) => {
         const current = projects.find((project) => project.id === currentId)
         const currentLine = current === undefined

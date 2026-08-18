@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import { setImmediate as yieldImmediate } from 'node:timers/promises'
 import { test } from 'node:test'
-import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ImageBlock, LlmCallConfig, UserMessage } from '@deepseek-ai/dsh-llm'
+import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import { LarkBridge } from '../src/bridge.ts'
 import type { ConversationBinding } from '../src/conversation-binding.ts'
 import type { LarkClientLike, LarkDeliveryOptions, LarkInbound } from '../src/lark.ts'
@@ -80,12 +83,28 @@ interface ModelRow {
 
 type ResolvePlan = Error | LlmCallConfig | ((config: LlmCallConfig) => LlmCallConfig)
 
+interface ModelCapability {
+  readonly provider: string
+  readonly id: string
+  readonly name: string
+  readonly inputModalities?: readonly string[]
+}
+
+type ModelInfoPlan = Error | ModelCapability | ((
+  provider: string,
+  model: string,
+  signal?: AbortSignal,
+) => ModelCapability | Promise<ModelCapability>)
+
 class ModelRuntime {
   readonly providers: ModelProvider[] = []
   readonly models = new Map<string, ModelRow[] | Error>()
   readonly listModelsCalls: string[] = []
   readonly resolveCalls: LlmCallConfig[] = []
+  readonly resolveModelInfoCalls: Array<{ readonly provider: string; readonly model: string }> = []
   private readonly resolvePlans: ResolvePlan[] = []
+  private readonly modelInfoPlans: ModelInfoPlan[] = []
+  private readonly modelCapabilities = new Map<string, ModelCapability | Error>()
 
   listProviders(): ModelProvider[] {
     return this.providers.map(provider => ({ ...provider }))
@@ -102,6 +121,23 @@ class ModelRuntime {
     this.resolvePlans.push(plan)
   }
 
+  setModelCapability(
+    provider: string,
+    model: string,
+    inputModalities: readonly string[] | undefined,
+  ): void {
+    this.modelCapabilities.set(`${provider}\0${model}`, {
+      provider,
+      id: model,
+      name: model,
+      ...(inputModalities === undefined ? {} : { inputModalities }),
+    })
+  }
+
+  planModelInfo(plan: ModelInfoPlan): void {
+    this.modelInfoPlans.push(plan)
+  }
+
   async resolveCallConfig(config: LlmCallConfig): Promise<LlmCallConfig> {
     this.resolveCalls.push({ ...config })
     const plan = this.resolvePlans.shift()
@@ -109,19 +145,54 @@ class ModelRuntime {
     if (typeof plan === 'function') return plan(config)
     return plan ?? config
   }
+
+  async resolveModelInfo(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<ModelCapability> {
+    this.resolveModelInfoCalls.push({ provider, model })
+    const plan = this.modelInfoPlans.shift()
+      ?? this.modelCapabilities.get(`${provider}\0${model}`)
+      ?? { provider, id: model, name: model, inputModalities: ['text'] }
+    if (plan instanceof Error) throw plan
+    return typeof plan === 'function' ? plan(provider, model, signal) : plan
+  }
 }
 
-interface ModelSession {
-  readonly id: string
-  readonly header: { readonly cwd?: string; readonly agentPreset?: string }
-  readonly events: Array<{ readonly type: string; readonly data: unknown }>
-  append(type: string, data: unknown): unknown
-  requestContext(): undefined
-  requestHeader(): { readonly config: LlmCallConfig } | undefined
+type ModelSession = Session
+
+class ModelInbox {
+  readonly nextStep: UserMessage[] = []
+  readonly nextTurn: UserMessage[] = []
+
+  get hasPending(): boolean {
+    return this.nextStep.length > 0 || this.nextTurn.length > 0
+  }
+
+  set hasPending(value: boolean) {
+    if (!value) {
+      this.nextStep.length = 0
+      this.nextTurn.length = 0
+      return
+    }
+    if (this.hasPending) return
+    this.nextStep.push(createUserMessage({
+      content: [{ type: 'text', text: 'synthetic pending work' }],
+      source: { kind: 'plugin', plugin: 'model-test' },
+    }))
+  }
+
+  replace(messageId: UserMessage['id'], replacement: UserMessage): boolean {
+    const index = this.nextStep.findIndex(({ id }) => id === messageId)
+    if (index < 0) return false
+    this.nextStep[index] = replacement
+    return true
+  }
 }
 
 class ModelAgent {
-  readonly inbox = { hasPending: false }
+  readonly inbox = new ModelInbox()
   readonly ctx: Record<string, never> = {}
   readonly id: string
   status: 'idle' | 'running' = 'idle'
@@ -139,7 +210,7 @@ class ModelAgent {
   followup(message: unknown): void {
     assert.equal(this.disposed, false, `followup reached disposed agent ${this.id}`)
     this.host.followups.push({ agent: this, message })
-    this.session.events.push({ type: 'user/message', data: message })
+    this.session.append('user/message', message as UserMessage, { surfaceOp: 'append' })
     if (this.maintenance) this.inbox.hasPending = true
   }
 
@@ -192,6 +263,9 @@ class ModelHost {
   readonly completedInboundKeys: string[] = []
   readonly warnings: unknown[][] = []
   readonly errors: unknown[][] = []
+  readonly runtimeExecutions: string[] = []
+  runtimeAvailable = false
+  private inboundCompletionFailures = 0
   private readonly flushPlans: FlushPlan[] = []
   private bindingPutStart: (() => void) | undefined
   private bindingPutWait: Promise<void> | undefined
@@ -205,6 +279,19 @@ class ModelHost {
     get: (name: string) => {
       if (name === 'approval') return {}
       if (name === 'llm') return this.llm
+      if (name === 'commands' && this.runtimeAvailable) {
+        return {
+          list: () => [
+            { name: 'plan', description: 'plan work' },
+            { name: 'compact', description: 'compact history' },
+            { name: 'custom', description: 'custom command' },
+          ],
+          execute: async (_agent: ModelAgent, line: string) => {
+            this.runtimeExecutions.push(line)
+            return { result: { kind: 'success' as const, text: 'runtime executed' } }
+          },
+        }
+      }
       if (name === 'sessionPersistence') {
         return {
           list: async () => [...this.persisted.values()].map(session => ({
@@ -239,6 +326,18 @@ class ModelHost {
     this.flushPlans.push(plan)
   }
 
+  failNextInboundCompletion(): void {
+    this.inboundCompletionFailures += 1
+  }
+
+  async completeInbound(key: string): Promise<void> {
+    if (this.inboundCompletionFailures > 0) {
+      this.inboundCompletionFailures -= 1
+      throw new Error('simulated inbound receipt failure')
+    }
+    this.completedInboundKeys.push(key)
+  }
+
   holdNextBindingPut(start: () => void, wait: Promise<void>): void {
     this.bindingPutStart = start
     this.bindingPutWait = wait
@@ -258,30 +357,17 @@ class ModelHost {
 
   private newSession(
     id: string,
-    header: ModelSession['header'],
-    seed: readonly { readonly type: string; readonly data: unknown }[] = [],
+    header: { readonly cwd?: string; readonly agentPreset?: string },
+    seed?: readonly SessionEvent[],
   ): ModelSession {
-    const events = [...seed]
-    return {
-      id,
-      header: { ...header },
-      events,
-      append: (type, data) => {
-        const event = { type, data }
-        events.push(event)
-        return event
-      },
-      requestContext: () => undefined,
-      requestHeader: () => {
-        for (let index = events.length - 1; index >= 0; index -= 1) {
-          const event = events[index]
-          if (event?.type !== 'request/header') continue
-          const data = event.data as { readonly header?: { readonly config?: LlmCallConfig } }
-          if (data.header?.config !== undefined) return { config: data.header.config }
-        }
-        return undefined
-      },
+    const sessionId = SessionId(id)
+    const sessionHeader: SessionHeader = {
+      version: SESSION_FORMAT_VERSION,
+      id: sessionId,
+      createdAt: Date.now(),
+      ...header,
     }
+    return Session.create(sessionId, seed, sessionHeader)
   }
 
   private async open(kind: 'create' | 'resume', options: AgentOpenOptions) {
@@ -343,7 +429,7 @@ interface AgentOpenOptions {
   readonly sessionId: unknown
   readonly agentOptions?: { readonly provider?: string; readonly model?: string }
   readonly meta?: { readonly cwd?: string; readonly agentPreset?: string }
-  readonly seed?: readonly { readonly type: string; readonly data: unknown }[]
+  readonly seed?: readonly SessionEvent[]
   readonly setup?: (agentCtx: unknown) => Promise<unknown> | unknown
 }
 
@@ -378,7 +464,7 @@ async function mountHost(
     client,
     inboundDeduplicator: {
       has: () => false,
-      async complete(key) { host.completedInboundKeys.push(key) },
+      complete: key => host.completeInbound(key),
     },
     conversationBindings: {
       read: baseId => host.bindings.get(baseId),
@@ -409,6 +495,32 @@ function assertModel(
   model: string,
 ): void {
   assert.deepEqual(actual, { provider, model })
+}
+
+const STANDARD_IMAGE_BLOCK: ImageBlock = Object.freeze({
+  type: 'image',
+  attachment: Object.freeze({
+    attachmentId: `sha256:${'b'.repeat(64)}` as ImageBlock['attachment']['attachmentId'],
+    mediaType: 'image/png',
+    bytes: 68,
+    width: 1,
+    height: 1,
+    name: 'model-switch.png',
+  }),
+})
+
+function appendImageSurface(session: ModelSession): number {
+  return session.append('user/message', createUserMessage({
+    content: [STANDARD_IMAGE_BLOCK],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' }).seq
+}
+
+function appendTextSurface(session: ModelSession, text: string): void {
+  session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
 }
 
 test('/model groups live catalogs and isolates a provider failure without exposing its error', async (t) => {
@@ -513,6 +625,62 @@ test('replaying an old model mutation after a later switch cannot roll the selec
   assert.equal(host.opens.length, opens)
   assert.equal(host.llm.resolveCalls.length, resolves)
   assert.match(restarted.client.sent.at(-1)?.text ?? '', /already handled/)
+})
+
+test('replaying the latest model mutation after restart does not cold-open an empty Session', async (t) => {
+  const { host, client, bridge } = await mount(t)
+  const command = inbound('empty-replay-chat', '/model route selected', 'empty-replay')
+  const baseId = 'lark:empty-replay-chat'
+
+  await deliver(client, command)
+  const committed = cloneBinding(currentBinding(host, baseId))
+  const puts = host.bindingPuts.length
+  const resolves = host.llm.resolveCalls.length
+  await bridge.stop()
+
+  const restarted = await mountHost(t, host)
+  const opens = host.opens.length
+  await deliver(restarted.client, command)
+
+  assert.deepEqual(currentBinding(host, baseId), committed)
+  assert.equal(host.bindingPuts.length, puts)
+  assert.equal(host.opens.length, opens)
+  assert.equal(host.llm.resolveCalls.length, resolves)
+  assert.match(restarted.client.sent.at(-1)?.text ?? '', /already handled/)
+})
+
+test('an older model replay cannot wake later pending work after the route returns', async (t) => {
+  const { host, client } = await mount(t)
+  const first = inbound('route-loop-chat', '/model route a', 'route-a-old')
+  const second = inbound('route-loop-chat', '/model route b', 'route-b')
+  const latest = inbound('route-loop-chat', '/model route a', 'route-a-new')
+  const baseId = 'lark:route-loop-chat'
+
+  host.failNextInboundCompletion()
+  const firstFailure = await deliver(client, first).catch((error: unknown) => error)
+  assert.ok(firstFailure instanceof Error)
+  assert.equal(firstFailure.message, 'simulated inbound receipt failure')
+  await deliver(client, second)
+  await deliver(client, latest)
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  appendImageSurface(agent.session)
+  agent.inbox.hasPending = true
+  const committed = cloneBinding(currentBinding(host, baseId))
+  const opens = host.opens.length
+  const puts = host.bindingPuts.length
+  const resolves = host.llm.resolveCalls.length
+  const capabilityResolves = host.llm.resolveModelInfoCalls.length
+
+  await deliver(client, first)
+
+  assert.deepEqual(currentBinding(host, baseId), committed)
+  assert.equal(host.opens.length, opens)
+  assert.equal(host.bindingPuts.length, puts)
+  assert.equal(host.llm.resolveCalls.length, resolves)
+  assert.equal(host.llm.resolveModelInfoCalls.length, capabilityResolves)
+  assert.equal(agent.inbox.hasPending, true)
+  assert.match(client.sent.at(-1)?.text ?? '', /already handled/)
 })
 
 test('private conversations isolate model state while defaultSessionId intentionally shares it', async (t) => {
@@ -692,6 +860,280 @@ test('work admitted during the final binding put stays on the selected live Hand
   assert.equal(host.followups.at(-1)?.agent, agent)
   assertModel(currentBinding(host, 'lark:commit-race').modelSelection, 'route', 'committed')
   assert.deepEqual(host.disposals, [])
+})
+
+test('an image surface rejects text-only and unknown model capabilities without changing binding or selection ref', async (t) => {
+  const { host, client } = await mount(t, { provider: 'route', model: 'vision' })
+  const baseId = 'lark:image-downgrade'
+  host.llm.setModelCapability('route', 'vision', ['text', 'image'])
+  host.llm.setModelCapability('route', 'text-only', ['text'])
+  host.llm.setModelCapability('route', 'unknown-input', undefined)
+  await send(client, 'image-downgrade', '/model route vision', 'image-vision-current')
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  appendImageSurface(agent.session)
+  const before = cloneBinding(currentBinding(host, baseId))
+
+  await send(client, 'image-downgrade', '/model route text-only', 'image-to-text')
+  assert.match(client.sent.at(-1)?.text ?? '', /contains images.*cannot switch/iu)
+  assert.deepEqual(currentBinding(host, baseId), before)
+  assert.equal(host.liveAgents.get(baseId), agent)
+
+  await send(client, 'image-downgrade', '/model route unknown-input', 'image-to-unknown')
+  assert.match(client.sent.at(-1)?.text ?? '', /contains images.*cannot switch/iu)
+  assert.deepEqual(currentBinding(host, baseId), before)
+  assert.equal(host.liveAgents.get(baseId), agent)
+
+  const followups = host.followups.length
+  await send(client, 'image-downgrade', 'continue on vision', 'image-ref-still-vision')
+  assert.equal(host.followups.length, followups + 1, 'rejected switch changed the live model selection ref')
+  assert.equal(host.followups.at(-1)?.agent, agent)
+  assert.deepEqual(host.llm.resolveModelInfoCalls, [
+    { provider: 'route', model: 'text-only' },
+    { provider: 'route', model: 'unknown-input' },
+    { provider: 'route', model: 'vision' },
+  ])
+})
+
+test('an image surface permits an exact vision-to-vision switch on the same Handle', async (t) => {
+  const { host, client } = await mount(t, { provider: 'route', model: 'vision-a' })
+  const baseId = 'lark:image-vision-switch'
+  host.llm.setModelCapability('route', 'vision-a', ['text', 'image'])
+  host.llm.setModelCapability('route', 'vision-b', ['image', 'text'])
+  await send(client, 'image-vision-switch', '/model route vision-a', 'vision-a-current')
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  appendImageSurface(agent.session)
+
+  await send(client, 'image-vision-switch', '/model route vision-b', 'vision-a-to-b')
+
+  assertModel(currentBinding(host, baseId).modelSelection, 'route', 'vision-b')
+  assert.equal(host.liveAgents.get(baseId), agent)
+  assert.equal(agent.disposed, false)
+  assert.deepEqual(host.disposals, [])
+  assert.deepEqual(host.llm.resolveModelInfoCalls, [{ provider: 'route', model: 'vision-b' }])
+  assert.match(client.sent.at(-1)?.text ?? '', /Switched to route \/ vision-b/u)
+
+  const followups = host.followups.length
+  await send(client, 'image-vision-switch', 'continue on vision b', 'vision-b-followup')
+  assert.equal(host.followups.length, followups + 1)
+  assert.equal(host.followups.at(-1)?.agent, agent)
+})
+
+test('a compaction replacement that shadows the image permits a text-only switch', async (t) => {
+  const { host, client } = await mount(t, { provider: 'route', model: 'vision' })
+  const baseId = 'lark:image-shadowed-switch'
+  host.llm.setModelCapability('route', 'text-only', ['text'])
+  await send(client, 'image-shadowed-switch', '/help', 'shadow-open')
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  const imageSeq = appendImageSurface(agent.session)
+  agent.session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'compacted image summary' }],
+    source: { kind: 'user' },
+  }), {
+    surfaceOp: { op: 'replace', start: imageSeq, end: imageSeq },
+    sourceEventSeqs: [imageSeq],
+  })
+
+  await send(client, 'image-shadowed-switch', '/model route text-only', 'shadow-to-text')
+
+  assertModel(currentBinding(host, baseId).modelSelection, 'route', 'text-only')
+  assert.equal(host.liveAgents.get(baseId), agent)
+  assert.deepEqual(host.llm.resolveModelInfoCalls, [])
+  assert.match(client.sent.at(-1)?.text ?? '', /Switched to route \/ text-only/u)
+})
+
+test('image capability lookup failure keeps the prior binding and Handle without leaking its error', async (t) => {
+  const { host, client } = await mount(t, { provider: 'route', model: 'vision' })
+  const baseId = 'lark:image-capability-failure'
+  await send(client, 'image-capability-failure', '/model route vision', 'capability-current')
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  appendImageSurface(agent.session)
+  const before = cloneBinding(currentBinding(host, baseId))
+  host.llm.planModelInfo(new Error('private capability credential marker'))
+
+  await send(client, 'image-capability-failure', '/model route maybe-vision', 'capability-failed')
+
+  assert.deepEqual(currentBinding(host, baseId), before)
+  assert.equal(host.liveAgents.get(baseId), agent)
+  assert.match(client.sent.at(-1)?.text ?? '', /compatibility cannot be confirmed/iu)
+  assert.doesNotMatch(JSON.stringify(client.sent), /private capability credential marker/u)
+  assert.doesNotMatch(JSON.stringify(host.warnings), /private capability credential marker/u)
+  assert.deepEqual(host.llm.resolveModelInfoCalls, [{ provider: 'route', model: 'maybe-vision' }])
+})
+
+test('a cold image Session on a degraded text route rejects prompts until /model selects vision', async (t) => {
+  const host = new ModelHost()
+  const baseId = 'lark:cold-image-route'
+  const stored = await host.ctx.agents.create({
+    sessionId: baseId,
+    agentOptions: { provider: 'route', model: 'text-only' },
+  })
+  appendImageSurface(stored.agent.session)
+  await host.ctx.sessions.flush(stored.agent.session)
+  await stored.dispose()
+  host.bindings.set(baseId, {
+    generation: 0,
+    suffix: null,
+    modelSelection: { provider: 'route', model: 'text-only' },
+    mutationHashes: [],
+  })
+  host.llm.setModelCapability('route', 'text-only', ['text'])
+  host.llm.setModelCapability('route', 'vision', ['text', 'image'])
+  const { client } = await mountHost(t, host, { provider: 'route', model: 'text-only' })
+
+  await send(client, 'cold-image-route', 'must not enter the text model', 'cold-text-prompt')
+  assert.equal(host.followups.length, 0)
+  assert.match(client.sent.at(-1)?.text ?? '', /current model does not explicitly support image input/iu)
+  assertModel(currentBinding(host, baseId).modelSelection, 'route', 'text-only')
+  const resumed = host.liveAgents.get(baseId)
+  assert.ok(resumed !== undefined)
+
+  await send(client, 'cold-image-route', '/model route vision', 'cold-select-vision')
+  assertModel(currentBinding(host, baseId).modelSelection, 'route', 'vision')
+  assert.equal(host.liveAgents.get(baseId), resumed)
+
+  await send(client, 'cold-image-route', 'vision can continue', 'cold-vision-prompt')
+  assert.equal(host.followups.length, 1)
+  assert.equal(host.followups[0]?.agent, resumed)
+  assert.deepEqual(host.llm.resolveModelInfoCalls, [
+    { provider: 'route', model: 'text-only' },
+    { provider: 'route', model: 'vision' },
+    { provider: 'route', model: 'vision' },
+  ])
+})
+
+test('a degraded image route blocks dynamic runtime commands and hides them from /help', async (t) => {
+  const { host, client } = await mount(t, { provider: 'route', model: 'text-only' })
+  const baseId = 'lark:image-runtime-guard'
+  host.runtimeAvailable = true
+  host.llm.setModelCapability('route', 'text-only', ['text'])
+  host.llm.setModelCapability('route', 'vision', ['text', 'image'])
+  await send(client, 'image-runtime-guard', '/help', 'runtime-open')
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  appendImageSurface(agent.session)
+
+  for (const [index, command] of ['/plan do work', '/compact', '/custom value'].entries()) {
+    await send(client, 'image-runtime-guard', command, `runtime-blocked-${index}`)
+    assert.match(client.sent.at(-1)?.text ?? '', /current model does not explicitly support image input/iu)
+  }
+  assert.deepEqual(host.runtimeExecutions, [])
+
+  await send(client, 'image-runtime-guard', '/help', 'runtime-degraded-help')
+  const help = client.sent.at(-1)?.text ?? ''
+  assert.match(help, /current model does not explicitly support image input/iu)
+  assert.doesNotMatch(help, /\/plan|\/compact|\/custom/u)
+
+  await send(client, 'image-runtime-guard', '/model route vision', 'runtime-select-vision')
+  await send(client, 'image-runtime-guard', '/custom value', 'runtime-after-recovery')
+  assert.deepEqual(host.runtimeExecutions, ['/custom value'])
+  assert.match(client.sent.at(-1)?.text ?? '', /runtime executed/u)
+})
+
+test('surface or inbox changes while image capability awaits make the model switch busy', async (t) => {
+  const { host, client } = await mount(t, { provider: 'route', model: 'vision-a' })
+  const baseId = 'lark:image-capability-race'
+  await send(client, 'image-capability-race', '/model route vision-a', 'race-current')
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  appendImageSurface(agent.session)
+  const before = cloneBinding(currentBinding(host, baseId))
+
+  const surfaceStarted = Promise.withResolvers<void>()
+  const releaseSurface = Promise.withResolvers<void>()
+  host.llm.planModelInfo(async (provider, model, signal) => {
+    assert.equal(signal?.aborted, false)
+    surfaceStarted.resolve()
+    await releaseSurface.promise
+    return { provider, id: model, name: model, inputModalities: ['text', 'image'] }
+  })
+  const surfaceSwitch = send(
+    client,
+    'image-capability-race',
+    '/model route vision-b',
+    'capability-surface-race',
+  )
+  await surfaceStarted.promise
+  appendTextSurface(agent.session, 'surface changed during capability lookup')
+  releaseSurface.resolve()
+  await surfaceSwitch
+
+  assert.match(client.sent.at(-1)?.text ?? '', /running or pending work/iu)
+  assert.deepEqual(currentBinding(host, baseId), before)
+  assert.equal(agent.inbox.hasPending, false)
+
+  const inboxStarted = Promise.withResolvers<void>()
+  const releaseInbox = Promise.withResolvers<void>()
+  host.llm.planModelInfo(async (provider, model) => {
+    inboxStarted.resolve()
+    await releaseInbox.promise
+    return { provider, id: model, name: model, inputModalities: ['image'] }
+  })
+  const inboxSwitch = send(
+    client,
+    'image-capability-race',
+    '/model route vision-c',
+    'capability-inbox-race',
+  )
+  await inboxStarted.promise
+  agent.inbox.hasPending = true
+  releaseInbox.resolve()
+  await inboxSwitch
+
+  assert.match(client.sent.at(-1)?.text ?? '', /running or pending work/iu)
+  assert.deepEqual(currentBinding(host, baseId), before)
+  assert.equal(host.liveAgents.get(baseId), agent)
+  assert.deepEqual(host.llm.resolveModelInfoCalls, [
+    { provider: 'route', model: 'vision-b' },
+    { provider: 'route', model: 'vision-c' },
+  ])
+})
+
+test('same-id inbox replacement during capability lookup prevents pending recovery commit', async (t) => {
+  const { host, client } = await mount(t, { provider: 'route', model: 'vision-a' })
+  const baseId = 'lark:image-inbox-replace-race'
+  await send(client, 'image-inbox-replace-race', '/model route vision-a', 'replace-current')
+  const agent = host.liveAgents.get(baseId)
+  assert.ok(agent !== undefined)
+  appendImageSurface(agent.session)
+  const original = createUserMessage({
+    content: [{ type: 'text', text: 'original pending content' }],
+    source: { kind: 'plugin', plugin: 'replace-race' },
+  })
+  agent.inbox.nextStep.push(original)
+  const before = cloneBinding(currentBinding(host, baseId))
+  const lookupStarted = Promise.withResolvers<void>()
+  const releaseLookup = Promise.withResolvers<void>()
+  host.llm.planModelInfo(async (provider, model) => {
+    lookupStarted.resolve()
+    await releaseLookup.promise
+    return { provider, id: model, name: model, inputModalities: ['text', 'image'] }
+  })
+  const switching = send(
+    client,
+    'image-inbox-replace-race',
+    '/model route vision-b',
+    'replace-during-lookup',
+  )
+  await lookupStarted.promise
+  const replacement = Object.freeze({
+    ...createUserMessage({
+      content: [{ type: 'text', text: 'replacement with the same id' }],
+      source: { kind: 'plugin', plugin: 'replace-race' },
+    }),
+    id: original.id,
+  }) as UserMessage
+  assert.equal(agent.inbox.replace(original.id, replacement), true)
+  releaseLookup.resolve()
+  await switching
+
+  assert.match(client.sent.at(-1)?.text ?? '', /running or pending work/iu)
+  assert.deepEqual(currentBinding(host, baseId), before)
+  assert.equal(agent.inbox.nextStep[0], replacement)
+  assert.equal(host.liveAgents.get(baseId), agent)
 })
 
 test('oversized and control-character catalog fields are sanitized and globally bounded', async (t) => {

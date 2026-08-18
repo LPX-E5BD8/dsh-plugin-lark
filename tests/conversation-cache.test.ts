@@ -70,6 +70,7 @@ async function send(client: CacheClient, chatId: string, text: string): Promise<
 
 interface TestSession {
   readonly id: string
+  readonly events: unknown[]
   requestContext(): undefined
 }
 
@@ -254,7 +255,7 @@ class CacheHost {
     }
     if (resumed) this.resumed.push(sessionId)
     else this.created.push(sessionId)
-    const session: TestSession = { id: sessionId, requestContext: () => undefined }
+    const session: TestSession = { id: sessionId, events: [], requestContext: () => undefined }
     const agent = new TestAgent(this, sessionId, session, ++this.serial)
     this.liveSessions.set(sessionId, session)
     this.liveAgents.set(sessionId, agent)
