@@ -463,6 +463,58 @@ test('e2e: help replies to the command message', async () => {
   await bridge.stop()
 })
 
+test('e2e: empty operatorFrom denies /status even for allowFrom users', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner'],
+  })
+  await bridge.start()
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/status'),
+    messageId: 'status-empty-ops',
+  })
+  assert.equal(client.cards.length, 0)
+  assert.match(client.sent.at(-1)?.text ?? '', /limited to operators|仅限运维/u)
+  await bridge.stop()
+})
+
+test('e2e: /status is operator-only and /diag renders a sanitized card', async () => {
+  const client = createClient()
+  const host = createHost()
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner', 'guest'],
+    operatorFrom: ['owner'],
+  })
+  await bridge.start()
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'guest', '/status'),
+    messageId: 'status-guest',
+  })
+  assert.equal(client.cards.length, 0)
+  assert.match(client.sent.at(-1)?.text ?? '', /limited to operators|仅限运维/u)
+  assert.doesNotMatch(JSON.stringify(client.sent), /oc_|ou_/u)
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/status'),
+    messageId: 'status-owner',
+  })
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/diag'),
+    messageId: 'diag-owner',
+  })
+  assert.equal(client.cards.length, 2)
+  const encoded = JSON.stringify(client.cards)
+  assert.match(encoded, /"element_id":"status"/u)
+  assert.match(encoded, /"element_id":"diag"/u)
+  assert.match(encoded, /schema":"2.0"/u)
+  assert.doesNotMatch(encoded, /oc_|om_|\/home\/|app_secret/u)
+  await bridge.stop()
+})
+
 test('e2e: unsupported p2p input replies once without creating an agent', async () => {
   const client = createClient()
   const host = createHost()

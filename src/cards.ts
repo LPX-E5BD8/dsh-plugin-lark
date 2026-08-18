@@ -70,6 +70,8 @@ const CARD_ELEMENT = {
   plan: 'plan',
   stop: 'turn_stop',
   notify: 'notify',
+  status: 'status',
+  diag: 'diag',
 } as const
 
 export const CARD_ACTIONS = {
@@ -905,6 +907,33 @@ export interface NotifyCard {
   readonly kind: 'completion' | 'attention'
   readonly summary: string
   readonly mentionMarkup?: string
+}
+
+export interface OperatorCard {
+  readonly locale?: LarkLocale
+  readonly kind: 'status' | 'diag'
+  readonly body: string
+}
+
+export function renderOperatorCard(card: OperatorCard): Record<string, unknown> {
+  const locale = card.locale ?? DEFAULT_CONFIG.locale
+  const copy = localeCopy(locale).card
+  const title = card.kind === 'diag' ? copy.diagTitle : copy.statusTitle
+  const payload = basePayload(title, [
+    markdownElement(
+      card.kind === 'diag' ? CARD_ELEMENT.diag : CARD_ELEMENT.status,
+      `**${escapeMarkdown(title)}**\n${escapeMarkdown(card.body)}`,
+    ),
+  ])
+  payload.header = {
+    title: { tag: CARD_STYLE.tagPlainText, content: title },
+    template: 'blue',
+    padding: CARD_STYLE.padding,
+  }
+  if (payloadBytes(payload) > CARD_LIMITS.maxBytes) {
+    throw new RangeError('lark: operator card exceeds the plugin Card byte budget')
+  }
+  return payload
 }
 
 export function renderNotifyCard(card: NotifyCard): Record<string, unknown> {

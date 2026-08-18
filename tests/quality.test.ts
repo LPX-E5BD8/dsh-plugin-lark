@@ -9,6 +9,7 @@ import {
   renderApprovalCard,
   renderApprovalDecisionCard,
   renderNotifyCard,
+  renderOperatorCard,
   renderTurnCard,
   renderTurnCardWithMeta,
 } from '../src/cards.ts'
@@ -89,6 +90,7 @@ test('quality: public defaults fail closed', () => {
   assert.equal(DEFAULT_CONFIG.allowAllUsers, false)
   assert.equal(DEFAULT_CONFIG.outboundArtifacts, false)
   assert.equal(DEFAULT_CONFIG.proactiveDelivery, false)
+  assert.deepEqual(DEFAULT_CONFIG.operatorFrom, [])
   assert.deepEqual(inject, ['agents', 'storageDomain', 'sessions', 'tools'])
 })
 
@@ -145,6 +147,15 @@ test('quality: proactive delivery stays opt-in through the bundle seam', () => {
   assert.match(source, /proactiveDelivery: Schema\.boolean\(\)\.default\(DEFAULT_CONFIG\.proactiveDelivery\)/u)
   assert.equal((patch.match(/^\s+proactiveDelivery: false$/gmu) ?? []).length, 1)
   assert.equal(Config({ proactiveDelivery: true }).proactiveDelivery, true)
+})
+
+test('quality: operator allowlist stays fail-closed through the bundle seam', () => {
+  const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8')
+  const patch = readFileSync(join(process.cwd(), 'cordis.patch.yml'), 'utf8')
+  assert.deepEqual(DEFAULT_CONFIG.operatorFrom, [])
+  assert.match(source, /operatorFrom: Schema\.array\(Schema\.string\(\)\)\.default\(\[\]\)/u)
+  assert.equal((patch.match(/^\s+operatorFrom: \[\]$/gmu) ?? []).length, 1)
+  assert.deepEqual(Config({}).operatorFrom, [])
 })
 
 test('quality: project management configuration stays fail-closed through the bundle seam', () => {
@@ -581,6 +592,14 @@ test('quality: every Card 2.0 payload keeps platform element ids and column sets
       kind: 'attention',
       summary: 'Please review the blocked step.',
       mentionMarkup: '<at id="ou_initiator"></at>',
+    }),
+    renderOperatorCard({
+      kind: 'status',
+      body: 'Version: 0.9.13\nConnection: connected',
+    }),
+    renderOperatorCard({
+      kind: 'diag',
+      body: 'OK Bot REST identity is available.',
     }),
   ]
   const allowedColumnSetKeys = new Set([

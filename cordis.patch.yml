@@ -9,6 +9,7 @@
         allowAllUsers: false
         allowFrom: []
         projectManageFrom: []
+        operatorFrom: []
         defaultSessionId: ""
         maxConversationHandles: 32
         inboundTextFiles: false

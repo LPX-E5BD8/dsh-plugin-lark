@@ -144,6 +144,8 @@ function enModelList(
 interface LocaleCopy {
   readonly bridge: {
     readonly help: string
+    readonly operatorHelp: string
+    readonly operatorOnly: string
     readonly denied: string
     readonly unsupportedInput: string
     readonly inboundTextFileInvalid: string
@@ -307,6 +309,8 @@ interface LocaleCopy {
     readonly earlierTodos: string
     readonly notifyCompletionTitle: string
     readonly notifyAttentionTitle: string
+    readonly statusTitle: string
+    readonly diagTitle: string
   }
   readonly event: {
     readonly command: string
@@ -334,6 +338,11 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
         '/model [提供方 ID] [模型 ID] — 查看或切换模型',
         '/help — 显示帮助',
       ].join('\n'),
+      operatorHelp: [
+        '/status — 查看当前通道状态（仅运维）',
+        '/diag — 运行脱敏诊断（仅运维）',
+      ].join('\n'),
+      operatorOnly: '该命令仅限运维人员。',
       denied: '没有权限。',
       unsupportedInput: '暂不支持图片、文件或其他非文本消息，请改用文字发送。',
       inboundTextFileInvalid: '无法读取该附件。仅支持安全文件名的 UTF-8 .txt、.log、.patch 和 .diff 文本文件。',
@@ -529,6 +538,8 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       earlierTodos: '个更早的计划项已折叠',
       notifyCompletionTitle: '任务完成',
       notifyAttentionTitle: '需要关注',
+      statusTitle: '通道状态',
+      diagTitle: '通道诊断',
     },
     event: {
       command: '命令',
@@ -554,6 +565,11 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
         '/model [provider ID] [model ID] — list or switch models',
         '/help — show this help',
       ].join('\n'),
+      operatorHelp: [
+        '/status — show channel status (operators only)',
+        '/diag — run a sanitized diagnostic (operators only)',
+      ].join('\n'),
+      operatorOnly: 'This command is limited to operators.',
       denied: "You don't have permission.",
       unsupportedInput: 'Images, files, and other non-text messages are not supported yet. Please send text.',
       inboundTextFileInvalid: 'This attachment cannot be read. Only UTF-8 .txt, .log, .patch, and .diff files with safe names are accepted.',
@@ -744,6 +760,8 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       earlierTodos: 'earlier plan items folded',
       notifyCompletionTitle: 'Task complete',
       notifyAttentionTitle: 'Needs attention',
+      statusTitle: 'Channel status',
+      diagTitle: 'Channel diagnostic',
     },
     event: {
       command: 'Command',

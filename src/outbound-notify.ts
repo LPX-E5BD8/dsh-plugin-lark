@@ -116,7 +116,9 @@ const outboxSchema = z.object({
   idempotencyKey: z.string().regex(IDEMPOTENCY_PATTERN),
   scopeId: z.string().regex(KEY_PATTERN),
   kind: z.enum(['completion', 'attention']),
-  summary: z.string().min(1).max(MAX_NOTIFY_SUMMARY_RUNES * 4),
+  summary: z.string().refine((value) => validSummary(value), {
+    message: 'notify summary must match admission invariants',
+  }),
   mentions: z.array(z.literal('initiator')).max(MAX_NOTIFY_MENTIONS).readonly(),
   status: z.enum(['pending', 'inflight', 'delivered', 'expired', 'failed', 'rate_limited']),
   attemptCount: z.number().int().nonnegative().max(MAX_NOTIFY_ATTEMPTS),
