@@ -17,7 +17,14 @@ import { contentHasImage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, LlmCallConfig, TokenUsage, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import { foldRequestHeader, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
-import type { ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type {
+  ToolDispatchExecution,
+  ToolExecution,
+  ToolExecutionResult,
+  ToolExecutionToken,
+  ToolRunContext,
+} from '@deepseek-ai/dsh-tools'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import {
   CARD_ACTIONS,
@@ -84,6 +91,24 @@ import type {
   LarkInbound,
 } from './lark.ts'
 import { LarkResourceError } from './lark.ts'
+import {
+  DEFAULT_OUTBOUND_IMAGE_BYTES,
+  DEFAULT_OUTBOUND_IMAGE_PIXELS,
+  DEFAULT_OUTBOUND_TEXT_BYTES,
+  inspectOutboundArtifact,
+  MAX_OUTBOUND_IMAGE_BYTES,
+  MAX_OUTBOUND_IMAGE_PIXELS,
+  MAX_OUTBOUND_TEXT_BYTES,
+  OUTBOUND_ARTIFACT_TOOL_NAME,
+  OutboundArtifactError,
+  readOutboundArtifact,
+  sameOutboundArtifactPreflight,
+} from './outbound-artifact.ts'
+import type {
+  OutboundArtifactLimits,
+  OutboundArtifactPreflight,
+  PreparedOutboundArtifact,
+} from './outbound-artifact.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 import {
@@ -110,6 +135,10 @@ export interface LarkBridgeOptions {
   maxInboundImagePixels?: number
   maxConversationImages?: number
   maxConversationImageBytes?: number
+  outboundArtifacts?: boolean
+  maxOutboundTextFileBytes?: number
+  maxOutboundImageBytes?: number
+  maxOutboundImagePixels?: number
   humanInputTimeoutMs?: number
   humanInputCardCloseTimeoutMs?: number
   cwd?: string
@@ -513,6 +542,54 @@ interface PendingApproval {
   readonly baseId: string
   readonly chatId: string
   readonly openId: string
+  messageId?: string
+  readonly outboundArtifact?: OutboundArtifactApprovalExpectation
+}
+
+type OutboundArtifactPhase =
+  | 'validating'
+  | 'awaiting-approval'
+  | 'approved'
+  | 'upload-started'
+  | 'uploaded'
+  | 'send-started'
+  | 'sent-confirmed'
+
+interface OutboundArtifactApprovalExpectation {
+  readonly key: string
+  readonly agent: Agent
+  readonly callId: string
+  readonly sessionId: string
+  readonly conversation: ConversationSession
+  readonly route: MessageRoute
+  readonly turnState: TurnState
+  approvalRequest?: Readonly<ApprovalRequest>
+  approvalClaimed: boolean
+  granted: boolean
+}
+
+interface OutboundArtifactAuthority extends OutboundArtifactApprovalExpectation {
+  readonly handle: AgentHandle
+  readonly registry: WorkspaceRegistryLike
+  readonly registryIdentity: object
+  readonly workspace: RegisteredWorkspace
+  readonly workspaceIdentity: object
+  readonly persistenceIdentity: object
+  readonly limits: OutboundArtifactLimits
+  readonly uploadArtifact: NonNullable<LarkClientLike['uploadArtifact']>
+  readonly sendArtifact: NonNullable<LarkClientLike['sendArtifact']>
+}
+
+interface OutboundArtifactApprovalSnapshot {
+  readonly preflight: OutboundArtifactPreflight
+  readonly digest: string
+  readonly kind: PreparedOutboundArtifact['kind']
+  readonly bytes: number
+  readonly mediaType?: string
+  readonly width?: number
+  readonly height?: number
+  readonly attachmentIdentity?: object
+  readonly attachmentLimits?: CapturedImageLimits
 }
 
 type HumanInputSettlement = {
@@ -570,6 +647,8 @@ const PROJECT_ID_LIMIT = 256
 const PROJECT_CONTROL_CHARACTER_TEST_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 const PROJECT_PATH_LIKE_TITLE_PATTERN = /^(?:[A-Za-z]:\S|file:(?:[/\\]|$)|[/\\]{1,2}|~(?:[/\\]|$)|\.{1,2}(?:[/\\]|$))/iu
 const PROJECT_PLATFORM_TAG_TEST_PATTERN = /<[^>]*>/u
+const OUTBOUND_ARTIFACT_ACK_LIMIT = 512
+const OUTBOUND_ARTIFACT_ID_CONTROL_PATTERN = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 const SESSION_REFERENCE_HASH_DOMAIN = 'dsh-plugin-lark/session-reference/v1'
 const SESSION_REFERENCE_PATTERN = /^s_[A-Za-z0-9_-]{43}$/u
 const SESSION_LIST_PAGE_SIZE = 10
@@ -623,6 +702,13 @@ class InboundImageFollowupError extends Error {
   constructor(cause?: unknown) {
     super('lark: inbound image followup failed', { cause })
     this.name = 'InboundImageFollowupError'
+  }
+}
+
+class OutboundArtifactToolError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message)
+    this.name = 'OutboundArtifactToolError'
   }
 }
 
@@ -980,6 +1066,28 @@ function validModelIdentifier(value: string, maxLength: number): boolean {
     && value.trim() === value
     && value.isWellFormed()
     && !MODEL_CONTROL_CHARACTER_TEST_PATTERN.test(value)
+}
+
+function outboundArtifactRelativePath(args: unknown): string | undefined {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return undefined
+  const keys = Reflect.ownKeys(args)
+  if (keys.length !== 1 || keys[0] !== 'relative_path') return undefined
+  const descriptor = Object.getOwnPropertyDescriptor(args, 'relative_path')
+  return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'string'
+    ? descriptor.value
+    : undefined
+}
+
+function validOutboundArtifactAcknowledgement(value: unknown): value is string {
+  return typeof value === 'string'
+    && value !== ''
+    && value !== '.'
+    && value !== '..'
+    && value.length <= OUTBOUND_ARTIFACT_ACK_LIMIT
+    && value.isWellFormed()
+    && !value.includes('/')
+    && !value.includes('\\')
+    && !OUTBOUND_ARTIFACT_ID_CONTROL_PATTERN.test(value)
 }
 
 function modelSelectionFromConfig(
@@ -1489,6 +1597,10 @@ export class LarkBridge {
   private readonly maxInboundImagePixels: number
   private readonly maxConversationImages: number
   private readonly maxConversationImageBytes: number
+  private readonly outboundArtifacts: boolean
+  private readonly maxOutboundTextFileBytes: number
+  private readonly maxOutboundImageBytes: number
+  private readonly maxOutboundImagePixels: number
   private readonly humanInputTimeoutMs: number
   private readonly humanInputCardCloseTimeoutMs: number
   private readonly cwd: string
@@ -1513,6 +1625,15 @@ export class LarkBridge {
   private readonly pendingHumanInputMessages = new Map<string, PendingHumanInput>()
   private readonly pendingHumanInputSessions = new Map<string, PendingHumanInput>()
   private readonly pendingStops = new Map<string, PendingStop>()
+  private readonly outboundArtifactApprovals = new Map<
+    string,
+    OutboundArtifactApprovalExpectation
+  >()
+  private readonly outboundArtifactExecutions = new Map<
+    ToolExecutionToken,
+    Promise<{ readonly sent: true }>
+  >()
+  private readonly outboundArtifactPhases = new Map<ToolExecutionToken, OutboundArtifactPhase>()
   private readonly deliveryTasks = new Set<Promise<void>>()
   private readonly warnedEventTypes = new Set<string>()
   private readonly inboundTasks = new Map<string, Promise<void>>()
@@ -1542,6 +1663,8 @@ export class LarkBridge {
   private bindingRecoveryRequired = false
   private workspaceMutationRecoveryRequired = false
   private inboundImageSlotTaken = false
+  private outboundArtifactValidationSlotTaken = false
+  private outboundArtifactSlotTaken = false
   private commandAbort = new AbortController()
 
   constructor(ctx: Context, options: LarkBridgeOptions) {
@@ -1599,6 +1722,22 @@ export class LarkBridge {
       options.maxConversationImageBytes ?? DEFAULT_CONFIG.maxConversationImageBytes,
       MAX_CONVERSATION_IMAGE_BYTES,
       'maxConversationImageBytes',
+    )
+    this.outboundArtifacts = options.outboundArtifacts === true
+    this.maxOutboundTextFileBytes = positiveBoundedInteger(
+      options.maxOutboundTextFileBytes ?? DEFAULT_OUTBOUND_TEXT_BYTES,
+      MAX_OUTBOUND_TEXT_BYTES,
+      'maxOutboundTextFileBytes',
+    )
+    this.maxOutboundImageBytes = positiveBoundedInteger(
+      options.maxOutboundImageBytes ?? DEFAULT_OUTBOUND_IMAGE_BYTES,
+      MAX_OUTBOUND_IMAGE_BYTES,
+      'maxOutboundImageBytes',
+    )
+    this.maxOutboundImagePixels = positiveBoundedInteger(
+      options.maxOutboundImagePixels ?? DEFAULT_OUTBOUND_IMAGE_PIXELS,
+      MAX_OUTBOUND_IMAGE_PIXELS,
+      'maxOutboundImagePixels',
     )
     this.humanInputTimeoutMs = options.humanInputTimeoutMs ?? HUMAN_INPUT_LIMITS.timeoutMs
     if (!Number.isSafeInteger(this.humanInputTimeoutMs)
@@ -2301,9 +2440,20 @@ export class LarkBridge {
       this.ctx.logger.warn('[lark] rejected approval from a different chat or user')
       return actionToast('error', this.text.approvalWrongContext)
     }
+    if (candidate.messageId === undefined || action.messageId !== candidate.messageId) {
+      this.ctx.logger.warn('[lark] rejected approval from a different Card message')
+      return actionToast('error', this.text.approvalWrongContext)
+    }
     await this.conversationBarriers.get(candidate.baseId)
     const pending = this.pending.get(requestId)
     if (pending !== candidate) return actionToast('info', this.text.approvalExpired)
+    if (outcome === APPROVAL_OUTCOME.allowedOnce && candidate.outboundArtifact !== undefined) {
+      if (!this.outboundArtifactExpectationCurrent(candidate.outboundArtifact)) {
+        await pending.settle(APPROVAL_OUTCOME.cancelled, action.messageId)
+        return actionToast('info', this.text.approvalExpired)
+      }
+      candidate.outboundArtifact.granted = true
+    }
     const messageId = action.messageId !== '' ? action.messageId : undefined
     await pending.settle(outcome, messageId)
     const content = outcome === APPROVAL_OUTCOME.allowedOnce
@@ -2416,6 +2566,22 @@ export class LarkBridge {
     const sessionId = String(req.agent.session.id)
     const route = this.approvalRoute(sessionId)
     if (route === undefined) return next()
+    const outboundArtifact = req.toolName === OUTBOUND_ARTIFACT_TOOL_NAME
+      && req.callId !== undefined
+      ? this.outboundArtifactApprovals.get(
+          this.outboundArtifactApprovalKey(sessionId, String(req.callId)),
+        )
+      : undefined
+    if (req.toolName === OUTBOUND_ARTIFACT_TOOL_NAME
+      && (outboundArtifact === undefined
+        || outboundArtifact.approvalRequest !== req
+        || outboundArtifact.approvalClaimed
+        || req.agent !== outboundArtifact.agent
+        || req.signal !== outboundArtifact.approvalRequest.signal
+        || !this.outboundArtifactExpectationCurrent(outboundArtifact))) {
+      return Promise.resolve(APPROVAL_OUTCOME.unavailable)
+    }
+    if (outboundArtifact !== undefined) outboundArtifact.approvalClaimed = true
     if (this.stopping) return Promise.resolve(APPROVAL_OUTCOME.unavailable)
     if (this.client.sendCard === undefined) {
       this.ctx.logger.warn('[lark] sendCard missing; skip approval card')
@@ -2460,6 +2626,7 @@ export class LarkBridge {
         baseId: route.sessionBaseId,
         chatId: route.chatId,
         openId: route.openId,
+        ...(outboundArtifact === undefined ? {} : { outboundArtifact }),
       }
       this.pending.set(requestId, pending)
       if (req.signal !== undefined) {
@@ -2482,6 +2649,7 @@ export class LarkBridge {
       const delivery = sending.then((messageId) => {
         if (typeof messageId === 'string' && messageId !== '') {
           deliveredMessageId = messageId
+          pending.messageId = messageId
           return settledOutcome === undefined
             ? undefined
             : settle(settledOutcome, messageId)
@@ -2836,6 +3004,561 @@ export class LarkBridge {
         'LARK_HUMAN_INPUT_UNAVAILABLE',
         'ask_user_question is unavailable in this Lark conversation',
       )
+    }
+  }
+
+  private outboundArtifactTool(sessionId: ReturnType<typeof SessionId>) {
+    return defineTool({
+      name: OUTBOUND_ARTIFACT_TOOL_NAME,
+      description: [
+        'Send one approved text file or static PNG/JPEG from the current registered Workspace',
+        'to the Lark message that started this turn. The path must be relative. A human approval',
+        'is always required; URLs, absolute paths, hidden files, and nested Code Mode are rejected.',
+      ].join(' '),
+      parameters: {
+        relative_path: {
+          type: 'string',
+          required: true,
+          description: 'Workspace-relative path to one .txt/.log/.patch/.diff/.png/.jpg/.jpeg file.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: { sent: { type: 'boolean', const: true } },
+          additionalProperties: false,
+        },
+        render: () => [{
+          type: 'text' as const,
+          text: this.text.outboundArtifactConfirmed,
+        }],
+      },
+      execute: (args, exec) => this.executeOutboundArtifactOnce(sessionId, args, exec),
+      finalizeContent: (exec, result) => this.finalizeOutboundArtifactContent(exec, result),
+      presentCall: () => ({
+        card: 'generic',
+        title: this.text.outboundArtifactCallTitle,
+        kind: 'other',
+      }),
+      presentResult: (_args, result) => ({
+        card: 'generic',
+        title: result.isError
+          ? this.text.outboundArtifactFailedTitle
+          : this.text.outboundArtifactSentTitle,
+        content: result.content,
+      }),
+    })
+  }
+
+  private executeOutboundArtifactOnce(
+    sessionId: ReturnType<typeof SessionId>,
+    args: unknown,
+    exec: ToolRunContext,
+  ): Promise<{ readonly sent: true }> {
+    const existing = this.outboundArtifactExecutions.get(exec.token)
+    if (existing !== undefined) return existing
+    this.outboundArtifactPhases.set(exec.token, 'validating')
+    const relativePath = outboundArtifactRelativePath(args)
+    const task = (relativePath === undefined
+      ? Promise.reject(new OutboundArtifactToolError(
+          'LARK_ARTIFACT_INVALID',
+          'Artifact arguments are invalid.',
+        ))
+      : this.executeOutboundArtifact(sessionId, relativePath, exec)).catch(() => {
+      throw this.outboundArtifactPhaseError(exec.token)
+    })
+    this.outboundArtifactExecutions.set(exec.token, task)
+    return task
+  }
+
+  private outboundArtifactPhaseError(token: ToolExecutionToken): OutboundArtifactToolError {
+    const phase = this.outboundArtifactPhases.get(token) ?? 'validating'
+    if (phase === 'sent-confirmed') {
+      return new OutboundArtifactToolError(
+        'LARK_ARTIFACT_SENT_CONFIRMED',
+        this.text.outboundArtifactSentBeforeInterrupt,
+      )
+    }
+    if (phase === 'send-started') {
+      return new OutboundArtifactToolError(
+        'LARK_ARTIFACT_DELIVERY_UNKNOWN',
+        this.text.outboundArtifactDeliveryUnknown,
+      )
+    }
+    if (phase === 'upload-started' || phase === 'uploaded') {
+      return new OutboundArtifactToolError(
+        'LARK_ARTIFACT_UPLOAD_UNKNOWN',
+        this.text.outboundArtifactUploadUnknown,
+      )
+    }
+    return new OutboundArtifactToolError(
+      'LARK_ARTIFACT_NOT_SENT',
+      this.text.outboundArtifactNotSent,
+    )
+  }
+
+  private finalizeOutboundArtifactContent(
+    exec: Readonly<ToolExecution>,
+    result: Readonly<ToolExecutionResult>,
+  ): ContentBlock[] | undefined {
+    const phase = this.outboundArtifactPhases.get(exec.token)
+    this.outboundArtifactExecutions.delete(exec.token)
+    this.outboundArtifactPhases.delete(exec.token)
+    let message: string
+    switch (phase) {
+      case 'sent-confirmed':
+        message = result.isError
+          ? this.text.outboundArtifactSentBeforeInterrupt
+          : this.text.outboundArtifactConfirmed
+        break
+      case 'send-started':
+        message = this.text.outboundArtifactDeliveryUnknown
+        break
+      case 'upload-started':
+      case 'uploaded':
+        message = this.text.outboundArtifactUploadUnknown
+        break
+      default:
+        message = result.isError
+          ? this.text.outboundArtifactNotSent
+          : this.text.outboundArtifactNotConfirmed
+        break
+    }
+    return [{ type: 'text', text: result.isError ? `Error: ${message}` : message }]
+  }
+
+  private outboundArtifactApprovalKey(sessionId: string, callId: string): string {
+    return `${sessionId}\0${callId}`
+  }
+
+  private outboundArtifactActivity(
+    expectation: OutboundArtifactApprovalExpectation,
+  ): ToolCardItem | undefined {
+    const index = expectation.turnState.toolIndexes.get(expectation.callId)
+    return index === undefined ? undefined : expectation.turnState.tools[index]
+  }
+
+  private outboundArtifactExpectationCurrent(
+    expectation: OutboundArtifactApprovalExpectation,
+  ): boolean {
+    const conversation = this.conversations.get(expectation.route.sessionBaseId)
+    const activity = this.outboundArtifactActivity(expectation)
+    return !this.stopping
+      && expectation.agent.status === 'running'
+      && this.ctx.agents.get(expectation.agent.id) === expectation.agent
+      && this.ctx.agents.roots().some((agent) => agent === expectation.agent)
+      && conversation === expectation.conversation
+      && conversation?.sessionId === expectation.sessionId
+      && conversation.handle.agent === expectation.agent
+      && this.activeRoutes.get(expectation.sessionId) === expectation.route
+      && this.activeTurnState(expectation.sessionId) === expectation.turnState
+      && expectation.turnState.status === 'running'
+      && activity?.name === OUTBOUND_ARTIFACT_TOOL_NAME
+      && activity.status === 'running'
+  }
+
+  private async captureOutboundArtifactAuthority(
+    sessionId: ReturnType<typeof SessionId>,
+    exec: ToolRunContext,
+    signal: AbortSignal,
+  ): Promise<OutboundArtifactAuthority> {
+    const key = String(sessionId)
+    const callId = String(exec.callId)
+    if (!this.outboundArtifacts
+      || process.platform !== 'linux'
+      || exec.parent !== undefined
+      || String(exec.rootCallId) !== callId
+      || exec.agent === undefined
+      || signal.aborted
+      || this.stopping
+      || sessionPersistenceOf(this.ctx) === undefined
+      || this.client.uploadArtifact === undefined
+      || this.client.sendArtifact === undefined) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_UNAVAILABLE', 'Artifact authority is unavailable.')
+    }
+    let initiator: Agent | undefined
+    try {
+      initiator = this.ctx.agents.currentInitiator()
+    } catch {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_UNAVAILABLE', 'Artifact authority is unavailable.')
+    }
+    if (initiator !== exec.agent) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_UNAVAILABLE', 'Artifact authority is unavailable.')
+    }
+    const route = this.activeRoutes.get(key)
+    const turnState = this.activeTurnState(key)
+    const handle = await this.handles.get(key)
+    if (route === undefined || turnState === undefined || handle?.agent !== exec.agent) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact turn is no longer active.')
+    }
+    const conversation = this.conversations.get(route.sessionBaseId)
+    const expectation: OutboundArtifactApprovalExpectation = {
+      key: this.outboundArtifactApprovalKey(key, callId),
+      agent: exec.agent,
+      callId,
+      sessionId: key,
+      conversation: conversation as ConversationSession,
+      route,
+      turnState,
+      approvalClaimed: false,
+      granted: false,
+    }
+    if (conversation === undefined
+      || !this.outboundArtifactExpectationCurrent(expectation)
+      || !this.authorized(route.openId)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact turn is no longer active.')
+    }
+    const registry = workspaceRegistryOf(this.ctx)
+    const persistence = sessionPersistenceOf(this.ctx)
+    const cwd = exec.agent.session.header.cwd
+    if (registry === undefined
+      || persistence === undefined
+      || cwd === undefined
+      || !isAbsolute(cwd)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_WORKSPACE', 'Registered Workspace authority is unavailable.')
+    }
+    const matches = listedWorkspaces(registry).filter((workspace) => workspace.path === cwd)
+    if (matches.length !== 1) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_WORKSPACE', 'Registered Workspace authority is unavailable.')
+    }
+    const workspace = matches[0]!
+    const current = registry.get(workspace.id)
+    const registryIdentity = serviceInstanceIdentity(registry)
+    const workspaceIdentity = serviceInstanceIdentity(workspace)
+    const persistenceIdentity = serviceInstanceIdentity(persistence)
+    if (current === undefined
+      || serviceInstanceIdentity(current) !== workspaceIdentity
+      || registeredWorkspace(current).path !== workspace.path) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_WORKSPACE', 'Registered Workspace authority changed.')
+    }
+    const workspaceStatus = await workspace.status()
+    const latestRegistry = workspaceRegistryOf(this.ctx)
+    const latestPersistence = sessionPersistenceOf(this.ctx)
+    const latestWorkspace = latestRegistry?.get(workspace.id)
+    if (workspaceStatus !== 'ok'
+      || latestRegistry === undefined
+      || latestPersistence === undefined
+      || latestWorkspace === undefined
+      || serviceInstanceIdentity(latestRegistry) !== registryIdentity
+      || serviceInstanceIdentity(latestPersistence) !== persistenceIdentity
+      || serviceInstanceIdentity(latestWorkspace) !== workspaceIdentity
+      || registeredWorkspace(latestWorkspace).path !== workspace.path
+      || !this.outboundArtifactExpectationCurrent(expectation)
+      || signal.aborted) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_WORKSPACE', 'Registered Workspace authority changed.')
+    }
+    conversation.workspaceId = workspace.id
+    return {
+      ...expectation,
+      handle,
+      registry,
+      registryIdentity,
+      workspace,
+      workspaceIdentity,
+      persistenceIdentity,
+      limits: Object.freeze({
+        maxTextBytes: this.maxOutboundTextFileBytes,
+        maxImageBytes: this.maxOutboundImageBytes,
+        maxImagePixels: this.maxOutboundImagePixels,
+      }),
+      uploadArtifact: this.client.uploadArtifact,
+      sendArtifact: this.client.sendArtifact,
+    }
+  }
+
+  private async outboundArtifactAuthorityCurrent(
+    authority: OutboundArtifactAuthority,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    let initiator: Agent | undefined
+    try {
+      initiator = this.ctx.agents.currentInitiator()
+    } catch {
+      return false
+    }
+    if (signal.aborted
+      || initiator !== authority.agent
+      || !this.outboundArtifactExpectationCurrent(authority)
+      || authority.conversation.handle !== authority.handle
+      || this.client.uploadArtifact !== authority.uploadArtifact
+      || this.client.sendArtifact !== authority.sendArtifact
+      || authority.agent.session.header.cwd !== authority.workspace.path) return false
+    try {
+      const registry = workspaceRegistryOf(this.ctx)
+      const persistence = sessionPersistenceOf(this.ctx)
+      if (registry === undefined
+        || persistence === undefined
+        || serviceInstanceIdentity(persistence) !== authority.persistenceIdentity
+        || serviceInstanceIdentity(registry) !== authority.registryIdentity) return false
+      const current = registry.get(authority.workspace.id)
+      if (current === undefined) return false
+      const workspace = registeredWorkspace(current)
+      if (serviceInstanceIdentity(workspace) !== authority.workspaceIdentity
+        || workspace.path !== authority.workspace.path
+        || listedWorkspaces(registry).filter((entry) => entry.path === workspace.path).length !== 1
+        || await workspace.status() !== 'ok') return false
+      const latestRegistry = workspaceRegistryOf(this.ctx)
+      const latestWorkspace = latestRegistry?.get(authority.workspace.id)
+      const latestPersistence = sessionPersistenceOf(this.ctx)
+      return !signal.aborted
+        && latestRegistry !== undefined
+        && latestWorkspace !== undefined
+        && latestPersistence !== undefined
+        && serviceInstanceIdentity(latestRegistry) === authority.registryIdentity
+        && serviceInstanceIdentity(latestWorkspace) === authority.workspaceIdentity
+        && serviceInstanceIdentity(latestPersistence) === authority.persistenceIdentity
+        && registeredWorkspace(latestWorkspace).path === authority.workspace.path
+        && this.outboundArtifactExpectationCurrent(authority)
+    } catch {
+      return false
+    }
+  }
+
+  private async outboundArtifactApprovalSnapshot(
+    authority: OutboundArtifactAuthority,
+    relativePath: string,
+    signal: AbortSignal,
+  ): Promise<OutboundArtifactApprovalSnapshot> {
+    if (!await this.outboundArtifactAuthorityCurrent(authority, signal)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact authority changed.')
+    }
+    const preflight = await inspectOutboundArtifact(
+      authority.workspace.path,
+      relativePath,
+      authority.limits,
+      { signal },
+    )
+    if (!await this.outboundArtifactAuthorityCurrent(authority, signal)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact authority changed.')
+    }
+    const prepared = await readOutboundArtifact(preflight, authority.limits, { signal })
+    let attachmentIdentity: object | undefined
+    let attachmentLimits: CapturedImageLimits | undefined
+    if (prepared.kind === 'image') {
+      const attachments = attachmentStoreOf(this.ctx)
+      if (attachments === undefined) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_IMAGE', 'Image validation is unavailable.')
+      }
+      attachmentLimits = captureImageLimits(attachments.imageLimits)
+      attachmentIdentity = serviceInstanceIdentity(attachments)
+      if (!attachmentLimits.mediaTypes.includes(prepared.mediaType)
+        || prepared.bytes > Math.min(
+          authority.limits.maxImageBytes,
+          attachmentLimits.maxImageBytes,
+          attachmentLimits.maxMessageBytes,
+        )
+        || prepared.width * prepared.height > Math.min(
+          authority.limits.maxImagePixels,
+          attachmentLimits.maxPixels,
+        )) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_IMAGE', 'Image exceeds deployment limits.')
+      }
+      await attachments.validateImage({ data: prepared.data, mediaType: prepared.mediaType })
+      const current = attachmentStoreOf(this.ctx)
+      if (signal.aborted
+        || current === undefined
+        || serviceInstanceIdentity(current) !== attachmentIdentity
+        || !sameImageLimits(attachments, attachmentLimits)) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_IMAGE', 'Image validation authority changed.')
+      }
+    }
+    if (!await this.outboundArtifactAuthorityCurrent(authority, signal)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact authority changed.')
+    }
+    return Object.freeze({
+      preflight,
+      digest: createHash('sha256').update(prepared.data).digest('hex'),
+      kind: prepared.kind,
+      bytes: prepared.bytes,
+      ...(prepared.kind === 'image'
+        ? {
+            mediaType: prepared.mediaType,
+            width: prepared.width,
+            height: prepared.height,
+            attachmentIdentity,
+            attachmentLimits,
+          }
+        : {}),
+    })
+  }
+
+  private async rereadApprovedOutboundArtifact(
+    authority: OutboundArtifactAuthority,
+    snapshot: OutboundArtifactApprovalSnapshot,
+    signal: AbortSignal,
+  ): Promise<PreparedOutboundArtifact> {
+    const prepared = await readOutboundArtifact(snapshot.preflight, authority.limits, { signal })
+    const digest = createHash('sha256').update(prepared.data).digest('hex')
+    if (prepared.kind !== snapshot.kind
+      || prepared.bytes !== snapshot.bytes
+      || digest !== snapshot.digest
+      || (prepared.kind === 'image'
+        && (prepared.mediaType !== snapshot.mediaType
+          || prepared.width !== snapshot.width
+          || prepared.height !== snapshot.height))) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_CHANGED', 'Artifact changed after approval.')
+    }
+    if (prepared.kind === 'image') {
+      const attachments = attachmentStoreOf(this.ctx)
+      if (attachments === undefined
+        || snapshot.attachmentIdentity === undefined
+        || snapshot.attachmentLimits === undefined
+        || serviceInstanceIdentity(attachments) !== snapshot.attachmentIdentity
+        || !sameImageLimits(attachments, snapshot.attachmentLimits)) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_IMAGE', 'Image validation authority changed.')
+      }
+      await attachments.validateImage({ data: prepared.data, mediaType: prepared.mediaType })
+      const current = attachmentStoreOf(this.ctx)
+      if (signal.aborted
+        || current === undefined
+        || serviceInstanceIdentity(current) !== snapshot.attachmentIdentity
+        || !sameImageLimits(attachments, snapshot.attachmentLimits)) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_IMAGE', 'Image validation authority changed.')
+      }
+    }
+    if (!await this.outboundArtifactAuthorityCurrent(authority, signal)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact authority changed.')
+    }
+    return prepared
+  }
+
+  private outboundImageValidationCurrent(
+    snapshot: OutboundArtifactApprovalSnapshot,
+  ): boolean {
+    if (snapshot.kind !== 'image') return true
+    if (snapshot.attachmentIdentity === undefined || snapshot.attachmentLimits === undefined) {
+      return false
+    }
+    try {
+      const attachments = attachmentStoreOf(this.ctx)
+      return attachments !== undefined
+        && serviceInstanceIdentity(attachments) === snapshot.attachmentIdentity
+        && sameImageLimits(attachments, snapshot.attachmentLimits)
+    } catch {
+      return false
+    }
+  }
+
+  private async requestOutboundArtifactApproval(
+    authority: OutboundArtifactAuthority,
+    snapshot: OutboundArtifactApprovalSnapshot,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const approval = this.ctx.get('approval') as unknown as {
+      request?: (request: ApprovalRequest) => Promise<ApprovalOutcome>
+    } | undefined
+    if (typeof approval?.request !== 'function'
+      || this.outboundArtifactApprovals.has(authority.key)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_APPROVAL', 'Lark approval is unavailable.')
+    }
+    this.outboundArtifactApprovals.set(authority.key, authority)
+    let outcome: ApprovalOutcome
+    const reason = this.text.outboundArtifactApprovalReason(
+      snapshot.kind,
+      snapshot.preflight.name,
+      snapshot.bytes,
+    )
+    const request = Object.freeze({
+      agent: authority.agent,
+      toolName: OUTBOUND_ARTIFACT_TOOL_NAME,
+      callId: authority.callId as never,
+      reason,
+      signal,
+    }) satisfies Readonly<ApprovalRequest>
+    authority.approvalRequest = request
+    try {
+      outcome = await approval.request(request)
+    } finally {
+      this.outboundArtifactApprovals.delete(authority.key)
+    }
+    if (outcome !== APPROVAL_OUTCOME.allowedOnce || !authority.granted || signal.aborted) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_APPROVAL', 'Lark approval was not granted.')
+    }
+  }
+
+  private async executeOutboundArtifact(
+    sessionId: ReturnType<typeof SessionId>,
+    relativePath: string,
+    exec: ToolRunContext,
+  ): Promise<{ readonly sent: true }> {
+    const signal = AbortSignal.any([exec.signal, this.commandAbort.signal])
+    const authority = await this.captureOutboundArtifactAuthority(sessionId, exec, signal)
+    if (this.outboundArtifactValidationSlotTaken) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_BUSY', 'Another artifact is being validated.')
+    }
+    this.outboundArtifactValidationSlotTaken = true
+    let snapshot: OutboundArtifactApprovalSnapshot
+    try {
+      snapshot = await this.outboundArtifactApprovalSnapshot(authority, relativePath, signal)
+    } finally {
+      this.outboundArtifactValidationSlotTaken = false
+    }
+    if (!await this.outboundArtifactAuthorityCurrent(authority, signal)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact authority changed.')
+    }
+    this.outboundArtifactPhases.set(exec.token, 'awaiting-approval')
+    await this.requestOutboundArtifactApproval(authority, snapshot, signal)
+    this.outboundArtifactPhases.set(exec.token, 'approved')
+    if (sessionPersistenceOf(this.ctx) === undefined) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_DURABILITY', 'Approval persistence is unavailable.')
+    }
+    const durable = await this.ctx.sessions.flush(authority.agent.session)
+    if (durable !== true || !await this.outboundArtifactAuthorityCurrent(authority, signal)) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_DURABILITY', 'Approval audit is not durable.')
+    }
+    if (this.outboundArtifactSlotTaken) {
+      throw new OutboundArtifactToolError('LARK_ARTIFACT_BUSY', 'Another artifact is being sent.')
+    }
+    this.outboundArtifactSlotTaken = true
+    try {
+      const prepared = await this.rereadApprovedOutboundArtifact(authority, snapshot, signal)
+      if (!await this.outboundArtifactAuthorityCurrent(authority, signal)
+        || !this.outboundImageValidationCurrent(snapshot)) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact authority changed.')
+      }
+      this.outboundArtifactPhases.set(exec.token, 'upload-started')
+      const uploaded = await authority.uploadArtifact.call(this.client, {
+        kind: prepared.kind,
+        data: prepared.data,
+        ...(prepared.kind === 'file' ? { name: prepared.name } : {}),
+      }, { signal })
+      this.outboundArtifactPhases.set(exec.token, 'uploaded')
+      if (uploaded === null
+        || typeof uploaded !== 'object'
+        || uploaded.kind !== prepared.kind
+        || !await this.outboundArtifactAuthorityCurrent(authority, signal)
+        || !this.outboundImageValidationCurrent(snapshot)) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_STALE', 'Artifact authority changed.')
+      }
+      const current = await inspectOutboundArtifact(
+        authority.workspace.path,
+        relativePath,
+        authority.limits,
+        { signal },
+      )
+      if (!sameOutboundArtifactPreflight(snapshot.preflight, current)
+        || !await this.outboundArtifactAuthorityCurrent(authority, signal)
+        || !this.outboundImageValidationCurrent(snapshot)) {
+        throw new OutboundArtifactToolError('LARK_ARTIFACT_CHANGED', 'Artifact changed before delivery.')
+      }
+      this.outboundArtifactPhases.set(exec.token, 'send-started')
+      const acknowledgement = await authority.sendArtifact.call(this.client, authority.route.chatId, uploaded, {
+        replyToMessageId: authority.route.replyToMessageId,
+        ...(authority.route.replyInThread === true ? { replyInThread: true } : {}),
+        signal,
+        idempotencyKey: randomUUID(),
+      })
+      if (!validOutboundArtifactAcknowledgement(acknowledgement)) {
+        throw new OutboundArtifactToolError(
+          'LARK_ARTIFACT_DELIVERY_UNKNOWN',
+          'Artifact delivery acknowledgement is invalid.',
+        )
+      }
+      this.outboundArtifactPhases.set(exec.token, 'sent-confirmed')
+      exec.concludeTurn()
+      return { sent: true }
+    } finally {
+      this.outboundArtifactSlotTaken = false
     }
   }
 
@@ -5941,6 +6664,15 @@ export class LarkBridge {
     const setup = async (agentCtx: Context): Promise<void> => {
       installModelSelection(agentCtx, modelSelectionRef)
       await composition.setup?.(agentCtx)
+      if (this.outboundArtifacts
+        && process.platform === 'linux'
+        && this.client.uploadArtifact !== undefined
+        && this.client.sendArtifact !== undefined
+        && this.hasApprovalSeam()
+        && sessionPersistenceOf(this.ctx) !== undefined
+        && workspaceRegistryOf(this.ctx) !== undefined) {
+        agentCtx.tools.register(this.outboundArtifactTool(sessionId))
+      }
       const scopedTools = (agentCtx as unknown as { tools?: {
         get?: Context['tools']['get']
       } }).tools
@@ -6283,7 +7015,9 @@ export class LarkBridge {
     const tool: ToolCardItem = {
       id,
       name: event.data.name,
-      detail: compactJson(event.data.arguments),
+      ...(event.data.name === OUTBOUND_ARTIFACT_TOOL_NAME
+        ? {}
+        : { detail: compactJson(event.data.arguments) }),
       status: 'running',
       startedAt: previous?.startedAt ?? time,
       updatedAt: time,
@@ -6741,6 +7475,11 @@ export class LarkBridge {
     this.pendingHumanInputs.clear()
     this.pendingHumanInputMessages.clear()
     this.pendingHumanInputSessions.clear()
+    this.outboundArtifactApprovals.clear()
+    this.outboundArtifactExecutions.clear()
+    this.outboundArtifactPhases.clear()
+    this.outboundArtifactValidationSlotTaken = false
+    this.outboundArtifactSlotTaken = false
     this.sessionOperations.clear()
   }
 

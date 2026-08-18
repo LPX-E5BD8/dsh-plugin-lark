@@ -11,6 +11,11 @@ import {
   MAX_INBOUND_IMAGE_PIXELS,
 } from './inbound-image.ts'
 import { MAX_INBOUND_TEXT_RESOURCE_BYTES } from './inbound-resource.ts'
+import {
+  MAX_OUTBOUND_IMAGE_BYTES,
+  MAX_OUTBOUND_IMAGE_PIXELS,
+  MAX_OUTBOUND_TEXT_BYTES,
+} from './outbound-artifact.ts'
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { LarkSdkClient } from './lark.ts'
 import { LARK_LOCALES } from './locale.ts'
@@ -37,6 +42,10 @@ export interface LarkConfig {
   maxInboundImagePixels?: number
   maxConversationImages?: number
   maxConversationImageBytes?: number
+  outboundArtifacts?: boolean
+  maxOutboundTextFileBytes?: number
+  maxOutboundImageBytes?: number
+  maxOutboundImagePixels?: number
 }
 
 export const Config: Schema = Schema.object({
@@ -74,6 +83,19 @@ export const Config: Schema = Schema.object({
     .min(1)
     .max(MAX_CONVERSATION_IMAGE_BYTES)
     .default(DEFAULT_CONFIG.maxConversationImageBytes),
+  outboundArtifacts: Schema.boolean().default(DEFAULT_CONFIG.outboundArtifacts),
+  maxOutboundTextFileBytes: Schema.natural()
+    .min(1)
+    .max(MAX_OUTBOUND_TEXT_BYTES)
+    .default(DEFAULT_CONFIG.maxOutboundTextFileBytes),
+  maxOutboundImageBytes: Schema.natural()
+    .min(1)
+    .max(MAX_OUTBOUND_IMAGE_BYTES)
+    .default(DEFAULT_CONFIG.maxOutboundImageBytes),
+  maxOutboundImagePixels: Schema.natural()
+    .min(1)
+    .max(MAX_OUTBOUND_IMAGE_PIXELS)
+    .default(DEFAULT_CONFIG.maxOutboundImagePixels),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -175,6 +197,10 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         maxInboundImagePixels: config.maxInboundImagePixels,
         maxConversationImages: config.maxConversationImages,
         maxConversationImageBytes: config.maxConversationImageBytes,
+        outboundArtifacts: config.outboundArtifacts,
+        maxOutboundTextFileBytes: config.maxOutboundTextFileBytes,
+        maxOutboundImageBytes: config.maxOutboundImageBytes,
+        maxOutboundImagePixels: config.maxOutboundImagePixels,
         sessionReferenceNamespace: appId,
       })
       await bridge.start()
@@ -203,6 +229,9 @@ export {
 } from './cards.ts'
 export { LarkResourceError, LarkSdkClient, splitText, unwrapCardAction } from './lark.ts'
 export type {
+  LarkArtifactDeliveryOptions,
+  LarkArtifactUploadInput,
+  LarkArtifactUploadOptions,
   LarkCardAction,
   LarkCardActionResult,
   LarkClientLike,
@@ -214,6 +243,7 @@ export type {
   LarkInboundResource,
   LarkResourceDownloadOptions,
   LarkResourceErrorCode,
+  LarkUploadedArtifact,
 } from './lark.ts'
 export { LARK_LOCALES } from './locale.ts'
 export type { LarkLocale } from './locale.ts'

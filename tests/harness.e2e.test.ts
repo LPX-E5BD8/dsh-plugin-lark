@@ -28,23 +28,38 @@ import UserQuestionService from '@deepseek-ai/dsh-user-questions'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { LarkBridge } from '../src/bridge.ts'
 import { inject as larkInject } from '../src/index.ts'
+import { OUTBOUND_ARTIFACT_TOOL_NAME } from '../src/outbound-artifact.ts'
 import {
   DurableConversationBindingStore,
   type ConversationBindingStore,
 } from '../src/conversation-binding.ts'
 import { DurableInboundDeduplicator } from '../src/inbound-dedup.ts'
 import type {
+  LarkArtifactDeliveryOptions,
+  LarkArtifactUploadInput,
   LarkCardAction,
   LarkCardActionResult,
   LarkClientLike,
   LarkInbound,
+  LarkUploadedArtifact,
 } from '../src/lark.ts'
 import type { LarkLocale } from '../src/locale.ts'
+
+const linuxOutboundTest = process.platform === 'linux' ? test : test.skip
 
 type HarnessClient = LarkClientLike & {
   readonly cards: Array<{ messageId: string; card: unknown }>
   readonly updated: Array<{ messageId: string; card: unknown }>
   readonly sent: string[]
+  readonly artifactUploads: Array<{
+    readonly input: LarkArtifactUploadInput
+    readonly artifact: LarkUploadedArtifact
+  }>
+  readonly artifactSends: Array<{
+    readonly chatId: string
+    readonly artifact: LarkUploadedArtifact
+    readonly options: LarkArtifactDeliveryOptions
+  }>
   stopped: boolean
   messageHandler?: (message: LarkInbound) => Promise<void>
   cardHandler?: (action: LarkCardAction) => Promise<LarkCardActionResult>
@@ -55,6 +70,8 @@ function createClient(): HarnessClient {
     cards: [],
     updated: [],
     sent: [],
+    artifactUploads: [],
+    artifactSends: [],
     stopped: false,
     async start() {},
     async stop() { client.stopped = true },
@@ -65,6 +82,21 @@ function createClient(): HarnessClient {
       return messageId
     },
     async updateCard(messageId, card) { client.updated.push({ messageId, card }) },
+    async uploadArtifact(input) {
+      const artifact = Object.freeze({ kind: input.kind })
+      client.artifactUploads.push({
+        input: Object.freeze({
+          ...input,
+          data: Uint8Array.from(input.data),
+        }),
+        artifact,
+      })
+      return artifact
+    },
+    async sendArtifact(chatId, artifact, options) {
+      client.artifactSends.push({ chatId, artifact, options })
+      return `artifact-message-${client.artifactSends.length}`
+    },
     onMessage(handler) { client.messageHandler = handler },
     onCardAction(handler) { client.cardHandler = handler },
   }
@@ -88,6 +120,26 @@ function toolResponse(): StreamChunk[] {
     { type: 'block-start', index: 0, blockType: 'tool-call' },
     { type: 'tool-call-delta', index: 0, id: callId, name: 'echo', argumentsDelta: args },
     { type: 'block-end', index: 0, block: { type: 'tool-call', id: callId, name: 'echo', arguments: args } },
+    { type: 'usage', usage: { inputTokens: 10, outputTokens: 2 } },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+}
+
+function namedToolResponse(
+  name: string,
+  args: unknown,
+  id = `${name}-call`,
+): StreamChunk[] {
+  const callId = CallId(id)
+  const encoded = JSON.stringify(args)
+  return [
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: callId, name, argumentsDelta: encoded },
+    {
+      type: 'block-end',
+      index: 0,
+      block: { type: 'tool-call', id: callId, name, arguments: encoded },
+    },
     { type: 'usage', usage: { inputTokens: 10, outputTokens: 2 } },
     { type: 'finish', reason: { kind: 'tool-calls' } },
   ]
@@ -460,12 +512,14 @@ async function mount(
   rootOwnedCleanup = false,
   inboundTextFiles = false,
   inboundImages = false,
+  outboundArtifacts = false,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
   client: HarnessClient
   workspaces: HarnessWorkspace[]
   remountAttachmentStore(): Promise<void>
+  remountSessionPersistence(): Promise<void>
   dispose(): Promise<void>
 }> {
   const ctx = new Context()
@@ -499,7 +553,11 @@ async function mount(
     await ctx.plugin(AskUserQuestionTool)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
-    await ctx.plugin(JsonlSessionPersistence, { root, compression: sessionCompression })
+    let sessionPersistenceFiber = ctx.plugin(JsonlSessionPersistence, {
+      root,
+      compression: sessionCompression,
+    })
+    await sessionPersistenceFiber
     await ctx.plugin(SessionCheckpointPolicy)
     await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
     await ctx.plugin(ApprovalService)
@@ -564,6 +622,7 @@ async function mount(
           humanInputCardCloseTimeoutMs,
           inboundTextFiles,
           inboundImages,
+          outboundArtifacts,
           cwd: realWorkspaceCwd,
         })
         bridge = candidate
@@ -588,6 +647,14 @@ async function mount(
         await attachmentFiber.dispose()
         attachmentFiber = ctx.plugin(LocalAttachmentStore, attachmentConfig)
         await attachmentFiber
+      },
+      async remountSessionPersistence() {
+        await sessionPersistenceFiber.dispose()
+        sessionPersistenceFiber = ctx.plugin(JsonlSessionPersistence, {
+          root,
+          compression: sessionCompression,
+        })
+        await sessionPersistenceFiber
       },
       dispose() {
         disposal ??= (async () => {
@@ -1103,6 +1170,965 @@ test('harness e2e: message, tool approval, cards, and teardown stay assembled', 
   await harness.dispose()
   assert.equal(harness.client.stopped, true)
   assert.equal(agents.list().length, 0)
+})
+
+linuxOutboundTest('harness e2e: exact Lark approval sends one Workspace artifact as one reply', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-harness-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(join(workspace, 'generated'), { recursive: true })
+  await writeFile(join(workspace, 'generated', 'report.txt'), 'approved artifact\n')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'generated/report.txt' },
+      'outbound-artifact-call',
+    ),
+    textResponse('artifact complete'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Outbound')
+  let duplicateDelegation = 0
+  harness.ctx.on('tools/execute', async (exec, next) => {
+    if (exec.name !== OUTBOUND_ARTIFACT_TOOL_NAME) return next()
+    duplicateDelegation += 1
+    const [first, second] = await Promise.all([next(), next()])
+    assert.deepEqual(second, first)
+    return first
+  })
+  const inbound = conversationCommand('chat-outbound', 'send the generated report')
+  await harness.client.messageHandler?.(inbound)
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  const requestId = approvalRequestId(approval?.card)
+  assert.ok(approval !== undefined)
+  assert.ok(requestId !== '')
+
+  const wrongCard = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-outbound',
+    messageId: 'card-from-another-request',
+    value: { request_id: requestId, decision: 'allowed-once' },
+  })
+  assert.equal(wrongCard?.toast.type, 'error')
+  assert.equal(harness.client.artifactUploads.length, 0)
+
+  const allowed = await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-outbound',
+    messageId: approval.messageId,
+    value: { request_id: requestId, decision: 'allowed-once' },
+  })
+  assert.equal(allowed?.toast.type, 'success')
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  assert.equal(duplicateDelegation, 1)
+  assert.equal(harness.client.artifactUploads[0]?.input.kind, 'file')
+  assert.equal(harness.client.artifactUploads[0]?.input.name, 'report.txt')
+  assert.equal(
+    new TextDecoder().decode(harness.client.artifactUploads[0]?.input.data),
+    'approved artifact\n',
+  )
+  assert.equal(harness.client.artifactSends.length, 1)
+  assert.equal(harness.client.artifactSends[0]?.chatId, 'chat-outbound')
+  assert.equal(harness.client.artifactSends[0]?.options.replyToMessageId, inbound.messageId)
+  assert.match(harness.client.artifactSends[0]?.options.idempotencyKey ?? '', /^[0-9a-f-]{36}$/u)
+  const result = agent.session.events.findLast((event) => event.type === 'tool/result')
+  assert.ok(result !== undefined)
+  const serialized = JSON.stringify(result)
+  assert.match(serialized, /delivery to the originating Lark conversation was confirmed/iu)
+  assert.doesNotMatch(serialized, /generated\/report|workspace-outbound|chat-outbound/u)
+  assert.doesNotMatch(
+    JSON.stringify({ cards: harness.client.cards, updated: harness.client.updated }),
+    /generated\/report|workspace-outbound|chat-outbound/u,
+  )
+})
+
+linuxOutboundTest('harness e2e: definition-owned finalization removes a post-execute success marker', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-finalize-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'finalize marker source')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-finalize-call',
+    ),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Finalize')
+  const privateMarker = 'PRIVATE_POST_EXECUTE_SUCCESS_MARKER'
+  const disposePost = harness.ctx.on('tools/post-execute', (exec, _result, next) => (
+    exec.name === OUTBOUND_ARTIFACT_TOOL_NAME
+      ? Promise.resolve({
+          kind: 'accept' as const,
+          content: [{ type: 'text' as const, text: privateMarker }],
+        })
+      : next()
+  ))
+  t.after(disposePost)
+
+  await harness.client.messageHandler?.(conversationCommand('chat-finalize', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-finalize',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  const session = JSON.stringify(agent.session.events)
+  const cards = JSON.stringify({ cards: harness.client.cards, updated: harness.client.updated })
+  assert.match(session, /delivery to the originating Lark conversation was confirmed/iu)
+  assert.doesNotMatch(session, new RegExp(privateMarker, 'u'))
+  assert.doesNotMatch(cards, new RegExp(privateMarker, 'u'))
+})
+
+linuxOutboundTest('harness e2e: an approved static PNG is decoded and sent without a filename override', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-image-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'plot.png'), INBOUND_PNG)
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'plot.png' },
+      'outbound-image-call',
+    ),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Image')
+
+  await harness.client.messageHandler?.(conversationCommand('chat-outbound-image', 'send plot'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-outbound-image',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  const input = harness.client.artifactUploads[0]?.input
+  assert.equal(input?.kind, 'image')
+  assert.equal(input?.name, undefined)
+  assert.deepEqual([...(input?.data ?? [])], [...INBOUND_PNG])
+  assert.equal(harness.client.artifactSends.length, 1)
+  assert.equal(harness.client.artifactSends[0]?.artifact.kind, 'image')
+})
+
+linuxOutboundTest('harness e2e: attachment remount while image upload waits leaves one orphan and no reply', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-image-hmr-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'plot.png'), INBOUND_PNG)
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'plot.png' },
+      'outbound-image-hmr-call',
+    ),
+    textResponse('handled attachment remount'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Image HMR')
+  const uploadStarted = Promise.withResolvers<void>()
+  const releaseUpload = Promise.withResolvers<void>()
+  harness.client.uploadArtifact = async (input) => {
+    const artifact = Object.freeze({ kind: input.kind })
+    harness.client.artifactUploads.push({ input, artifact })
+    uploadStarted.resolve()
+    await releaseUpload.promise
+    return artifact
+  }
+
+  await harness.client.messageHandler?.(conversationCommand('chat-image-hmr', 'send plot'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-image-hmr',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  await uploadStarted.promise
+  await harness.remountAttachmentStore()
+  releaseUpload.resolve()
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  assert.equal(harness.client.artifactSends.length, 0)
+  const serialized = JSON.stringify(
+    agent.session.events.findLast((event) => event.type === 'tool/result'),
+  )
+  assert.match(serialized, /uploaded platform object may remain/iu)
+  assert.doesNotMatch(serialized, /plot\.png|chat-image-hmr/u)
+})
+
+linuxOutboundTest('harness e2e: a non-Lark allowed-once outcome cannot authorize artifact upload', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-provenance-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'private provenance marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-provenance-call',
+    ),
+    textResponse('handled denied artifact'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Provenance')
+  const approval = (harness.ctx.approval as unknown as Record<PropertyKey, unknown>)[
+    symbols.original
+  ] as { request: (...args: unknown[]) => Promise<unknown> }
+  const originalRequest = approval.request
+  let forgedOutcome: unknown
+  approval.request = async (request) => {
+    const forged = Object.freeze({ ...(request as Record<string, unknown>) })
+    const handler = (harness.bridge as unknown as {
+      handleApprovalRequest(
+        request: unknown,
+        next: () => Promise<unknown>,
+      ): Promise<unknown>
+    }).handleApprovalRequest.bind(harness.bridge)
+    forgedOutcome = await handler(forged, async () => 'unavailable')
+    return 'allowed-once'
+  }
+
+  await harness.client.messageHandler?.(conversationCommand('chat-provenance', 'send report'))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  approval.request = originalRequest
+
+  assert.equal(harness.client.artifactUploads.length, 0)
+  assert.equal(forgedOutcome, 'unavailable')
+  assert.equal(harness.client.artifactSends.length, 0)
+  assert.equal(harness.client.cards.some(({ card }) => approvalRequestId(card) !== ''), false)
+  const result = agent.session.events.findLast((event) => event.type === 'tool/result')
+  assert.ok(result !== undefined)
+  const serialized = JSON.stringify(result)
+  assert.match(serialized, /Artifact was not sent/iu)
+  assert.doesNotMatch(serialized, /private provenance marker|report\.txt|chat-provenance/u)
+})
+
+linuxOutboundTest('harness e2e: outbound artifact arguments reject every extra field before approval', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-extra-args-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'extra argument marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt', destination_chat: 'oc_forbidden' },
+      'outbound-extra-args-call',
+    ),
+    textResponse('handled invalid artifact arguments'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Extra Args')
+
+  await harness.client.messageHandler?.(conversationCommand('chat-extra-args', 'send elsewhere'))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.cards.some(({ card }) => approvalRequestId(card) !== ''), false)
+  assert.equal(harness.client.artifactUploads.length, 0)
+  assert.equal(harness.client.artifactSends.length, 0)
+  const serialized = JSON.stringify(agent.session.events.findLast((event) => event.type === 'tool/result'))
+  assert.match(serialized, /Artifact was not sent/iu)
+  assert.doesNotMatch(serialized, /extra argument marker|oc_forbidden|report\.txt|chat-extra-args/u)
+})
+
+linuxOutboundTest('harness e2e: Web-origin and nested Code Mode artifact calls fail before approval', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-origin-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'origin marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const harness = await mount(
+    stateRoot,
+    new ScriptedAdapter([textResponse('created Lark agent')]),
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Origin')
+  await harness.client.messageHandler?.(conversationCommand('chat-origin', 'create agent'))
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  const external = await harness.ctx.tools.execute({
+    callId: CallId('outbound-web-call'),
+    name: OUTBOUND_ARTIFACT_TOOL_NAME,
+    arguments: { relative_path: 'report.txt' },
+    agent,
+    signal: new AbortController().signal,
+  })
+  const nested = await harness.ctx.tools.execute({
+    callId: CallId('outbound-code-call'),
+    rootCallId: CallId('outbound-code-root'),
+    parent: Symbol('run-code-parent') as never,
+    name: OUTBOUND_ARTIFACT_TOOL_NAME,
+    arguments: { relative_path: 'report.txt' },
+    agent,
+    signal: new AbortController().signal,
+  })
+
+  for (const result of [external, nested]) {
+    assert.equal(result.isError, true)
+    assert.match(JSON.stringify(result.content), /Artifact was not sent/iu)
+    assert.doesNotMatch(JSON.stringify(result), /origin marker|report\.txt|chat-origin/u)
+  }
+  assert.equal(harness.client.artifactUploads.length, 0)
+  assert.equal(harness.client.artifactSends.length, 0)
+  assert.equal(harness.client.cards.some(({ card }) => approvalRequestId(card) !== ''), false)
+})
+
+linuxOutboundTest('harness e2e: an artifact changed while approval waits is never uploaded', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-change-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  const artifactPath = join(workspace, 'report.txt')
+  await writeFile(artifactPath, 'approved version')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-change-call',
+    ),
+    textResponse('handled changed artifact'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Changed Artifact')
+
+  await harness.client.messageHandler?.(conversationCommand('chat-change', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await writeFile(artifactPath, 'unapproved replacement')
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-change',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 0)
+  assert.equal(harness.client.artifactSends.length, 0)
+  const result = agent.session.events.findLast((event) => event.type === 'tool/result')
+  const serialized = JSON.stringify(result)
+  assert.match(serialized, /Artifact was not sent/iu)
+  assert.doesNotMatch(serialized, /approved version|unapproved replacement|report\.txt/u)
+})
+
+linuxOutboundTest('harness e2e: artifact upload requires the Lark approval audit to flush', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-flush-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'flush marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-flush-call',
+    ),
+    textResponse('handled flush failure'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Flush')
+
+  await harness.client.messageHandler?.(conversationCommand('chat-flush', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  const sessions = harness.ctx.sessions as unknown as {
+    flush(session: Parameters<Context['sessions']['flush']>[0]): Promise<boolean>
+  }
+  const originalFlush = sessions.flush.bind(sessions)
+  let rejected = false
+  sessions.flush = async (session) => {
+    if (!rejected) {
+      rejected = true
+      return false
+    }
+    return originalFlush(session)
+  }
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-flush',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+  sessions.flush = originalFlush
+
+  assert.equal(rejected, true)
+  assert.equal(harness.client.artifactUploads.length, 0)
+  assert.equal(harness.client.artifactSends.length, 0)
+  assert.match(JSON.stringify(
+    agent.session.events.findLast((event) => event.type === 'tool/result'),
+  ), /Artifact was not sent/iu)
+})
+
+linuxOutboundTest('harness e2e: Session persistence remount during Workspace status prevents upload', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-persistence-hmr-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'persistence hmr marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-persistence-hmr-call',
+    ),
+    textResponse('handled persistence remount'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  const registered = await harness.ctx.workspaceRegistry.create(workspace, 'Persistence HMR')
+
+  await harness.client.messageHandler?.(conversationCommand('chat-persistence-hmr', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  const statusStarted = Promise.withResolvers<void>()
+  const releaseStatus = Promise.withResolvers<void>()
+  const originalStatus = registered.status.bind(registered)
+  registered.status = async () => {
+    statusStarted.resolve()
+    await releaseStatus.promise
+    return originalStatus()
+  }
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-persistence-hmr',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  await statusStarted.promise
+  await harness.remountSessionPersistence()
+  releaseStatus.resolve()
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 0)
+  assert.equal(harness.client.artifactSends.length, 0)
+  assert.match(JSON.stringify(
+    agent.session.events.findLast((event) => event.type === 'tool/result'),
+  ), /Artifact was not sent/iu)
+})
+
+linuxOutboundTest('harness e2e: Workspace remove and re-register after upload leaves an orphan and sends nothing', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-orphan-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'orphan marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-orphan-call',
+    ),
+    textResponse('handled orphan'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  const registered = await harness.ctx.workspaceRegistry.create(workspace, 'Orphan')
+  const uploadStarted = Promise.withResolvers<void>()
+  const releaseUpload = Promise.withResolvers<void>()
+  harness.client.uploadArtifact = async (input) => {
+    const artifact = Object.freeze({ kind: input.kind })
+    harness.client.artifactUploads.push({ input, artifact })
+    uploadStarted.resolve()
+    await releaseUpload.promise
+    return artifact
+  }
+
+  await harness.client.messageHandler?.(conversationCommand('chat-orphan', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-orphan',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  await uploadStarted.promise
+  assert.equal(await harness.ctx.workspaceRegistry.delete(registered.id), true)
+  const replacement = await harness.ctx.workspaceRegistry.create(workspace, 'Replacement')
+  assert.notEqual(replacement.id, registered.id)
+  releaseUpload.resolve()
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  assert.equal(harness.client.artifactSends.length, 0)
+  const serialized = JSON.stringify(
+    agent.session.events.findLast((event) => event.type === 'tool/result'),
+  )
+  assert.match(serialized, /uploaded platform object may remain/iu)
+  assert.doesNotMatch(serialized, /orphan marker|report\.txt|chat-orphan/u)
+})
+
+linuxOutboundTest('harness e2e: a wrong-kind upload token is never delivered or reported confirmed', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-wrong-token-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'wrong token marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-wrong-token-call',
+    ),
+    textResponse('handled wrong upload token'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Wrong Token')
+  harness.client.uploadArtifact = async (input) => {
+    const artifact = Object.freeze({ kind: 'image' as const })
+    harness.client.artifactUploads.push({ input, artifact })
+    return artifact
+  }
+
+  await harness.client.messageHandler?.(conversationCommand('chat-wrong-token', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-wrong-token',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  assert.equal(harness.client.artifactSends.length, 0)
+  const serialized = JSON.stringify(
+    agent.session.events.findLast((event) => event.type === 'tool/result'),
+  )
+  assert.match(serialized, /uploaded platform object may remain/iu)
+  assert.doesNotMatch(serialized, /was confirmed|wrong token marker|report\.txt|chat-wrong-token/iu)
+})
+
+linuxOutboundTest('harness e2e: an ambiguous artifact reply is attempted once and reported unknown', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-unknown-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'private send marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-unknown-call',
+    ),
+    textResponse('handled unknown send'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Unknown Send')
+  harness.client.sendArtifact = async (chatId, artifact, options) => {
+    harness.client.artifactSends.push({ chatId, artifact, options })
+    throw new Error('private ambiguous send marker')
+  }
+
+  await harness.client.messageHandler?.(conversationCommand('chat-unknown', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-unknown',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  assert.equal(harness.client.artifactSends.length, 1)
+  const serialized = JSON.stringify(
+    agent.session.events.findLast((event) => event.type === 'tool/result'),
+  )
+  assert.match(serialized, /delivery outcome is unknown/iu)
+  assert.doesNotMatch(
+    serialized,
+    /private ambiguous send marker|private send marker|report\.txt|chat-unknown/u,
+  )
+  assert.doesNotMatch(
+    JSON.stringify({ cards: harness.client.cards, updated: harness.client.updated }),
+    /private ambiguous send marker|private send marker|chat-unknown/u,
+  )
+})
+
+linuxOutboundTest('harness e2e: an empty artifact reply acknowledgement is reported unknown', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-empty-ack-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'empty acknowledgement marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-empty-ack-call',
+    ),
+    textResponse('handled empty acknowledgement'),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  await harness.ctx.workspaceRegistry.create(workspace, 'Empty Ack')
+  harness.client.sendArtifact = async (chatId, artifact, options) => {
+    harness.client.artifactSends.push({ chatId, artifact, options })
+    return ''
+  }
+
+  await harness.client.messageHandler?.(conversationCommand('chat-empty-ack', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-empty-ack',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  await agent.whenIdle()
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  assert.equal(harness.client.artifactSends.length, 1)
+  const serialized = JSON.stringify(
+    agent.session.events.findLast((event) => event.type === 'tool/result'),
+  )
+  assert.match(serialized, /delivery outcome is unknown/iu)
+  assert.doesNotMatch(serialized, /was confirmed|empty acknowledgement marker|report\.txt|chat-empty-ack/iu)
+})
+
+linuxOutboundTest('harness e2e: shutdown waits for an admitted artifact upload and never sends afterward', async (t) => {
+  const stateRoot = await mkdtemp(join(tmpdir(), 'dsh-lark-outbound-shutdown-'))
+  const workspace = join(stateRoot, 'workspace')
+  await mkdir(workspace)
+  await writeFile(join(workspace, 'report.txt'), 'shutdown marker')
+  t.after(() => rm(stateRoot, { recursive: true, force: true }))
+  const adapter = new ScriptedAdapter([
+    namedToolResponse(
+      OUTBOUND_ARTIFACT_TOOL_NAME,
+      { relative_path: 'report.txt' },
+      'outbound-shutdown-call',
+    ),
+  ])
+  const harness = await mount(
+    stateRoot,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    workspace,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    false,
+    true,
+  )
+  await harness.ctx.workspaceRegistry.create(workspace, 'Shutdown')
+  const uploadStarted = Promise.withResolvers<void>()
+  const releaseUpload = Promise.withResolvers<void>()
+  let uploadSignal: AbortSignal | undefined
+  harness.client.uploadArtifact = async (input, options) => {
+    uploadSignal = options.signal
+    const artifact = Object.freeze({ kind: input.kind })
+    harness.client.artifactUploads.push({ input, artifact })
+    uploadStarted.resolve()
+    await releaseUpload.promise
+    return artifact
+  }
+
+  await harness.client.messageHandler?.(conversationCommand('chat-shutdown-artifact', 'send report'))
+  await waitFor(() => harness.client.cards.some((entry) => approvalRequestId(entry.card) !== ''))
+  const approval = harness.client.cards.find((entry) => approvalRequestId(entry.card) !== '')
+  assert.ok(approval !== undefined)
+  await harness.client.cardHandler?.({
+    openId: 'owner',
+    chatId: 'chat-shutdown-artifact',
+    messageId: approval.messageId,
+    value: { request_id: approvalRequestId(approval.card), decision: 'allowed-once' },
+  })
+  await uploadStarted.promise
+  let disposed = false
+  const disposing = harness.dispose().then(() => { disposed = true })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(disposed, false)
+  assert.equal(uploadSignal?.aborted, true)
+  releaseUpload.resolve()
+  await disposing
+
+  assert.equal(harness.client.artifactUploads.length, 1)
+  assert.equal(harness.client.artifactSends.length, 0)
+  assert.equal(harness.client.stopped, true)
 })
 
 test('harness e2e: structured Lark input resumes its turn and Web input keeps the stock provider', async (t) => {

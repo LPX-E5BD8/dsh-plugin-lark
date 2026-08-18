@@ -334,6 +334,7 @@ async function assertHarnessFallback(home) {
     'dsh-session-query',
     'dsh-session-query-sqlite',
     'dsh-session-title',
+    'dsh-user-approval',
     'dsh-workspace',
   ]) {
     assert.ok(

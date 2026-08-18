@@ -5,6 +5,11 @@ import {
   DEFAULT_INBOUND_IMAGE_BYTES,
   DEFAULT_INBOUND_IMAGE_PIXELS,
 } from './inbound-image.ts'
+import {
+  DEFAULT_OUTBOUND_IMAGE_BYTES,
+  DEFAULT_OUTBOUND_IMAGE_PIXELS,
+  DEFAULT_OUTBOUND_TEXT_BYTES,
+} from './outbound-artifact.ts'
 
 export const DEFAULT_CONFIG = {
   domain: 'feishu',
@@ -22,6 +27,10 @@ export const DEFAULT_CONFIG = {
   maxInboundImagePixels: DEFAULT_INBOUND_IMAGE_PIXELS,
   maxConversationImages: DEFAULT_CONVERSATION_IMAGES,
   maxConversationImageBytes: DEFAULT_CONVERSATION_IMAGE_BYTES,
+  outboundArtifacts: false,
+  maxOutboundTextFileBytes: DEFAULT_OUTBOUND_TEXT_BYTES,
+  maxOutboundImageBytes: DEFAULT_OUTBOUND_IMAGE_BYTES,
+  maxOutboundImagePixels: DEFAULT_OUTBOUND_IMAGE_PIXELS,
 } as const
 
 export const LARK_APP_ID_PATTERN = /^cli_[0-9a-f]{16}$/i
