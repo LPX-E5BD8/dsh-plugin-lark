@@ -146,6 +146,24 @@ test('policy mutations parse only the bounded operator vocabulary', () => {
   }, hashUser).allowFrom, undefined)
 })
 
+// Only a capacity error means the list is full; a bad principal hash is not.
+test('policy mutations separate a full list from an invalid principal hash', () => {
+  const base = defaultConversationPolicy()
+  let full = base
+  for (let index = 0; index < 64; index += 1) {
+    full = applyPolicyMutation(full, { kind: 'users', action: 'add', openId: `ou_${index}` }, hashUser)
+  }
+  assert.equal(full.allowFrom?.length, 64)
+  assert.throws(
+    () => applyPolicyMutation(full, { kind: 'users', action: 'add', openId: 'ou_extra' }, hashUser),
+    RangeError,
+  )
+  assert.throws(
+    () => applyPolicyMutation(base, { kind: 'users', action: 'add', openId: 'ou_bad' }, () => 'not-a-hash'),
+    TypeError,
+  )
+})
+
 test('durable policy store survives reopen without secrets', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-lark-policy-'))
   t.after(() => rm(root, { recursive: true, force: true }))

@@ -52,6 +52,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.12` | Adds no schema. The notify drain worker releases its slot after each run so a later admit or backoff timer can send again; leftover review-thread closures fail closed on retirement maintenance throw and require outbound `sent`. | v0.9.11 reads the same `lark_notify` unit but can leave later admits pending after the first drain. Pending rows remain; do not mint a new idempotency key. |
 | `0.9.13` | Adds no durable schema. Operator `/status` and `/diag` are process-local Card replies gated by `operatorFrom`. | v0.9.12 ignores the commands. No sidecar migration. |
 | `0.9.14` | Adds the `lark_policy` storage-domain unit (`policies`). Rows are keyed by a salted hash of the chat or group and store only the mention mode, tool/approval flags, and bounded Workspace, model, and salted-hash user lists. No plaintext open ID, chat ID, or secret is stored. | v0.9.13 ignores the new unit and no longer applies conversation-scoped narrowing, so a conversation reverts to the global fail-closed configuration. Nothing is migrated; re-apply `/policy` after a roll-forward. |
+| `0.9.15` | Adds no durable schema. Card callbacks resolve the same `lark_policy` document as inbound messages, and `/diag` reports an unconfirmed bot when the client exposes no health probe. | v0.9.14 reads the same unit but gates only inbound messages, so a conversation narrowed after a Card was delivered can still be driven through that Card's buttons. No sidecar migration. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -68,7 +69,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.14'
+target_tag='v0.9.15'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -222,8 +223,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.14 | State handling |
+| Rollback target from v0.9.15 | State handling |
 | --- | --- |
+| v0.9.14 | Same durable state; conversation policy stops gating Card callbacks and `/diag` reports a healthy bot whenever no failure is observed. |
 | v0.9.13 | Keeps the `lark_policy` rows but stops reading them, so every conversation falls back to the global configuration. A conversation that was narrowed becomes as permissive as the global gates allow; re-check `allowFrom`, `operatorFrom`, `outboundArtifacts`, and `proactiveDelivery` before rollback. |
 | v0.9.12 | Same as v0.9.13, and `/status` and `/diag` disappear. |
 | v0.9.11 | Uses the same `lark_notify` unit and tool, but the first drain worker can leave later admits or backoff retries pending until remount. |

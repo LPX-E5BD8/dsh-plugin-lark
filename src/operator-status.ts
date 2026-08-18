@@ -24,7 +24,8 @@ export interface OperatorStatusSnapshot {
 }
 
 export interface OperatorDiagInput {
-  readonly botReady: boolean
+  // undefined means the client exposes no health probe, which is not a healthy bot.
+  readonly botReady: boolean | undefined
   readonly workspaceCount: number | undefined
   readonly persistenceMounted: boolean
   readonly storageFlushOk: boolean | undefined
@@ -129,10 +130,14 @@ export function buildDiagChecks(input: OperatorDiagInput, locale: 'zh-CN' | 'en-
   const checks: OperatorDiagCheck[] = [
     {
       id: 'bot',
-      state: input.botReady ? 'ok' : 'fail',
-      hint: input.botReady
-        ? (zh ? '机器人 REST 身份可用。' : 'Bot REST identity is available.')
-        : (zh ? '机器人身份不可用。检查应用凭证与长连接。' : 'Bot identity is unavailable. Check app credentials and the long connection.'),
+      state: input.botReady === undefined ? 'warn' : input.botReady ? 'ok' : 'fail',
+      hint: input.botReady === undefined
+        ? (zh
+            ? '无法确认机器人连接状态：该客户端未提供健康探针。'
+            : 'Bot connection state is unconfirmed: this client exposes no health probe.')
+        : input.botReady
+          ? (zh ? '机器人 REST 身份可用。' : 'Bot REST identity is available.')
+          : (zh ? '机器人身份不可用。检查应用凭证与长连接。' : 'Bot identity is unavailable. Check app credentials and the long connection.'),
     },
     {
       id: 'workspaces',
