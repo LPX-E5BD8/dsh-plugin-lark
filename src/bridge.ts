@@ -404,6 +404,8 @@ interface PendingHumanInput {
   readonly request: HumanInputRequest
   state: 'sending' | 'awaiting' | 'settled'
   messageId?: string
+  settlement?: HumanInputSettlement
+  cardCloseStarted: boolean
   claim(settlement: HumanInputSettlement): boolean
 }
 
@@ -443,6 +445,7 @@ const SESSION_CREATED_AT_MAX = 8_640_000_000_000_000
 const SESSION_TITLE_SOURCE_CODE_UNIT_LIMIT = 4_096
 const WORKSPACE_REGISTRIES_REQUIRING_REMOUNT = new WeakSet<object>()
 const HUMAN_INPUT_CARD_CLOSE_TIMEOUT_MS = 15_000
+const HUMAN_INPUT_SHUTDOWN_CLOSE_TIMEOUT_MS = 2_000
 const HUMAN_INPUT_CARD_REPAIR_DELAY_MS = 250
 
 type HumanInputFailureCode =
@@ -1426,9 +1429,22 @@ export class LarkBridge {
     }
     this.conversationEvictionRequested = false
     this.clearAllStreamTimers()
+    const agents = await collectSettled(this.handles.values(), failures)
+    const agentCleanup = collectSettled(
+      [...new Set(agents)].map((handle) => Promise.resolve().then(() => handle.dispose())),
+      failures,
+    )
+    const retirementCleanup = collectSettled([...this.handleRetirements], failures)
+    // Keep REST available while terminal Card delivery and Agent/Session
+    // quiescence advance together. A second drain after every producer has
+    // settled closes the admission window before the client is stopped.
+    await Promise.all([
+      this.drainDeliveries(failures),
+      agentCleanup,
+      retirementCleanup,
+    ])
     await this.drainDeliveries(failures)
     await collectSettled([Promise.resolve().then(() => this.client.stop())], failures)
-    const agents = await collectSettled(this.handles.values(), failures)
     this.conversations.clear()
     this.conversationOpenings.clear()
     this.conversationLeases.clear()
@@ -1441,8 +1457,6 @@ export class LarkBridge {
     this.conversationBarriers.clear()
     this.completedInboundKeys.length = 0
     this.clearRoutes()
-    await collectSettled([...new Set(agents)].map((handle) => handle.dispose()), failures)
-    await collectSettled([...this.handleRetirements], failures)
     this.handleRetirements.clear()
     this.conversationAccessSequence = 0
     this.clientStarted = false
@@ -1910,6 +1924,7 @@ export class LarkBridge {
     const closing = (async () => {
       if (delayMs > 0) await delay(delayMs)
       const deadline = new AbortController()
+      const shutdownSignal = this.commandAbort.signal
       let rejectAbort: ((error: Error) => void) | undefined
       const aborted = new Promise<never>((_resolve, reject) => {
         rejectAbort = reject
@@ -1918,9 +1933,22 @@ export class LarkBridge {
         rejectAbort?.(new Error('lark: human-input card update timed out'))
       }
       deadline.signal.addEventListener('abort', onAbort, { once: true })
-      const timer = setTimeout(() => {
-        deadline.abort(new Error('lark: human-input card update timed out'))
-      }, this.humanInputCardCloseTimeoutMs)
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const armDeadline = (timeoutMs: number): void => {
+        if (timer !== undefined) clearTimeout(timer)
+        timer = setTimeout(() => {
+          deadline.abort(new Error('lark: human-input card update timed out'))
+        }, timeoutMs)
+      }
+      const onShutdown = (): void => {
+        armDeadline(Math.min(
+          this.humanInputCardCloseTimeoutMs,
+          HUMAN_INPUT_SHUTDOWN_CLOSE_TIMEOUT_MS,
+        ))
+      }
+      shutdownSignal.addEventListener('abort', onShutdown, { once: true })
+      if (shutdownSignal.aborted) onShutdown()
+      else armDeadline(this.humanInputCardCloseTimeoutMs)
       const updating = Promise.resolve().then(() => this.client.updateCard!(
         messageId,
         renderHumanInputTerminalCard(outcome, this.locale),
@@ -1929,12 +1957,21 @@ export class LarkBridge {
       try {
         await Promise.race([updating, aborted])
       } finally {
-        clearTimeout(timer)
+        if (timer !== undefined) clearTimeout(timer)
+        shutdownSignal.removeEventListener('abort', onShutdown)
         deadline.signal.removeEventListener('abort', onAbort)
       }
     })()
       .catch(() => { this.ctx.logger.error('[lark] human-input card update failed') })
     this.trackDelivery(closing)
+  }
+
+  private closePendingHumanInputCard(pending: PendingHumanInput): void {
+    if (pending.cardCloseStarted
+      || pending.messageId === undefined
+      || pending.settlement === undefined) return
+    pending.cardCloseStarted = true
+    this.closeHumanInputCard(pending.messageId, pending.settlement)
   }
 
   private closeHumanInputCard(
@@ -2000,14 +2037,20 @@ export class LarkBridge {
       turnState,
       request,
       state: 'sending',
+      cardCloseStarted: false,
       claim: (settlement) => {
         if (pending.state === 'settled') return false
         pending.state = 'settled'
+        pending.settlement = settlement
         if (timer !== undefined) clearTimeout(timer)
         exec.signal.removeEventListener('abort', onAbort)
         this.pendingHumanInputs.delete(requestId)
         this.pendingHumanInputSessions.delete(sessionId)
         if (pending.messageId !== undefined) this.pendingHumanInputMessages.delete(pending.messageId)
+        // Register terminal delivery before resolving the tool wait. Root-fiber
+        // teardown may otherwise drain an empty delivery set and close REST
+        // before the await continuation gets a chance to enqueue this PATCH.
+        this.closePendingHumanInputCard(pending)
         settled.resolve(settlement)
         return true
       },
@@ -2017,15 +2060,16 @@ export class LarkBridge {
     exec.signal.addEventListener('abort', onAbort, { once: true })
     if (exec.signal.aborted) onAbort()
 
-    let messageId: string | undefined
     const acceptDelivery = (delivered: string | void): void => {
       if (typeof delivered !== 'string' || delivered === '') {
         pending.claim({ kind: 'unavailable', immediateCard: false })
         return
       }
-      messageId = delivered
       pending.messageId = delivered
-      if (pending.state !== 'sending') return
+      if (pending.state !== 'sending') {
+        this.closePendingHumanInputCard(pending)
+        return
+      }
       pending.state = 'awaiting'
       this.pendingHumanInputMessages.set(delivered, pending)
       timer = setTimeout(() => {
@@ -2053,7 +2097,6 @@ export class LarkBridge {
       }
     }
     const settlement = await settled.promise
-    if (messageId !== undefined) this.closeHumanInputCard(messageId, settlement)
     switch (settlement.kind) {
       case 'answered': return settlement.answer
       case 'cancelled': throw new HumanInputExpectedError(
