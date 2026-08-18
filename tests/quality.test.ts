@@ -119,6 +119,19 @@ test('quality: outbound artifacts stay opt-in and independently bounded through 
   assert.throws(() => Config({ maxOutboundImageBytes: MAX_OUTBOUND_IMAGE_BYTES + 1 }), TypeError)
   assert.throws(() => Config({ maxOutboundImagePixels: MAX_OUTBOUND_IMAGE_PIXELS + 1 }), TypeError)
   assert.equal(Config({ outboundArtifacts: true }).outboundArtifacts, true)
+  const bridge = readFileSync(join(process.cwd(), 'src/bridge.ts'), 'utf8')
+  assert.match(
+    bridge,
+    /properties: \{ sent: \{ type: 'boolean', const: true \} \},\s+required: \['sent'\],/u,
+  )
+})
+
+test('quality: image surface snapshots reuse already-derived messages', () => {
+  const source = readFileSync(join(process.cwd(), 'src/bridge.ts'), 'utf8')
+  const snapshot = source.match(/private imageSurfaceSnapshot\([\s\S]*?\n  \}\n/u)?.[0]
+  assert.ok(snapshot !== undefined)
+  assert.match(snapshot, /messagesHaveModelVisibleImage\(messages\)/u)
+  assert.doesNotMatch(snapshot, /sessionHasModelVisibleImage\(session\)/u)
 })
 
 test('quality: project management configuration stays fail-closed through the bundle seam', () => {

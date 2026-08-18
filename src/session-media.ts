@@ -4,7 +4,7 @@ import type { Message } from '@deepseek-ai/dsh-llm'
 import { deriveEventMessage, foldSurface } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 
-function messagesHaveModelVisibleImage(messages: readonly Message[]): boolean {
+export function messagesHaveModelVisibleImage(messages: readonly Message[]): boolean {
   for (const message of messages) {
     if (contentHasImage(message.content)) return true
   }

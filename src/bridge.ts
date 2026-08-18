@@ -115,7 +115,7 @@ import {
   eventLogHasModelVisibleImage,
   eventLogMayContainImage,
   eventLogRequiresImageRouteRecovery,
-  sessionHasModelVisibleImage,
+  messagesHaveModelVisibleImage,
 } from './session-media.ts'
 
 export interface LarkBridgeOptions {
@@ -3026,6 +3026,7 @@ export class LarkBridge {
         schema: {
           type: 'object',
           properties: { sent: { type: 'boolean', const: true } },
+          required: ['sent'],
           additionalProperties: false,
         },
         render: () => [{
@@ -5375,7 +5376,7 @@ export class LarkBridge {
       ? cached.hasImage || messages.slice(cached.messageCount).some((message) => (
           contentHasImage(message.content)
         ))
-      : sessionHasModelVisibleImage(session)
+      : messagesHaveModelVisibleImage(messages)
     const seq = candidate.seq
     const replaceGeneration = candidate.surface?.replaceGeneration
     if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0
@@ -6758,7 +6759,7 @@ export class LarkBridge {
             }
           })
         } catch {
-          this.retireCandidateHandleAfterIdle(sessionId, handle)
+          this.ctx.logger.error('[lark] retired candidate session maintenance failed; retaining its handle')
           return
         }
         if (!durable) {

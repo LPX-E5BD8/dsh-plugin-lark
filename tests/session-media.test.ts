@@ -12,6 +12,7 @@ import {
   eventLogHasModelVisibleImage,
   eventLogMayContainImage,
   eventLogRequiresImageRouteRecovery,
+  messagesHaveModelVisibleImage,
   sessionHasModelVisibleImage,
 } from '../src/session-media.ts'
 
@@ -40,6 +41,27 @@ function imageMessage() {
     source: { kind: 'user' as const },
   })
 }
+
+test('already-derived messages are scanned without another Session derive', () => {
+  const session = Session.create(SessionId('session-media-derived-messages'))
+  session.append('turn/start', { turn: 0 })
+  session.append('user/message', textMessage('text only'), { surfaceOp: 'append' })
+  const derived = session.deriveMessages()
+  let deriveCalls = 0
+  const original = session.deriveMessages.bind(session)
+  session.deriveMessages = ((...args: Parameters<Session['deriveMessages']>) => {
+    deriveCalls += 1
+    return original(...args)
+  }) as Session['deriveMessages']
+
+  assert.equal(messagesHaveModelVisibleImage(derived), false)
+  assert.equal(deriveCalls, 0)
+  session.append('user/message', imageMessage(), { surfaceOp: 'append' })
+  assert.equal(messagesHaveModelVisibleImage(session.deriveMessages()), true)
+  assert.equal(deriveCalls, 1)
+  assert.equal(sessionHasModelVisibleImage(session), true)
+  assert.equal(deriveCalls, 2)
+})
 
 test('live Session detection uses the current derived model surface', () => {
   const session = Session.create(SessionId('session-media-live'))
