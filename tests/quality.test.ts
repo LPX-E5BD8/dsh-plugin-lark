@@ -8,6 +8,7 @@ import {
   CARD_LIMITS,
   renderApprovalCard,
   renderApprovalDecisionCard,
+  renderNotifyCard,
   renderTurnCard,
   renderTurnCardWithMeta,
 } from '../src/cards.ts'
@@ -35,6 +36,7 @@ import {
   MAX_OUTBOUND_IMAGE_PIXELS,
   MAX_OUTBOUND_TEXT_BYTES,
 } from '../src/outbound-artifact.ts'
+import { DEFAULT_PROACTIVE_DELIVERY } from '../src/outbound-notify.ts'
 import { apply, Config, inject } from '../src/index.ts'
 import { LARK_LOCALES } from '../src/locale.ts'
 
@@ -86,6 +88,7 @@ function assertControlDepth(source: ts.SourceFile): void {
 test('quality: public defaults fail closed', () => {
   assert.equal(DEFAULT_CONFIG.allowAllUsers, false)
   assert.equal(DEFAULT_CONFIG.outboundArtifacts, false)
+  assert.equal(DEFAULT_CONFIG.proactiveDelivery, false)
   assert.deepEqual(inject, ['agents', 'storageDomain', 'sessions', 'tools'])
 })
 
@@ -119,6 +122,16 @@ test('quality: outbound artifacts stay opt-in and independently bounded through 
   assert.throws(() => Config({ maxOutboundImageBytes: MAX_OUTBOUND_IMAGE_BYTES + 1 }), TypeError)
   assert.throws(() => Config({ maxOutboundImagePixels: MAX_OUTBOUND_IMAGE_PIXELS + 1 }), TypeError)
   assert.equal(Config({ outboundArtifacts: true }).outboundArtifacts, true)
+})
+
+test('quality: proactive delivery stays opt-in through the bundle seam', () => {
+  const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8')
+  const patch = readFileSync(join(process.cwd(), 'cordis.patch.yml'), 'utf8')
+  assert.equal(DEFAULT_CONFIG.proactiveDelivery, DEFAULT_PROACTIVE_DELIVERY)
+  assert.equal(DEFAULT_PROACTIVE_DELIVERY, false)
+  assert.match(source, /proactiveDelivery: Schema\.boolean\(\)\.default\(DEFAULT_CONFIG\.proactiveDelivery\)/u)
+  assert.equal((patch.match(/^\s+proactiveDelivery: false$/gmu) ?? []).length, 1)
+  assert.equal(Config({ proactiveDelivery: true }).proactiveDelivery, true)
 })
 
 test('quality: project management configuration stays fail-closed through the bundle seam', () => {
@@ -495,6 +508,33 @@ test('quality: rendered cards stay within the conservative plugin byte budget', 
   assert.match(encoded, /…/)
 })
 
+test('quality: notify cards reuse the shared Card 2.0 style and locale copy', () => {
+  const completion = renderNotifyCard({
+    locale: 'zh-CN',
+    kind: 'completion',
+    summary: '夜间任务已完成。',
+  })
+  const attention = renderNotifyCard({
+    locale: 'en-US',
+    kind: 'attention',
+    summary: 'Please review the blocked step.',
+    mentionMarkup: '<at id="ou_initiator"></at>',
+  })
+  assert.equal(completion.schema, '2.0')
+  assert.equal(attention.schema, '2.0')
+  const completionBody = completion.body as { padding?: string; vertical_spacing?: string }
+  const attentionBody = attention.body as { padding?: string; vertical_spacing?: string }
+  assert.equal(completionBody.padding, '16px 16px 16px 16px')
+  assert.equal(attentionBody.padding, '16px 16px 16px 16px')
+  assert.equal(completionBody.vertical_spacing, '12px')
+  const encoded = JSON.stringify(completion)
+  assert.match(encoded, /"element_id":"notify"/u)
+  assert.match(encoded, /任务完成/u)
+  assert.match(JSON.stringify(attention), /Needs attention/u)
+  assert.match(JSON.stringify(attention), /<at id=\\?"ou_initiator\\?"><\/at>/u)
+  assert.doesNotMatch(JSON.stringify(completion), /oc_|cli_/u)
+})
+
 test('quality: every Card 2.0 payload keeps platform element ids and column sets valid', () => {
   const payloads = [
     renderApprovalCard({
@@ -519,6 +559,15 @@ test('quality: every Card 2.0 payload keeps platform element ids and column sets
       answer: 'Done.',
       startedAt: 1_000,
       updatedAt: 2_000,
+    }),
+    renderNotifyCard({
+      kind: 'completion',
+      summary: 'The scheduled job finished.',
+    }),
+    renderNotifyCard({
+      kind: 'attention',
+      summary: 'Please review the blocked step.',
+      mentionMarkup: '<at id="ou_initiator"></at>',
     }),
   ]
   const allowedColumnSetKeys = new Set([
@@ -722,6 +771,12 @@ test('quality: supported locales cover cards and extended events', () => {
     updatedAt: 2,
   })
   assert.match(JSON.stringify(card), /Execution failed/)
+  const notify = renderNotifyCard({
+    locale: 'en-US',
+    kind: 'attention',
+    summary: 'A long job needs a look.',
+  })
+  assert.match(JSON.stringify(notify), /Needs attention/)
   const activity = projectActivity({
     type: 'llm/retry',
     seq: 1,

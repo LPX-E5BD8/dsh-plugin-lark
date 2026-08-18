@@ -10,6 +10,7 @@ import {
   DEFAULT_OUTBOUND_IMAGE_PIXELS,
   DEFAULT_OUTBOUND_TEXT_BYTES,
 } from './outbound-artifact.ts'
+import { DEFAULT_PROACTIVE_DELIVERY } from './outbound-notify.ts'
 
 export const DEFAULT_CONFIG = {
   domain: 'feishu',
@@ -31,6 +32,7 @@ export const DEFAULT_CONFIG = {
   maxOutboundTextFileBytes: DEFAULT_OUTBOUND_TEXT_BYTES,
   maxOutboundImageBytes: DEFAULT_OUTBOUND_IMAGE_BYTES,
   maxOutboundImagePixels: DEFAULT_OUTBOUND_IMAGE_PIXELS,
+  proactiveDelivery: DEFAULT_PROACTIVE_DELIVERY,
 } as const
 
 export const LARK_APP_ID_PATTERN = /^cli_[0-9a-f]{16}$/i

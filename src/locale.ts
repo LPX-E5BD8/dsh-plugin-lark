@@ -166,6 +166,11 @@ interface LocaleCopy {
     readonly outboundArtifactDeliveryUnknown: string
     readonly outboundArtifactSentBeforeInterrupt: string
     outboundArtifactApprovalReason(kind: 'file' | 'image', name: string, bytes: number): string
+    readonly notifyCallTitle: string
+    readonly notifyAdmittedTitle: string
+    readonly notifyFailedTitle: string
+    readonly notifyAdmitted: string
+    readonly notifyNotAdmitted: string
     readonly followupFailure: string
     readonly cardUnavailable: string
     readonly approvalUnauthorized: string
@@ -300,6 +305,8 @@ interface LocaleCopy {
     readonly humanInputUnavailable: string
     readonly planTitle: string
     readonly earlierTodos: string
+    readonly notifyCompletionTitle: string
+    readonly notifyAttentionTitle: string
   }
   readonly event: {
     readonly command: string
@@ -351,6 +358,11 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       outboundArtifactApprovalReason: (kind, name, bytes) => (
         `将已审批的 Workspace ${kind === 'image' ? '图片' : '文件'}“${name}”（${bytes} 字节）发送到发起本轮的 Lark 会话。`
       ),
+      notifyCallTitle: '发送 Lark 通知',
+      notifyAdmittedTitle: '通知已受理',
+      notifyFailedTitle: '通知未受理',
+      notifyAdmitted: '已将通知写入当前注册会话的可靠发件箱。',
+      notifyNotAdmitted: '通知未受理：会话未注册、参数无效或已达速率上限。',
       followupFailure: '消息提交失败，请重试。',
       cardUnavailable: '卡片操作暂不可用。',
       approvalUnauthorized: '无权执行此操作。',
@@ -515,6 +527,8 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       humanInputUnavailable: '问题不可用',
       planTitle: '📋 **计划**',
       earlierTodos: '个更早的计划项已折叠',
+      notifyCompletionTitle: '任务完成',
+      notifyAttentionTitle: '需要关注',
     },
     event: {
       command: '命令',
@@ -564,6 +578,11 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       outboundArtifactApprovalReason: (kind, name, bytes) => (
         `Send approved Workspace ${kind} "${name}" (${bytes} bytes) to the originating Lark conversation.`
       ),
+      notifyCallTitle: 'Send Lark notification',
+      notifyAdmittedTitle: 'Notification admitted',
+      notifyFailedTitle: 'Notification not admitted',
+      notifyAdmitted: 'The notification was admitted to the registered conversation outbox.',
+      notifyNotAdmitted: 'The notification was not admitted because the conversation is unregistered, the arguments are invalid, or the rate limit was reached.',
       followupFailure: 'Message submission failed. Please try again.',
       cardUnavailable: 'Card actions are temporarily unavailable.',
       approvalUnauthorized: 'You cannot perform this action.',
@@ -723,6 +742,8 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       humanInputUnavailable: 'Question unavailable',
       planTitle: '📋 **Plan**',
       earlierTodos: 'earlier plan items folded',
+      notifyCompletionTitle: 'Task complete',
+      notifyAttentionTitle: 'Needs attention',
     },
     event: {
       command: 'Command',

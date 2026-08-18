@@ -10,7 +10,7 @@
 - 复制或恢复状态前必须优雅停止 Harness，并等待进程完全退出。在线执行 `cp`/`tar` 不构成一致性快照，也不能把 `kill -9` 当作备份边界。
 - 除非迁移明确要求，否则必须保持相同的 Lark app ID、状态根目录、启动 workspace、`defaultSessionId`、JSONL 压缩格式、canonical Workspace 路径、profile 配置与凭据来源。app ID 会参与存储 key 的哈希；更换后旧回执和绑定会像不存在一样。
 - Sessions、storage domains、attachments 与 Web profile 必须按同一时间点做快照。绝不能只恢复某个被引用附件或 `lark_conversations.json`、手工合并新旧 JSON，或编辑引用/哈希/schema 字段。
-- 所有快照都应视为敏感数据。Session 日志可能包含 prompt、工具结果和仓库数据；Workspace 状态包含路径；已选模型路由 ID 是明文。快照必须放在检出目录之外并限制访问，绝不能附到 issue。
+- 所有快照都应视为敏感数据。Session 日志可能包含 prompt、工具结果和仓库数据；Workspace 状态包含路径；已选模型路由 ID 以及 notify destination 的聊天/用户/消息 ID 是明文。快照必须放在检出目录之外并限制访问，绝不能附到 issue。
 - 状态回滚不会撤销已经发送的消息、模型/provider 用量、工具副作用或 Workspace 中已修改的文件。项目目录必须使用自己的版本控制或备份保护。
 
 ## 一个完整的冷备份单元
@@ -20,7 +20,7 @@
 | 单元 | 标准位置 | 必须保持一致的原因 |
 | --- | --- | --- |
 | 会话持久化 | `$DSH_HOME/sessions` | JSONL header、event、generation、cwd、preset 与 request header |
-| Storage domains | `$DSH_HOME/storages` | `lark_inbound.json`、`lark_conversations.json`、`workspace.json` 以及其他宿主 domain 状态 |
+| Storage domains | `$DSH_HOME/storages` | `lark_inbound.json`、`lark_conversations.json`、`lark_notify.json`、`workspace.json` 以及其他宿主 domain 状态 |
 | 附件存储 | `$DSH_HOME/attachments` | Session 事件引用的不可变图片对象；对象必须与日志保持一致 |
 | Web profile 安装 | `$DSH_HOME/profiles/web` | 插件规格、profile 依赖图与本地检出目录引用 |
 | 插件检出目录 | 传给 `dsh plugin --profile web add` 的绝对路径 | 本地安装可能持续链接该目录；回滚窗口关闭前必须保留旧检出目录 |
@@ -48,6 +48,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.8` | 不新增持久化 schema。优雅停机时会通过有界、感知 signal 的最终 PATCH 尝试终态化每一张已知的运行中执行卡，不追加 Session 结果，也不发送 partial 输出。 | v0.9.7 会读取相同状态，但进程内 turn authority 消失后，已经投递的运行卡可能仍保留失效的“停止执行”控件。回滚前必须优雅停止 v0.9.8，并把仍显示运行中的旧卡视为 stale。 |
 | `0.9.9` | 不新增插件自有 schema。显式开启后，图片会在 Harness 附件 backend 发布不可变对象；Session 事件只保存已验证的内容寻址引用与元数据。 | v0.9.8 在部署提供附件服务时仍能保留并读取相同的 Session image block，但新的 Lark 图片会回到不支持路径。回滚代码不会删除对象或 orphan；附件 backend 必须与 Session log 保持一致。 |
 | `0.9.10` | 不新增插件自有 schema。经审批的出站产物沿用现有 `tool/call`、approval audit 与 `tool/result` 事件；平台上传 key、目标、路径和字节绝不会进入插件 sidecar。 | v0.9.9 可读取相同 Session log，但不再注册发送工具。回滚无法撤回已投递平台消息或删除上传 orphan；开放中/未知工具调用遵循普通 rc.6 冷修复。 |
+| `0.9.11` | 新增 `lark_notify` storage-domain 单元（`destinations` + `outbox`）。destination 行保存重启后投递所需的聊天/用户/消息 ID；outbox 行保存哈希键、类型、有界摘要、提及 token、重试/过期与终态。 | v0.9.10 会忽略该单元且不再注册 `notify_lark`。已投递的平台卡片仍会保留；未完成的 outbox 项在功能再次开启前不会被排空。回滚后不要重放已投递的幂等键。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -64,7 +65,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.10'
+target_tag='v0.9.11'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -218,8 +219,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.10 回滚到 | 状态处理方式 |
+| 从 v0.9.11 回滚到 | 状态处理方式 |
 | --- | --- |
+| v0.9.10 | 使用相同 Session、binding 与产物工具，但忽略 `lark_notify` 且不注册 `notify_lark`。已经投递的通知卡片仍留在平台上；未完成的 outbox 行会一直保留到再次开启该功能。 |
 | v0.9.9 | 使用相同 binding、附件存储、approval audit 与 Session 词汇，但移除出站产物工具。已经投递的消息和平台上传 orphan 仍是外部状态；不能根据回滚后的 `tool/result` 推断它们。 |
 | v0.9.8 | 使用相同 binding、Session log 与图片路由 guard，但不再下载新的 Lark 图片。已有 image block 仍要求其引用对象与支持图片的路由。任何对象或 orphan 都不会被删除；附件存储必须随快照保留。 |
 | v0.9.7 | 使用相同持久化状态与图片路由 guard，但移除普通运行中执行卡的优雅停机终态化。进程退出后仍显示“运行/停止执行”的卡片已经没有实时 Stop authority；重启后必须检查 Session，再按需重试。 |

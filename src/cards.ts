@@ -69,6 +69,7 @@ const CARD_ELEMENT = {
   approvalButtons: 'approval_buttons',
   plan: 'plan',
   stop: 'turn_stop',
+  notify: 'notify',
 } as const
 
 export const CARD_ACTIONS = {
@@ -897,4 +898,32 @@ export function renderTurnCardWithMeta(input: TurnCard): RenderedTurnCard {
 
 export function renderTurnCard(input: TurnCard): Record<string, unknown> {
   return renderTurnCardWithMeta(input).payload
+}
+
+export interface NotifyCard {
+  readonly locale?: LarkLocale
+  readonly kind: 'completion' | 'attention'
+  readonly summary: string
+  readonly mentionMarkup?: string
+}
+
+export function renderNotifyCard(card: NotifyCard): Record<string, unknown> {
+  const locale = card.locale ?? DEFAULT_CONFIG.locale
+  const copy = localeCopy(locale).card
+  const title = card.kind === 'attention' ? copy.notifyAttentionTitle : copy.notifyCompletionTitle
+  const body = card.mentionMarkup === undefined || card.mentionMarkup === ''
+    ? escapeMarkdown(truncateRunes(card.summary, CARD_LIMITS.maxAnswerRunes))
+    : `${card.mentionMarkup} ${escapeMarkdown(truncateRunes(card.summary, CARD_LIMITS.maxAnswerRunes))}`
+  const payload = basePayload(title, [
+    markdownElement(CARD_ELEMENT.notify, `**${escapeMarkdown(title)}**\n${body}`),
+  ])
+  payload.header = {
+    title: { tag: CARD_STYLE.tagPlainText, content: title },
+    template: card.kind === 'attention' ? 'orange' : 'blue',
+    padding: CARD_STYLE.padding,
+  }
+  if (payloadBytes(payload) > CARD_LIMITS.maxBytes) {
+    throw new RangeError('lark: notify card exceeds the plugin Card byte budget')
+  }
+  return payload
 }

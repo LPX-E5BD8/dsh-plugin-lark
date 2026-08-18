@@ -36,6 +36,7 @@ import {
   renderApprovalDecisionCard,
   renderHumanInputCard,
   renderHumanInputTerminalCard,
+  renderNotifyCard,
   renderTurnCardWithMeta,
 } from './cards.ts'
 import type {
@@ -92,6 +93,14 @@ import type {
 } from './lark.ts'
 import { LarkResourceError } from './lark.ts'
 import {
+  DurableNotifyOutbox,
+  NOTIFY_LARK_TOOL_NAME,
+  newNotifyIdempotencyKey,
+  notifyConversationScopeId,
+  notifyMentionMarkup,
+  parseNotifyToolArgs,
+} from './outbound-notify.ts'
+import {
   DEFAULT_OUTBOUND_IMAGE_BYTES,
   DEFAULT_OUTBOUND_IMAGE_PIXELS,
   DEFAULT_OUTBOUND_TEXT_BYTES,
@@ -146,6 +155,8 @@ export interface LarkBridgeOptions {
   client: LarkClientLike
   inboundDeduplicator?: InboundDeduplicator
   conversationBindings?: ConversationBindingStore
+  notifyOutbox?: DurableNotifyOutbox
+  proactiveDelivery?: boolean
 }
 
 interface ConversationSession {
@@ -1641,6 +1652,8 @@ export class LarkBridge {
   private readonly completedInboundKeys: string[] = []
   private readonly inboundDeduplicator: InboundDeduplicator | undefined
   private readonly conversationBindings: ConversationBindingStore | undefined
+  private readonly notifyOutbox: DurableNotifyOutbox | undefined
+  private readonly proactiveDelivery: boolean
   private readonly sessionOperations = new Map<string, Promise<void>>()
   private readonly conversationBarriers = new Map<string, Promise<void>>()
   private workspaceMutationTail: Promise<void> = Promise.resolve()
@@ -1656,6 +1669,9 @@ export class LarkBridge {
   private startPromise: Promise<void> | undefined
   private stopPromise: Promise<void> | undefined
   private conversationEvictionWorker: Promise<void> | undefined
+  private notifyDrainWorker: Promise<void> | undefined
+  private notifyDrainRequested = false
+  private notifyDrainTimer: ReturnType<typeof setTimeout> | undefined
   private clientStarted = false
   private stopping = false
   private conversationEvictionRequested = false
@@ -1665,6 +1681,10 @@ export class LarkBridge {
   private inboundImageSlotTaken = false
   private outboundArtifactValidationSlotTaken = false
   private outboundArtifactSlotTaken = false
+  private readonly notifyExecutions = new Map<
+    ToolExecutionToken,
+    Promise<{ readonly admitted: true }>
+  >()
   private commandAbort = new AbortController()
 
   constructor(ctx: Context, options: LarkBridgeOptions) {
@@ -1672,6 +1692,8 @@ export class LarkBridge {
     this.client = options.client
     this.inboundDeduplicator = options.inboundDeduplicator
     this.conversationBindings = options.conversationBindings ?? conversationBindingsOf(ctx)
+    this.notifyOutbox = options.notifyOutbox
+    this.proactiveDelivery = options.proactiveDelivery === true
     this.locale = options.locale ?? DEFAULT_CONFIG.locale
     this.text = localeCopy(this.locale).bridge
     this.allowFrom = new Set((options.allowFrom ?? []).map((openId) => openId.trim()).filter(Boolean))
@@ -1799,6 +1821,7 @@ export class LarkBridge {
     this.client.onCardAction?.((action) => this.handleCardAction(action))
     const start = this.client.start().then(() => {
       this.clientStarted = true
+      this.requestNotifyDrain()
     })
     this.startPromise = start
     return start
@@ -1871,6 +1894,12 @@ export class LarkBridge {
     this.workspaceAttachmentTasks.clear()
     const evictionWorker = this.conversationEvictionWorker
     if (evictionWorker !== undefined) await collectSettled([evictionWorker], failures)
+    if (this.notifyDrainTimer !== undefined) {
+      clearTimeout(this.notifyDrainTimer)
+      this.notifyDrainTimer = undefined
+    }
+    const notifyWorker = this.notifyDrainWorker
+    if (notifyWorker !== undefined) await collectSettled([notifyWorker], failures)
     if (this.conversationEvictionWorker === evictionWorker) {
       this.conversationEvictionWorker = undefined
     }
@@ -1972,6 +2001,7 @@ export class LarkBridge {
       await this.safeSend(route.chatId, this.text.denied, routeDeliveryOptions(route))
       return
     }
+    void this.rememberNotifyDestination(route)
     if (!isTextMessage) {
       if (msg.messageType === 'file' && msg.chatType === 'p2p' && this.inboundTextFiles) {
         await this.handleInboundTextFile(route, msg)
@@ -3559,6 +3589,200 @@ export class LarkBridge {
       return { sent: true }
     } finally {
       this.outboundArtifactSlotTaken = false
+    }
+  }
+
+  private notifyLarkTool(sessionId: ReturnType<typeof SessionId>) {
+    return defineTool({
+      name: NOTIFY_LARK_TOOL_NAME,
+      description: [
+        'Admit one completion or attention notification to the Lark conversation already',
+        'registered for this turn. Do not pass chat, user, or message IDs. Mentions may',
+        'include only "initiator". Delivery is retried from the durable outbox.',
+      ].join(' '),
+      parameters: {
+        kind: {
+          type: 'string',
+          required: true,
+          enum: ['completion', 'attention'],
+          description: 'completion announces finished work; attention asks the user to look.',
+        },
+        summary: {
+          type: 'string',
+          required: true,
+          description: 'Bounded notification text shown on the Lark card.',
+        },
+        mentions: {
+          type: 'array',
+          items: { type: 'string', enum: ['initiator'] },
+          description: 'Optional mention tokens. Only "initiator" is accepted.',
+        },
+        idempotency_key: {
+          type: 'string',
+          description: 'Optional 8-50 character key that makes retries of this call idempotent.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: { admitted: { type: 'boolean', const: true } },
+          required: ['admitted'],
+          additionalProperties: false,
+        },
+        render: () => [{ type: 'text' as const, text: this.text.notifyAdmitted }],
+      },
+      execute: (args, exec) => this.executeNotifyLarkOnce(sessionId, args, exec),
+      presentCall: () => ({
+        card: 'generic',
+        title: this.text.notifyCallTitle,
+        kind: 'other',
+      }),
+      presentResult: (_args, result) => ({
+        card: 'generic',
+        title: result.isError ? this.text.notifyFailedTitle : this.text.notifyAdmittedTitle,
+        content: result.content,
+      }),
+    })
+  }
+
+  private executeNotifyLarkOnce(
+    sessionId: ReturnType<typeof SessionId>,
+    args: unknown,
+    exec: ToolRunContext,
+  ): Promise<{ readonly admitted: true }> {
+    const existing = this.notifyExecutions.get(exec.token)
+    if (existing !== undefined) return existing
+    const task = this.executeNotifyLark(sessionId, args, exec)
+    this.notifyExecutions.set(exec.token, task)
+    const cleanup = (): void => {
+      this.notifyExecutions.delete(exec.token)
+    }
+    void task.then(cleanup, cleanup)
+    return task
+  }
+
+  private async executeNotifyLark(
+    sessionId: ReturnType<typeof SessionId>,
+    args: unknown,
+    exec: ToolRunContext,
+  ): Promise<{ readonly admitted: true }> {
+    const parsed = parseNotifyToolArgs(args)
+    const outbox = this.notifyOutbox
+    const route = this.activeRoutes.get(String(sessionId))
+    if (parsed === undefined
+      || outbox === undefined
+      || !this.proactiveDelivery
+      || route === undefined
+      || exec.parent !== undefined
+      || exec.signal.aborted
+      || this.stopping) {
+      throw new Error(this.text.notifyNotAdmitted)
+    }
+    const scopeId = notifyConversationScopeId(this.sessionReferenceNamespace, route.sessionBaseId)
+    await this.rememberNotifyDestination(route)
+    await outbox.admit({
+      scopeId,
+      kind: parsed.kind,
+      summary: parsed.summary,
+      mentions: parsed.mentions,
+      idempotencyKey: parsed.idempotencyKey ?? newNotifyIdempotencyKey(),
+    }, Date.now())
+    this.requestNotifyDrain()
+    return { admitted: true }
+  }
+
+  private async rememberNotifyDestination(route: MessageRoute): Promise<void> {
+    if (this.notifyOutbox === undefined || !this.proactiveDelivery) return
+    try {
+      const scopeId = notifyConversationScopeId(this.sessionReferenceNamespace, route.sessionBaseId)
+      await this.notifyOutbox.registerDestination(scopeId, {
+        chatId: route.chatId,
+        chatType: route.chatType,
+        openId: route.openId,
+        lastMessageId: route.replyToMessageId,
+        ...(route.replyInThread === true ? { replyInThread: true } : {}),
+      })
+    } catch {
+      this.ctx.logger.warn('[lark] notify destination could not be registered')
+    }
+  }
+
+  private requestNotifyDrain(): void {
+    if (this.stopping || this.notifyOutbox === undefined || !this.proactiveDelivery) return
+    this.notifyDrainRequested = true
+    if (this.notifyDrainWorker !== undefined) return
+    const worker = Promise.resolve().then(() => this.runNotifyDrainWorker())
+    this.notifyDrainWorker = worker.catch((error: unknown) => {
+      this.ctx.logger.error('[lark] notify drain failed: %s', messageOf(error))
+    })
+    const cleanup = (): void => {
+      if (this.notifyDrainWorker === worker || this.notifyDrainWorker === undefined) {
+        this.notifyDrainWorker = undefined
+      }
+      if (this.notifyDrainRequested && !this.stopping) this.requestNotifyDrain()
+    }
+    void this.notifyDrainWorker.then(cleanup, cleanup)
+  }
+
+  private scheduleNotifyDrain(at: number): void {
+    if (this.stopping || this.notifyOutbox === undefined || !this.proactiveDelivery) return
+    const delay = Math.max(0, at - Date.now())
+    if (this.notifyDrainTimer !== undefined) {
+      clearTimeout(this.notifyDrainTimer)
+    }
+    this.notifyDrainTimer = setTimeout(() => {
+      this.notifyDrainTimer = undefined
+      this.requestNotifyDrain()
+    }, Math.min(delay, 60_000))
+  }
+
+  private async runNotifyDrainWorker(): Promise<void> {
+    while (this.notifyDrainRequested && !this.stopping && this.notifyOutbox !== undefined) {
+      this.notifyDrainRequested = false
+      const due = await this.notifyOutbox.claimDue(Date.now())
+      for (const record of due) await this.deliverNotifyRecord(record)
+    }
+    const next = this.notifyOutbox?.earliestPendingAt(Date.now())
+    if (next !== undefined) this.scheduleNotifyDrain(next)
+  }
+
+  private async deliverNotifyRecord(record: {
+    readonly id: string
+    readonly scopeId: string
+    readonly kind: 'completion' | 'attention'
+    readonly summary: string
+    readonly mentions: readonly 'initiator'[]
+  }): Promise<void> {
+    const outbox = this.notifyOutbox
+    if (outbox === undefined || this.client.sendCard === undefined) {
+      await outbox?.retryOrFail(record.id, Date.now())
+      return
+    }
+    const destination = outbox.destination(record.scopeId)
+    if (destination === undefined) {
+      await outbox.complete(record.id, 'failed', Date.now())
+      return
+    }
+    try {
+      const mentionMarkup = record.mentions.includes('initiator')
+        ? notifyMentionMarkup(destination.openId)
+        : undefined
+      const card = renderNotifyCard({
+        locale: this.locale,
+        kind: record.kind,
+        summary: record.summary,
+        ...(mentionMarkup === undefined ? {} : { mentionMarkup }),
+      })
+      await this.client.sendCard(destination.chatId, card, {
+        replyToMessageId: destination.lastMessageId,
+        ...(destination.replyInThread === true ? { replyInThread: true } : {}),
+        signal: this.commandAbort.signal,
+        idempotencyKey: record.id,
+      })
+      await outbox.complete(record.id, 'delivered', Date.now())
+    } catch {
+      const next = await outbox.retryOrFail(record.id, Date.now())
+      if (next.status === 'pending') this.notifyDrainRequested = true
     }
   }
 
@@ -6673,6 +6897,9 @@ export class LarkBridge {
         && workspaceRegistryOf(this.ctx) !== undefined) {
         agentCtx.tools.register(this.outboundArtifactTool(sessionId))
       }
+      if (this.proactiveDelivery && this.notifyOutbox !== undefined) {
+        agentCtx.tools.register(this.notifyLarkTool(sessionId))
+      }
       const scopedTools = (agentCtx as unknown as { tools?: {
         get?: Context['tools']['get']
       } }).tools
@@ -7480,6 +7707,7 @@ export class LarkBridge {
     this.outboundArtifactPhases.clear()
     this.outboundArtifactValidationSlotTaken = false
     this.outboundArtifactSlotTaken = false
+    this.notifyExecutions.clear()
     this.sessionOperations.clear()
   }
 

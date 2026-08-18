@@ -17,6 +17,7 @@ import {
   MAX_OUTBOUND_TEXT_BYTES,
 } from './outbound-artifact.ts'
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
+import { DurableNotifyOutbox } from './outbound-notify.ts'
 import { LarkSdkClient } from './lark.ts'
 import { LARK_LOCALES } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
@@ -46,6 +47,7 @@ export interface LarkConfig {
   maxOutboundTextFileBytes?: number
   maxOutboundImageBytes?: number
   maxOutboundImagePixels?: number
+  proactiveDelivery?: boolean
 }
 
 export const Config: Schema = Schema.object({
@@ -96,6 +98,7 @@ export const Config: Schema = Schema.object({
     .min(1)
     .max(MAX_OUTBOUND_IMAGE_PIXELS)
     .default(DEFAULT_CONFIG.maxOutboundImagePixels),
+  proactiveDelivery: Schema.boolean().default(DEFAULT_CONFIG.proactiveDelivery),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -109,6 +112,7 @@ async function cleanupRuntime(
   bridge: LarkBridge | undefined,
   deduplicator: DurableInboundDeduplicator,
   conversationBindings: DurableConversationBindingStore,
+  notifyOutbox?: DurableNotifyOutbox,
 ): Promise<unknown[]> {
   const failures: unknown[] = []
   if (bridge !== undefined) {
@@ -128,17 +132,36 @@ async function cleanupRuntime(
   } catch (error) {
     failures.push(error)
   }
+  if (notifyOutbox !== undefined) {
+    try {
+      await notifyOutbox.close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
   return failures
 }
 
-async function openRuntimeStorage(ctx: Context, appId: string): Promise<{
+async function openRuntimeStorage(
+  ctx: Context,
+  appId: string,
+  proactiveDelivery: boolean,
+): Promise<{
   readonly deduplicator: DurableInboundDeduplicator
   readonly conversationBindings: DurableConversationBindingStore
+  readonly notifyOutbox?: DurableNotifyOutbox
 }> {
   const deduplicator = await DurableInboundDeduplicator.open(ctx.storageDomain, appId)
   try {
     const conversationBindings = await DurableConversationBindingStore.open(ctx.storageDomain, appId)
-    return { deduplicator, conversationBindings }
+    if (!proactiveDelivery) return { deduplicator, conversationBindings }
+    try {
+      const notifyOutbox = await DurableNotifyOutbox.open(ctx.storageDomain, appId)
+      return { deduplicator, conversationBindings, notifyOutbox }
+    } catch (error) {
+      await conversationBindings.close().catch(() => {})
+      throw error
+    }
   } catch (error) {
     try {
       await deduplicator.close()
@@ -165,7 +188,11 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
     throw new Error('lark: appId must match cli_<16 hexadecimal characters>')
   }
   return (async () => {
-    const { deduplicator, conversationBindings } = await openRuntimeStorage(ctx, appId)
+    const { deduplicator, conversationBindings, notifyOutbox } = await openRuntimeStorage(
+      ctx,
+      appId,
+      config.proactiveDelivery === true,
+    )
     let bridge: LarkBridge | undefined
     try {
       const client = new LarkSdkClient({
@@ -202,10 +229,12 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         maxOutboundImageBytes: config.maxOutboundImageBytes,
         maxOutboundImagePixels: config.maxOutboundImagePixels,
         sessionReferenceNamespace: appId,
+        notifyOutbox,
+        proactiveDelivery: config.proactiveDelivery,
       })
       await bridge.start()
     } catch (error) {
-      const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings)
+      const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings, notifyOutbox)
       if (failures.length > 0) {
         throw new AggregateError([error, ...failures], 'lark: startup and cleanup failed')
       }
@@ -214,7 +243,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
     let teardown: Promise<void> | undefined
     return () => {
       teardown ??= (async () => {
-        const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings)
+        const failures = await cleanupRuntime(bridge, deduplicator, conversationBindings, notifyOutbox)
         if (failures.length > 0) throw new AggregateError(failures, 'lark: plugin teardown failed')
       })()
       return teardown

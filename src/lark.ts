@@ -108,6 +108,7 @@ export interface LarkDeliveryOptions {
   replyToMessageId?: string
   replyInThread?: boolean
   signal?: AbortSignal
+  idempotencyKey?: string
 }
 
 export type LarkConnectionState =
@@ -170,6 +171,14 @@ const REST_REQUEST_TIMEOUT_MS = 15_000
 const RESOURCE_ID_CONTROL_PATTERN = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 const ARTIFACT_NAME_UNSAFE_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\/:*?"<>|]/u
 const ARTIFACT_IDEMPOTENCY_PATTERN = /^[A-Za-z0-9_-]{1,50}$/u
+
+function deliveryIdempotency(value: string | undefined): { readonly uuid?: string } {
+  if (value === undefined) return {}
+  if (!ARTIFACT_IDEMPOTENCY_PATTERN.test(value)) {
+    throw new TypeError('lark: delivery idempotency key is invalid')
+  }
+  return { uuid: value }
+}
 
 const discardSdkLog = (..._messages: unknown[]): void => {}
 const PRIVATE_SDK_LOGGER = Object.freeze({
@@ -1091,6 +1100,7 @@ export class LarkSdkClient implements LarkClientLike {
                 msg_type: msgType,
                 content,
                 ...(options.replyInThread === true ? { reply_in_thread: true } : {}),
+                ...deliveryIdempotency(options.idempotencyKey),
               },
               signal,
               timeout: REST_REQUEST_TIMEOUT_MS,
@@ -1099,7 +1109,12 @@ export class LarkSdkClient implements LarkClientLike {
               url: '/open-apis/im/v1/messages',
               method: 'POST',
               params: { receive_id_type: 'chat_id' },
-              data: { receive_id: chatId, msg_type: msgType, content },
+              data: {
+                receive_id: chatId,
+                msg_type: msgType,
+                content,
+                ...deliveryIdempotency(options.idempotencyKey),
+              },
               signal,
               timeout: REST_REQUEST_TIMEOUT_MS,
             },
@@ -1119,11 +1134,17 @@ export class LarkSdkClient implements LarkClientLike {
             msg_type: msgType,
             content,
             ...(options?.replyInThread === true ? { reply_in_thread: true } : {}),
+            ...deliveryIdempotency(options?.idempotencyKey),
           },
         })
         : message.create({
           params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chatId, msg_type: msgType, content },
+          data: {
+            receive_id: chatId,
+            msg_type: msgType,
+            content,
+            ...deliveryIdempotency(options?.idempotencyKey),
+          },
         })
     ))
     const id = asRecord(res.data).message_id
