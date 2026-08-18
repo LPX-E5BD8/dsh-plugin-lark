@@ -122,6 +122,8 @@ class ProjectAgent {
   readonly id: string
   status: 'idle' | 'running' = 'idle'
   disposed = false
+  maintenanceAttempts = 0
+  whenIdleCalls = 0
   private maintenance = false
   private readonly idleWaiters: Array<() => void> = []
 
@@ -144,6 +146,7 @@ class ProjectAgent {
   cancel(): void {}
 
   whenIdle(): Promise<void> {
+    this.whenIdleCalls += 1
     if (!this.maintenance && !this.inbox.hasPending) return Promise.resolve()
     return new Promise((resolve) => this.idleWaiters.push(resolve))
   }
@@ -155,6 +158,9 @@ class ProjectAgent {
   }
 
   runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    this.maintenanceAttempts += 1
+    const plannedThrow = this.host.maintenanceThrowPlans.get(this.id)?.shift()
+    if (plannedThrow !== undefined) throw plannedThrow
     if (this.status !== 'idle' || this.maintenance) {
       throw new Error(`agent "${this.id}" already has active work`)
     }
@@ -283,6 +289,7 @@ class ProjectHost {
   sessionQueryAvailable = true
   defaultPreset = 'coding'
   createError?: Error
+  readonly maintenanceThrowPlans = new Map<string, Error[]>()
   bindingPutError?: Error
   disposeErrorOnce?: Error
   runtimeHandler?: (agent: ProjectAgent, line: string) => Promise<void>
@@ -436,6 +443,12 @@ class ProjectHost {
 
   planFlush(plan: FlushPlan): void {
     this.flushPlans.push(plan)
+  }
+
+  planMaintenanceThrow(sessionId: string, error: Error): void {
+    const plans = this.maintenanceThrowPlans.get(sessionId) ?? []
+    plans.push(error)
+    this.maintenanceThrowPlans.set(sessionId, plans)
   }
 
   planBindingPut(plan: BindingPutPlan): void {
@@ -894,6 +907,39 @@ test('/session retains a rolled-back candidate without spinning when retirement 
   assert.match(client.sent.at(-1)?.text ?? '', /\/session resume/u)
 })
 
+test('/session retains a rolled-back candidate without spinning when retirement maintenance throws', async (t) => {
+  const workspaces = await navigableWorkspaces(t)
+  const { host, client } = mount(t, workspaces)
+  const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-retirement-throw')
+  await send(client, 'session-retirement-throw', '/help')
+  await send(client, 'session-retirement-throw', '/session')
+  const catalog = client.sent.at(-1)?.text ?? ''
+  const currentLine = catalog.split('\n').find((line) => line.includes('[当前]'))
+  const reference = [...catalog.matchAll(/s_[A-Za-z0-9_-]{43}/gu)]
+    .map(([value]) => value)
+    .find((value) => currentLine?.includes(value) !== true)
+  assert.ok(reference !== undefined)
+  host.planMaintenanceThrow(seeded.historicalId, new Error('candidate commit exploded'))
+  host.planMaintenanceThrow(seeded.historicalId, new Error('candidate retirement exploded'))
+
+  await send(client, 'session-retirement-throw', `/session resume ${reference}`)
+  await yieldTurn()
+  const candidate = host.liveAgents.get(seeded.historicalId)
+  assert.ok(candidate !== undefined)
+  assert.match(client.sent.at(-1)?.text ?? '', /仍有执行或待处理消息|会话恢复失败/u)
+  assert.equal(host.bindings.get(seeded.baseId)?.generation, 1)
+  assert.equal(candidate.disposed, false)
+  const attempts = candidate.maintenanceAttempts
+  const idleWaits = candidate.whenIdleCalls
+  assert.ok(attempts >= 1)
+  await delay(20)
+  assert.equal(candidate.maintenanceAttempts, attempts)
+  assert.equal(candidate.whenIdleCalls, idleWaits)
+  assert.ok(attempts <= 2)
+  assert.ok(idleWaits <= 2)
+  assert.match(host.errors.join(' '), /maintenance failed; retaining its handle/u)
+})
+
 test('/session disposes a candidate when the historical Agent cannot be resumed', async (t) => {
   const workspaces = await navigableWorkspaces(t)
   const { host, client } = mount(t, workspaces)
@@ -1331,7 +1377,7 @@ test('/session ignores an oversized missing Workspace when authorizing available
   assert.equal(host.bindings.get(seeded.baseId)?.generation, 0)
 })
 
-test('/session displays valid out-of-Date-range timestamps safely and rejects changed title sources', async (t) => {
+test('/session displays valid out-of-date-range timestamps safely and rejects changed title sources', async (t) => {
   const workspaces = await navigableWorkspaces(t)
   const { host, client } = mount(t, workspaces)
   const seeded = seedSessionNavigation(host, workspaces[0]!, 'session-title-source')

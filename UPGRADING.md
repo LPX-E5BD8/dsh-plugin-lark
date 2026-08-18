@@ -49,6 +49,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.9` | Adds no plugin-owned schema. Opted-in images publish immutable objects under the Harness attachment backend, while Session events store only validated content-addressed references and metadata. | v0.9.8 retains and reads the same Session image blocks when its deployment has an attachment service, but new Lark image messages return to the unsupported path. Rolling code back does not delete objects or orphans; keep the attachment backend aligned with Session logs. |
 | `0.9.10` | Adds no plugin-owned schema. Approved outbound artifacts use existing `tool/call`, approval audit, and `tool/result` events; platform upload keys, destinations, paths, and bytes are never stored in plugin sidecars. | v0.9.9 reads the same Session log but no longer registers the send tool. Rollback cannot retract a delivered platform message or delete an uploaded orphan, and an open/unknown tool call follows ordinary rc.6 cold repair. |
 | `0.9.11` | Adds the `lark_notify` storage-domain unit (`destinations` + `outbox`). Destination rows store the chat/user/message IDs required to deliver after restart; outbox rows store hashed keys, kind, bounded summary, mention tokens, retry/expiry, and terminal status. | v0.9.10 ignores the new unit and no longer registers `notify_lark`. Already delivered platform cards remain; pending outbox items are not drained until the feature is enabled again. Do not replay a delivered idempotency key after rollback. |
+| `0.9.12` | Adds no schema. The notify drain worker releases its slot after each run so a later admit or backoff timer can send again; leftover review-thread closures fail closed on retirement maintenance throw and require outbound `sent`. | v0.9.11 reads the same `lark_notify` unit but can leave later admits pending after the first drain. Pending rows remain; do not mint a new idempotency key. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -65,7 +66,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.11'
+target_tag='v0.9.12'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -219,8 +220,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.11 | State handling |
+| Rollback target from v0.9.12 | State handling |
 | --- | --- |
+| v0.9.11 | Uses the same `lark_notify` unit and tool, but the first drain worker can leave later admits or backoff retries pending until remount. |
 | v0.9.10 | Uses the same Session, bindings, and artifact tool, but ignores `lark_notify` and does not register `notify_lark`. Already delivered notification cards remain on the platform; pending outbox rows stay until the feature is enabled again. |
 | v0.9.9 | Uses the same bindings, attachment store, approval audit, and Session vocabulary, but removes the outbound-artifact tool. Already delivered messages and uploaded platform orphans remain external; do not infer their state from a rolled-back `tool/result`. |
 | v0.9.8 | Uses the same bindings, Session logs, and image-routing guard but never downloads a new Lark image. Existing image blocks still require their referenced attachment objects and an image-capable route. No object or orphan is deleted; keep the attachment store with the snapshot. |

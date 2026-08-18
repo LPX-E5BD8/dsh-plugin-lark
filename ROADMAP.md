@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.11 are implemented in the current release line. The next planned independently reviewable capability is 0.9.12.
+Milestones through 0.9.12 are implemented in the current release line. The next planned independently reviewable capability is 0.9.13.
 
 ## 0.1.1 — Reliability
 
@@ -202,31 +202,36 @@ Milestones through 0.9.11 are implemented in the current release line. The next 
 - Persist a bounded outbox with idempotency keys, retry state, expiry, rate limits, and terminal delivery outcomes so process restarts cannot silently lose or duplicate admitted notifications.
 - Leave scheduling to Harness or an external scheduler; keep the channel responsible only for authorization, durable delivery, and observability.
 
-## 0.9.12 — Operator status and diagnostics
+## 0.9.12 — Notify drain reliability
+
+- Deliver a later admitted notification after the first drain worker settles on the same process, and wake a backoff retry without remounting the bridge.
+- Fail closed when candidate retirement maintenance throws; scan already-derived image-surface messages once; mark the outbound `sent` field required in the tool DSL.
+
+## 0.9.13 — Operator status and diagnostics
 
 - Add an operator-only status command covering the current plugin version, uptime, connection state, conversation/session identity, project, model, active work, and bounded context/usage information.
 - Add a sanitized diagnostic command that checks Bot REST identity, required scopes, Workspace registration count, session persistence, storage-domain write/flush participation, provider configuration, and recent categorized failures.
 - Return actionable remediation without revealing credentials, platform identifiers, prompts, message/session IDs, private paths, provider endpoints, or raw errors.
 
-## 0.9.13 — Conversation-scoped policy
+## 0.9.14 — Conversation-scoped policy
 
 - Support per-chat and per-group policy for authorized users, mention requirements, visible/selectable Workspaces, selectable provider/model routes, and allowed tool or approval classes.
 - Intersect scoped policy with the global fail-closed configuration so a local rule can only narrow access unless an explicit administrator-controlled policy says otherwise.
 - Apply policy before listing protected names or IDs as well as before execution, and persist no secret values in the policy document.
 
-## 0.9.14 — Runtime supervision and safe recovery
+## 0.9.15 — Runtime supervision and safe recovery
 
 - Ship optional, reviewable service-manager templates with graceful shutdown, bounded restart, stable logs, credential-environment guidance, and readiness checks for supported hosts.
 - Detect a failed or non-ready DSH profile from outside that process and provide a minimal recovery path without loading the failing third-party profile graph.
 - Prevent split-brain channel ownership through a heartbeat or lease, and require explicit operator action before any recovery component changes plugins, profiles, or durable state.
 
-## 0.9.15 — Explicit parallel tasks
+## 0.9.16 — Explicit parallel tasks
 
 - Let a user explicitly create, list, inspect, and stop bounded parallel tasks, each with its own DSH session, run ID, reply target, lifecycle card, and durable conversation association.
 - Keep ordinary consecutive messages serialized; never reinterpret them as implicit parallel work.
 - Define project-level write-collision policy and concurrency limits so parallel tasks cannot silently modify the same Workspace without an explicit safe configuration.
 
-## 0.9.16 — Optional document handoff
+## 0.9.17 — Optional document handoff
 
 - Read only an explicitly supplied, authorized Lark document link through a separately permissioned tool with bounded content and clear source attribution.
 - Publish a long final report as a document on explicit request, then return its link in the originating conversation while preserving the normal chat answer and delivery receipt.
