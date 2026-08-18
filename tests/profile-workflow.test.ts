@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 
-const BASELINE_TAG = 'v0.9.7'
-const BASELINE_COMMIT = 'a9daa84371e9b55482dbd94312937f18da2efa25'
-const BASELINE_DIGEST = 'sha256:71eca47c13b2038d98b01c9ec0f50319a5a506bde0f87eee89bc8668bb613a77'
+const BASELINE_TAG = 'v0.9.8'
+const BASELINE_COMMIT = 'd0921e4d1186dc256bc3eff587cc929da5dc8bad'
+const BASELINE_DIGEST = 'sha256:796b73c23ff8a3cd9d2d58ce6edd5d8257f79986769bfd1cb1d99d0c4f218204'
 const workflow = readFileSync('.github/workflows/ci.yml', 'utf8')
 const profileSmoke = readFileSync('scripts/profile-smoke.mjs', 'utf8')
 
@@ -229,6 +229,8 @@ test('profile smoke proves clean install and in-place upgrade composition', () =
   assert.match(profileSmoke, /const deepseekScope = join\(home, 'profiles', 'node_modules', '@deepseek-ai'\)/u)
   assert.match(profileSmoke, /filter\(\(entry\) => entry\.name\.startsWith\('dsh-'\)\)/u)
   for (const required of [
+    'dsh-attachment',
+    'dsh-attachment-local',
     'dsh-session-projection',
     'dsh-session-query',
     'dsh-session-query-sqlite',

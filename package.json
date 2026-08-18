@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-lark",
-  "description": "Feishu/Lark bridge for DeepSeek Harness with execution cards, structured input, and bounded text attachments",
-  "version": "0.9.8",
+  "description": "Feishu/Lark bridge for DeepSeek Harness with execution cards, structured input, and bounded media ingestion",
+  "version": "0.9.9",
   "author": "LPX-E5BD8",
   "type": "module",
   "repository": {
@@ -67,6 +67,7 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
     "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-attachment": "0.1.0-rc.6",
     "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "0.1.0-rc.6",
     "@deepseek-ai/dsh-storage-domain": "0.1.0-rc.6",
@@ -75,6 +76,9 @@
     "@deepseek-ai/schemastery": "3.18.1"
   },
   "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-attachment": {
+      "optional": true
+    },
     "@deepseek-ai/dsh-user-approval": {
       "optional": true
     }
@@ -84,8 +88,12 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-attachment": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-attachment-local": "0.1.0-rc.6",
     "@deepseek-ai/dsh-agent-loop": "0.1.0-rc.6",
     "@deepseek-ai/dsh-code-runtime": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-home-paths": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-invariants": "0.1.0-rc.6",
     "@deepseek-ai/dsh-session-checkpoint-policy": "0.1.0-rc.6",
     "@deepseek-ai/dsh-session-persistence": "0.1.0-rc.6",
     "@deepseek-ai/dsh-session-persistence-jsonl": "0.1.0-rc.6",

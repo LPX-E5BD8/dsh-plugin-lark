@@ -2,6 +2,8 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
+Milestones through 0.9.9 are implemented in the current release line. The next planned independently reviewable capability is 0.9.10.
+
 ## 0.1.1 — Reliability
 
 - Restore the persisted Agent preset and its scoped tools when Lark sessions are created or resumed.

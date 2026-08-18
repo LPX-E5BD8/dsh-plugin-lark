@@ -3,9 +3,16 @@ import { realpathSync, statSync } from 'node:fs'
 import { realpath, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
+import { symbols } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import type {
+  ImageAttachmentLimits,
+  ImageAttachmentRef,
+  SaveImageAttachment,
+  StoredImageAttachment,
+} from '@deepseek-ai/dsh-attachment'
 import { contentHasImage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, LlmCallConfig, TokenUsage, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
@@ -50,6 +57,18 @@ import {
 } from './human-input.ts'
 import type { HumanInputAnswer, HumanInputRequest } from './human-input.ts'
 import {
+  assertImageAggregate,
+  InboundImageError,
+  MAX_CONVERSATION_IMAGE_BYTES,
+  MAX_CONVERSATION_IMAGES,
+  MAX_INBOUND_IMAGE_BYTES,
+  MAX_INBOUND_IMAGE_PIXELS,
+  messagesImageStats,
+  prepareInboundImage,
+  validateSavedImageRef,
+} from './inbound-image.ts'
+import type { ImageContentStats, PreparedInboundImage } from './inbound-image.ts'
+import {
   InboundTextResourceError,
   prepareInboundTextResource,
   resolveInboundTextResourceMaxBytes,
@@ -61,6 +80,7 @@ import type {
   LarkCardActionResult,
   LarkClientLike,
   LarkDeliveryOptions,
+  LarkDownloadedResource,
   LarkInbound,
 } from './lark.ts'
 import { LarkResourceError } from './lark.ts'
@@ -85,6 +105,11 @@ export interface LarkBridgeOptions {
   maxConversationHandles?: number
   inboundTextFiles?: boolean
   maxInboundTextFileBytes?: number
+  inboundImages?: boolean
+  maxInboundImageBytes?: number
+  maxInboundImagePixels?: number
+  maxConversationImages?: number
+  maxConversationImageBytes?: number
   humanInputTimeoutMs?: number
   humanInputCardCloseTimeoutMs?: number
   cwd?: string
@@ -180,6 +205,21 @@ interface LlmRuntimeLike {
   listModels(provider: string): Promise<LlmModelInfoLike[]>
   resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<LlmCallConfig>
   resolveModelInfo?(provider: string, model: string, signal?: AbortSignal): Promise<unknown>
+}
+
+interface AttachmentStoreLike {
+  readonly imageLimits: ImageAttachmentLimits
+  validateImage(input: SaveImageAttachment): Promise<void>
+  saveImage(input: SaveImageAttachment): Promise<ImageAttachmentRef>
+  readImage(ref: ImageAttachmentRef, signal?: AbortSignal): Promise<StoredImageAttachment>
+}
+
+interface CapturedImageLimits {
+  readonly maxImageBytes: number
+  readonly maxImages: number
+  readonly maxMessageBytes: number
+  readonly maxPixels: number
+  readonly mediaTypes: readonly string[]
 }
 
 interface ListedModel {
@@ -349,6 +389,22 @@ type ReplayedModelWakeResult =
 
 type ReplayedModelWakePreflight = 'required' | 'not-applicable' | 'unavailable'
 
+type InboundImageAdmissionResult = {
+  readonly kind:
+    | 'accepted'
+    | 'busy'
+    | 'invalid'
+    | 'aggregate-limit'
+    | 'model-unsupported'
+    | 'unavailable'
+} | {
+  readonly kind: 'too-large'
+  readonly limit: number
+} | {
+  readonly kind: 'too-many-pixels'
+  readonly limit: number
+}
+
 interface ImageSurfaceSnapshot {
   readonly seq: number
   readonly replaceGeneration: number
@@ -370,6 +426,20 @@ interface ImageRouteSnapshot {
   readonly surface: ImageSurfaceSnapshot
   readonly inbox: readonly InboxSnapshotEntry[]
   readonly hasImage: boolean
+}
+
+interface InboundImageAdmissionSnapshot {
+  readonly conversation: ConversationSession
+  readonly handle: AgentHandle
+  readonly sessionId: string
+  readonly selection: ConversationModelSelection
+  readonly runtime: LlmRuntimeLike
+  readonly runtimeIdentity: object
+  readonly attachments: AttachmentStoreLike
+  readonly attachmentIdentity: object
+  readonly limits: CapturedImageLimits
+  readonly route: ImageRouteSnapshot
+  readonly stats: ImageContentStats
 }
 
 type ResetMaintenanceResult = {
@@ -549,6 +619,13 @@ class InboundResourceInterruptedError extends Error {
   }
 }
 
+class InboundImageFollowupError extends Error {
+  constructor(cause?: unknown) {
+    super('lark: inbound image followup failed', { cause })
+    this.name = 'InboundImageFollowupError'
+  }
+}
+
 class ModelWakeAfterCommitError extends Error {
   constructor() {
     super('lark: committed image-route recovery could not wake pending inbox')
@@ -587,6 +664,13 @@ function eventTime(time: number): number {
 
 function validContextWindow(value: number | undefined): number | undefined {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+function positiveBoundedInteger(value: number, max: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > max) {
+    throw new RangeError(`lark: ${name} must be a positive bounded safe integer`)
+  }
+  return value
 }
 
 function boundedText(value: string, limit: number): string {
@@ -1115,6 +1199,82 @@ function llmRuntimeOf(ctx: Context): LlmRuntimeLike | undefined {
   return candidate as LlmRuntimeLike
 }
 
+function attachmentStoreOf(ctx: Context): AttachmentStoreLike | undefined {
+  const service = ctx.get('attachments') as unknown
+  if (service === undefined) return undefined
+  if (service === null || typeof service !== 'object') {
+    throw new TypeError('lark: attachments service is invalid')
+  }
+  const candidate = service as Partial<AttachmentStoreLike>
+  if (typeof candidate.validateImage !== 'function'
+    || typeof candidate.saveImage !== 'function'
+    || typeof candidate.readImage !== 'function') {
+    throw new TypeError('lark: attachments service is invalid')
+  }
+  captureImageLimits(candidate.imageLimits)
+  return candidate as AttachmentStoreLike
+}
+
+function captureImageLimits(value: unknown): CapturedImageLimits {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('lark: attachment image limits are invalid')
+  }
+  const limits = value as Partial<ImageAttachmentLimits>
+  const maxImageBytes = positiveBoundedServiceLimit(limits.maxImageBytes)
+  const maxImages = positiveBoundedServiceLimit(limits.maxImagesPerMessage)
+  const maxMessageBytes = positiveBoundedServiceLimit(limits.maxMessageImageBytes)
+  const maxPixels = positiveBoundedServiceLimit(limits.maxImagePixels)
+  if (!Array.isArray(limits.mediaTypes)
+    || limits.mediaTypes.length === 0
+    || limits.mediaTypes.length > 16
+    || !limits.mediaTypes.every((mediaType) => typeof mediaType === 'string'
+      && mediaType.length > 0
+      && mediaType.length <= 64
+      && mediaType.isWellFormed()
+      && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mediaType))) {
+    throw new TypeError('lark: attachment image media types are invalid')
+  }
+  return Object.freeze({
+    maxImageBytes,
+    maxImages,
+    maxMessageBytes,
+    maxPixels,
+    mediaTypes: Object.freeze([...limits.mediaTypes]),
+  })
+}
+
+function positiveBoundedServiceLimit(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError('lark: attachment image limit is invalid')
+  }
+  return value
+}
+
+function sameImageLimits(service: AttachmentStoreLike, captured: CapturedImageLimits): boolean {
+  try {
+    const current = captureImageLimits(service.imageLimits)
+    return current.maxImageBytes === captured.maxImageBytes
+      && current.maxImages === captured.maxImages
+      && current.maxMessageBytes === captured.maxMessageBytes
+      && current.maxPixels === captured.maxPixels
+      && current.mediaTypes.length === captured.mediaTypes.length
+      && current.mediaTypes.every((mediaType, index) => mediaType === captured.mediaTypes[index])
+  } catch {
+    return false
+  }
+}
+
+export function serviceInstanceIdentity(service: object): object {
+  try {
+    const original = (service as Record<PropertyKey, unknown>)[symbols.original]
+    return original !== null && (typeof original === 'object' || typeof original === 'function')
+      ? original
+      : service
+  } catch {
+    return service
+  }
+}
+
 function listedProvider(value: unknown): LlmProviderInfoLike {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('lark: llm provider catalog is invalid')
@@ -1324,6 +1484,11 @@ export class LarkBridge {
   private readonly maxConversationHandles: number
   private readonly inboundTextFiles: boolean
   private readonly maxInboundTextFileBytes: number
+  private readonly inboundImages: boolean
+  private readonly maxInboundImageBytes: number
+  private readonly maxInboundImagePixels: number
+  private readonly maxConversationImages: number
+  private readonly maxConversationImageBytes: number
   private readonly humanInputTimeoutMs: number
   private readonly humanInputCardCloseTimeoutMs: number
   private readonly cwd: string
@@ -1376,6 +1541,7 @@ export class LarkBridge {
   private conversationAccessSequence = 0
   private bindingRecoveryRequired = false
   private workspaceMutationRecoveryRequired = false
+  private inboundImageSlotTaken = false
   private commandAbort = new AbortController()
 
   constructor(ctx: Context, options: LarkBridgeOptions) {
@@ -1412,6 +1578,27 @@ export class LarkBridge {
     this.inboundTextFiles = options.inboundTextFiles === true
     this.maxInboundTextFileBytes = resolveInboundTextResourceMaxBytes(
       options.maxInboundTextFileBytes ?? DEFAULT_CONFIG.maxInboundTextFileBytes,
+    )
+    this.inboundImages = options.inboundImages === true
+    this.maxInboundImageBytes = positiveBoundedInteger(
+      options.maxInboundImageBytes ?? DEFAULT_CONFIG.maxInboundImageBytes,
+      MAX_INBOUND_IMAGE_BYTES,
+      'maxInboundImageBytes',
+    )
+    this.maxInboundImagePixels = positiveBoundedInteger(
+      options.maxInboundImagePixels ?? DEFAULT_CONFIG.maxInboundImagePixels,
+      MAX_INBOUND_IMAGE_PIXELS,
+      'maxInboundImagePixels',
+    )
+    this.maxConversationImages = positiveBoundedInteger(
+      options.maxConversationImages ?? DEFAULT_CONFIG.maxConversationImages,
+      MAX_CONVERSATION_IMAGES,
+      'maxConversationImages',
+    )
+    this.maxConversationImageBytes = positiveBoundedInteger(
+      options.maxConversationImageBytes ?? DEFAULT_CONFIG.maxConversationImageBytes,
+      MAX_CONVERSATION_IMAGE_BYTES,
+      'maxConversationImageBytes',
     )
     this.humanInputTimeoutMs = options.humanInputTimeoutMs ?? HUMAN_INPUT_LIMITS.timeoutMs
     if (!Number.isSafeInteger(this.humanInputTimeoutMs)
@@ -1651,6 +1838,10 @@ export class LarkBridge {
         await this.handleInboundTextFile(route, msg)
         return
       }
+      if (msg.messageType === 'image' && msg.chatType === 'p2p' && this.inboundImages) {
+        await this.handleInboundImage(route, msg)
+        return
+      }
       await this.safeSend(route.chatId, this.text.unsupportedInput, routeDeliveryOptions(route))
       return
     }
@@ -1666,7 +1857,7 @@ export class LarkBridge {
   private async handleInboundTextFile(route: MessageRoute, msg: LarkInbound): Promise<void> {
     const resource = msg.resource
     const download = this.client.downloadMessageResource
-    if (resource === undefined || download === undefined) {
+    if (resource?.kind !== 'file' || download === undefined) {
       await this.sendInboundTextFileReply(route, this.text.inboundTextFileInvalid)
       return
     }
@@ -1723,6 +1914,286 @@ export class LarkBridge {
     }
   }
 
+  private async handleInboundImage(route: MessageRoute, msg: LarkInbound): Promise<void> {
+    if (msg.resource?.kind !== 'image' || this.client.downloadMessageResource === undefined) {
+      await this.sendInboundImageReply(route, { kind: 'invalid' })
+      return
+    }
+    if (this.inboundImageSlotTaken) {
+      await this.sendInboundImageReply(route, { kind: 'busy' })
+      return
+    }
+    this.inboundImageSlotTaken = true
+    try {
+      const result = await this.enqueueConversationOperation(route.sessionBaseId, () => (
+        this.withConversation(route.sessionBaseId, async (conversation) => {
+          await this.sessionOperations.get(conversation.baseId)
+          return this.admitInboundImage(conversation, route, msg)
+        })
+      ))
+      if (result.kind !== 'accepted') {
+        if (this.stopping || this.commandAbort.signal.aborted) {
+          throw new InboundResourceInterruptedError(this.commandAbort.signal.reason)
+        }
+        await this.sendInboundImageReply(route, result)
+      }
+    } finally {
+      this.inboundImageSlotTaken = false
+    }
+  }
+
+  private async sendInboundImageReply(
+    route: MessageRoute,
+    result: Exclude<InboundImageAdmissionResult, { readonly kind: 'accepted' }>,
+  ): Promise<void> {
+    const text = this.inboundImageReplyText(result)
+    try {
+      await this.client.sendText(route.chatId, text, routeDeliveryOptions(route))
+    } catch {
+      throw new Error('lark: inbound image notice delivery failed')
+    }
+  }
+
+  private inboundImageReplyText(
+    result: Exclude<InboundImageAdmissionResult, { readonly kind: 'accepted' }>,
+  ): string {
+    switch (result.kind) {
+      case 'busy': return this.text.inboundImageBusy
+      case 'invalid': return this.text.inboundImageInvalid
+      case 'too-large': return this.text.inboundImageTooLarge(result.limit)
+      case 'too-many-pixels': return this.text.inboundImageTooManyPixels(result.limit)
+      case 'aggregate-limit': return this.text.inboundImageAggregateLimit
+      case 'model-unsupported': return this.text.inboundImageModelUnsupported
+      case 'unavailable': return this.text.inboundImageUnavailable
+      default: return this.text.inboundImageUnavailable
+    }
+  }
+
+  private async admitInboundImage(
+    conversation: ConversationSession,
+    route: MessageRoute,
+    msg: LarkInbound,
+  ): Promise<InboundImageAdmissionResult> {
+    if (this.stopping || this.commandAbort.signal.aborted) {
+      throw new InboundResourceInterruptedError(this.commandAbort.signal.reason)
+    }
+    const handle = conversation.handle
+    let maintenance: Promise<InboundImageAdmissionResult>
+    try {
+      maintenance = handle.agent.runMaintenance((signal) => (
+        this.processInboundImage(conversation, handle, route, msg, signal)
+      ))
+    } catch (error) {
+      if (this.stopping || this.commandAbort.signal.aborted) {
+        throw new InboundResourceInterruptedError(error)
+      }
+      return { kind: 'busy' }
+    }
+    try {
+      return await maintenance
+    } catch (error) {
+      if (error instanceof InboundImageFollowupError) throw error
+      if (error instanceof InboundResourceInterruptedError
+        || this.stopping
+        || this.commandAbort.signal.aborted) {
+        throw new InboundResourceInterruptedError(error)
+      }
+      return { kind: 'unavailable' }
+    }
+  }
+
+  private async processInboundImage(
+    conversation: ConversationSession,
+    handle: AgentHandle,
+    route: MessageRoute,
+    msg: LarkInbound,
+    maintenanceSignal: AbortSignal,
+  ): Promise<InboundImageAdmissionResult> {
+    const agent = handle.agent
+    const signal = AbortSignal.any([maintenanceSignal, this.commandAbort.signal])
+    if (signal.aborted) throw new InboundResourceInterruptedError(signal.reason)
+    if (agent.inbox.hasPending) return { kind: 'busy' }
+    const captured = this.captureInboundImageSnapshot(conversation, handle)
+    if (captured === undefined) return { kind: 'unavailable' }
+    const effectiveBytes = Math.min(
+      this.maxInboundImageBytes,
+      captured.limits.maxImageBytes,
+      captured.limits.maxMessageBytes,
+    )
+    const effectivePixels = Math.min(this.maxInboundImagePixels, captured.limits.maxPixels)
+    const effectiveImages = Math.min(this.maxConversationImages, captured.limits.maxImages)
+    const effectiveAggregateBytes = Math.min(
+      this.maxConversationImageBytes,
+      captured.limits.maxMessageBytes,
+    )
+    if (captured.stats.count + 1 > effectiveImages
+      || captured.stats.bytes >= effectiveAggregateBytes) return { kind: 'aggregate-limit' }
+    const capability = await this.exactImageCapability(
+      captured.runtime,
+      captured.selection,
+      signal,
+    )
+    if (signal.aborted) throw new InboundResourceInterruptedError(signal.reason)
+    if (capability === 'image-unsupported') return { kind: 'model-unsupported' }
+    if (capability !== 'compatible') return { kind: capability === 'stale' ? 'busy' : 'unavailable' }
+    if (!this.inboundImageSnapshotCurrent(captured, signal)) return { kind: 'busy' }
+
+    let downloaded: LarkDownloadedResource
+    try {
+      downloaded = await this.client.downloadMessageResource!(msg.messageId, msg.resource!, {
+        maxBytes: effectiveBytes,
+        signal,
+      })
+    } catch (error) {
+      if (signal.aborted) throw new InboundResourceInterruptedError(error)
+      return this.inboundImageFailure(error, effectiveBytes, effectivePixels)
+    }
+    if (signal.aborted) throw new InboundResourceInterruptedError(signal.reason)
+    if (!this.inboundImageSnapshotCurrent(captured, signal)) return { kind: 'busy' }
+
+    let prepared: PreparedInboundImage
+    try {
+      prepared = prepareInboundImage(
+        downloaded.data,
+        downloaded.mediaType,
+        effectiveBytes,
+        effectivePixels,
+      )
+      if (!captured.limits.mediaTypes.includes(prepared.input.mediaType)) {
+        return { kind: 'unavailable' }
+      }
+      assertImageAggregate(
+        captured.stats,
+        prepared.input.data.byteLength,
+        effectiveImages,
+        effectiveAggregateBytes,
+      )
+    } catch (error) {
+      return this.inboundImageFailure(error, effectiveBytes, effectivePixels)
+    }
+    if (!this.inboundImageSnapshotCurrent(captured, signal)) return { kind: 'busy' }
+
+    let ref: ImageAttachmentRef
+    try {
+      const saved = await captured.attachments.saveImage(prepared.input)
+      ref = validateSavedImageRef(saved, prepared)
+    } catch (error) {
+      if (signal.aborted) throw new InboundResourceInterruptedError(error)
+      return this.inboundImageFailure(error, effectiveBytes, effectivePixels)
+    }
+    if (signal.aborted) throw new InboundResourceInterruptedError(signal.reason)
+    if (!this.inboundImageSnapshotCurrent(captured, signal)) return { kind: 'busy' }
+    const finalCapability = await this.exactImageCapability(
+      captured.runtime,
+      captured.selection,
+      signal,
+    )
+    if (signal.aborted) throw new InboundResourceInterruptedError(signal.reason)
+    if (finalCapability === 'image-unsupported') return { kind: 'model-unsupported' }
+    if (finalCapability !== 'compatible') {
+      return { kind: finalCapability === 'stale' ? 'busy' : 'unavailable' }
+    }
+    if (!this.inboundImageSnapshotCurrent(captured, signal)) return { kind: 'busy' }
+    await this.submitMaintainedConversationFollowup(
+      conversation,
+      route,
+      [{ type: 'image', attachment: ref }],
+    )
+    return { kind: 'accepted' }
+  }
+
+  private captureInboundImageSnapshot(
+    conversation: ConversationSession,
+    handle: AgentHandle,
+  ): InboundImageAdmissionSnapshot | undefined {
+    try {
+      const runtime = llmRuntimeOf(this.ctx)
+      const attachments = attachmentStoreOf(this.ctx)
+      if (runtime === undefined || attachments === undefined) return undefined
+      const before = this.imageRouteSnapshot(handle.agent)
+      const stats = this.currentImageStats(handle.agent)
+      const route = this.imageRouteSnapshot(handle.agent)
+      if (!this.sameImageRouteSnapshot(before, route)) return undefined
+      return {
+        conversation,
+        handle,
+        sessionId: conversation.sessionId,
+        selection: Object.freeze({ ...conversation.modelSelection }),
+        runtime,
+        runtimeIdentity: serviceInstanceIdentity(runtime),
+        attachments,
+        attachmentIdentity: serviceInstanceIdentity(attachments),
+        limits: captureImageLimits(attachments.imageLimits),
+        route,
+        stats,
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  private inboundImageSnapshotCurrent(
+    captured: InboundImageAdmissionSnapshot,
+    signal: AbortSignal,
+  ): boolean {
+    if (signal.aborted
+      || this.stopping
+      || this.conversations.get(captured.conversation.baseId) !== captured.conversation
+      || captured.conversation.handle !== captured.handle
+      || captured.conversation.sessionId !== captured.sessionId
+      || captured.sessionId !== String(captured.handle.agent.id)
+      || !sameModelSelection(captured.conversation.modelSelection, captured.selection)
+      || !modelSelectionRefMatches(captured.conversation.modelSelectionRef, captured.selection)
+      || !sameImageLimits(captured.attachments, captured.limits)) return false
+    try {
+      const runtime = llmRuntimeOf(this.ctx)
+      const attachments = attachmentStoreOf(this.ctx)
+      return runtime !== undefined
+        && attachments !== undefined
+        && serviceInstanceIdentity(runtime) === captured.runtimeIdentity
+        && serviceInstanceIdentity(attachments) === captured.attachmentIdentity
+        && this.sameImageRouteSnapshot(
+          this.imageRouteSnapshot(captured.handle.agent),
+          captured.route,
+        )
+    } catch {
+      return false
+    }
+  }
+
+  private currentImageStats(agent: Agent): ImageContentStats {
+    const surface = messagesImageStats(agent.session.deriveMessages())
+    const inbox = messagesImageStats(this.inboxSnapshot(agent).map(({ message }) => message))
+    const count = surface.count + inbox.count
+    const bytes = surface.bytes + inbox.bytes
+    if (!Number.isSafeInteger(count) || !Number.isSafeInteger(bytes)) {
+      throw new InboundImageError('IMAGE_REFERENCE_INVALID', 'lark: image aggregate overflows')
+    }
+    return Object.freeze({ count, bytes })
+  }
+
+  private inboundImageFailure(
+    error: unknown,
+    maxBytes: number,
+    maxPixels: number,
+  ): InboundImageAdmissionResult {
+    const code = error instanceof InboundImageError
+      ? error.code
+      : typeof (error as { readonly code?: unknown } | null)?.code === 'string'
+        ? (error as { readonly code: string }).code
+        : ''
+    if (error instanceof LarkResourceError && error.code === 'too_large'
+      || code === 'IMAGE_TOO_LARGE') return { kind: 'too-large', limit: maxBytes }
+    if (code === 'IMAGE_TOO_MANY_PIXELS') return { kind: 'too-many-pixels', limit: maxPixels }
+    if (code === 'IMAGE_AGGREGATE_LIMIT') return { kind: 'aggregate-limit' }
+    if (error instanceof LarkResourceError && error.code === 'invalid'
+      || code === 'IMAGE_INVALID'
+      || code === 'IMAGE_TYPE_UNSUPPORTED'
+      || code === 'IMAGE_TYPE_MISMATCH'
+      || code === 'INVALID_IMAGE') return { kind: 'invalid' }
+    return { kind: 'unavailable' }
+  }
+
   private async followupConversation(
     route: MessageRoute,
     content: ContentBlock[],
@@ -1730,21 +2201,44 @@ export class LarkBridge {
     await this.withConversation(route.sessionBaseId, async (conversation) => {
       await this.sessionOperations.get(conversation.baseId)
       if (!await this.ensureImageRouteInput(conversation, route)) return
-      this.prepareWorkspaceAttachment(conversation)
-      const message = createUserMessage({
-        content,
-        source: { kind: 'user' },
-      })
-      this.enqueueMessageRoute(conversation.sessionId, String(message.id), route)
-      try {
-        conversation.handle.agent.followup(message)
-      } catch (error) {
-        this.removeMessageRoute(String(message.id), route)
-        this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
-        await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
-        throw error
-      }
+      await this.submitConversationFollowup(conversation, route, content)
     })
+  }
+
+  private async submitMaintainedConversationFollowup(
+    conversation: ConversationSession,
+    route: MessageRoute,
+    content: ContentBlock[],
+  ): Promise<void> {
+    this.prepareWorkspaceAttachment(conversation)
+    const message = createUserMessage({ content, source: { kind: 'user' } })
+    this.enqueueMessageRoute(conversation.sessionId, String(message.id), route)
+    try {
+      conversation.handle.agent.send(message, 'next-turn', true)
+    } catch (error) {
+      this.removeMessageRoute(String(message.id), route)
+      this.ctx.logger.error('[lark] image followup failed')
+      await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
+      throw new InboundImageFollowupError(error)
+    }
+  }
+
+  private async submitConversationFollowup(
+    conversation: ConversationSession,
+    route: MessageRoute,
+    content: ContentBlock[],
+  ): Promise<void> {
+    this.prepareWorkspaceAttachment(conversation)
+    const message = createUserMessage({ content, source: { kind: 'user' } })
+    this.enqueueMessageRoute(conversation.sessionId, String(message.id), route)
+    try {
+      conversation.handle.agent.followup(message)
+    } catch (error) {
+      this.removeMessageRoute(String(message.id), route)
+      this.ctx.logger.error('[lark] followup failed: %s', messageOf(error))
+      await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
+      throw error
+    }
   }
 
   private async imageRouteBlockCopy(
@@ -4208,15 +4702,9 @@ export class LarkBridge {
     } catch {
       return 'unavailable'
     }
-    const resolve = runtime?.resolveModelInfo
-    if (runtime === undefined || typeof resolve !== 'function') return 'unavailable'
-    let info: unknown
-    try {
-      info = await resolve.call(runtime, selection.provider, selection.model, signal)
-    } catch {
-      return signal.aborted ? 'stale' : 'unavailable'
-    }
-    if (signal.aborted) return 'stale'
+    if (runtime === undefined) return 'unavailable'
+    const capability = await this.exactImageCapability(runtime, selection, signal)
+    if (capability === 'stale') return capability
     let after: ImageRouteSnapshot
     try {
       after = this.imageRouteSnapshot(agent)
@@ -4224,6 +4712,23 @@ export class LarkBridge {
       return 'unavailable'
     }
     if (!this.sameImageRouteSnapshot(before, after)) return 'stale'
+    return capability
+  }
+
+  private async exactImageCapability(
+    runtime: LlmRuntimeLike,
+    selection: ConversationModelSelection,
+    signal: AbortSignal,
+  ): Promise<Exclude<ImageRouteCompatibility, 'not-required'>> {
+    const resolve = runtime.resolveModelInfo
+    if (typeof resolve !== 'function') return 'unavailable'
+    let info: unknown
+    try {
+      info = await resolve.call(runtime, selection.provider, selection.model, signal)
+    } catch {
+      return signal.aborted ? 'stale' : 'unavailable'
+    }
+    if (signal.aborted) return 'stale'
     if (info === null || typeof info !== 'object' || Array.isArray(info)) return 'unavailable'
     const record = info as {
       readonly provider?: unknown

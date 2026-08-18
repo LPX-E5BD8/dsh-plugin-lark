@@ -1,6 +1,8 @@
 import { readFile } from 'node:fs/promises'
 import type { Readable } from 'node:stream'
 import { DEFAULT_CONFIG } from './config.ts'
+import { MAX_INBOUND_IMAGE_BYTES } from './inbound-image.ts'
+import { MAX_INBOUND_TEXT_RESOURCE_BYTES } from './inbound-resource.ts'
 import { localeCopy } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
 
@@ -20,10 +22,13 @@ export interface LarkInbound {
   resource?: LarkInboundResource
 }
 
-export interface LarkInboundResource {
+export type LarkInboundResource = {
   kind: 'file'
   key: string
   name: string
+} | {
+  kind: 'image'
+  key: string
 }
 
 export interface LarkDownloadedResource {
@@ -123,13 +128,13 @@ export interface LarkSdkOptions {
   domain?: 'feishu' | 'lark'
   locale?: LarkLocale
   inboundTextFiles?: boolean
+  inboundImages?: boolean
 }
 
 const TEXT_LIMIT = 4000
 const START_TIMEOUT_MS = 15_000
 const REST_REQUEST_TIMEOUT_MS = 15_000
 const RESOURCE_ID_CONTROL_PATTERN = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
-const MAX_RESOURCE_DOWNLOAD_BYTES = 256 * 1_024
 
 const discardSdkLog = (..._messages: unknown[]): void => {}
 const PRIVATE_SDK_LOGGER = Object.freeze({
@@ -204,6 +209,17 @@ function parseInboundFileResource(content: string): LarkInboundResource | undefi
     if (typeof key !== 'string' || !validResourceId(key)) return undefined
     if (typeof name !== 'string' || name === '' || name.length > 1_024) return undefined
     return { kind: 'file', key, name }
+  } catch {
+    return undefined
+  }
+}
+
+function parseInboundImageResource(content: string): LarkInboundResource | undefined {
+  try {
+    const key = asRecord(JSON.parse(content)).image_key
+    return typeof key === 'string' && validResourceId(key)
+      ? { kind: 'image', key }
+      : undefined
   } catch {
     return undefined
   }
@@ -645,7 +661,11 @@ export class LarkSdkClient implements LarkClientLike {
               : { text: '', mentioned }
             const resource = self.options.inboundTextFiles === true && messageType === 'file'
               ? parseInboundFileResource(message.content ?? '')
-              : undefined
+              : self.options.inboundImages === true
+                && messageType === 'image'
+                && message.chat_type === 'p2p'
+                ? parseInboundImageResource(message.content ?? '')
+                : undefined
             if (messageType === 'text' && normalized.text === '') return
             if (self.handler === undefined) return
             await self.handler({
@@ -700,14 +720,17 @@ export class LarkSdkClient implements LarkClientLike {
     resource: LarkInboundResource,
     options: LarkResourceDownloadOptions,
   ): Promise<LarkDownloadedResource> {
-    if (resource.kind !== 'file'
+    if ((resource.kind !== 'file' && resource.kind !== 'image')
       || !validResourceId(messageId)
       || !validResourceId(resource.key)) {
       throw new LarkResourceError('invalid', 'lark: message.resource reference is invalid')
     }
+    const hardMaxBytes = resource.kind === 'image'
+      ? MAX_INBOUND_IMAGE_BYTES
+      : MAX_INBOUND_TEXT_RESOURCE_BYTES
     if (!Number.isSafeInteger(options.maxBytes)
       || options.maxBytes <= 0
-      || options.maxBytes > MAX_RESOURCE_DOWNLOAD_BYTES) {
+      || options.maxBytes > hardMaxBytes) {
       throw new RangeError('lark: message.resource byte limit is invalid')
     }
     if (this.rest === undefined) {

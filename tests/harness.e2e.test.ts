@@ -3,9 +3,10 @@ import { cp, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'nod
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { test } from 'node:test'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, symbols } from '@deepseek-ai/cordis'
 import AgentRegistry, { installModelSelection } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import LocalAttachmentStore from '@deepseek-ai/dsh-attachment-local'
 import CodeRuntime from '@deepseek-ai/dsh-code-runtime'
 import type { CodeRunRequest, CodeRunResult } from '@deepseek-ai/dsh-code-runtime'
 import LlmRuntime, { CallId, createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
@@ -185,6 +186,11 @@ const ROUTING_IMAGE_BLOCK: ImageBlock = Object.freeze({
   }),
 })
 
+const INBOUND_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+)
+
 class NestedAskCodeRuntime extends CodeRuntime {
   readonly language = 'typescript'
   readonly isolation = 'worker-thread'
@@ -249,6 +255,19 @@ function conversationCommand(chatId: string, text: string): LarkInbound {
     text,
     messageId: `message-${chatId}-${text}`,
     mentioned: false,
+  }
+}
+
+function conversationImage(chatId: string, messageId: string): LarkInbound {
+  return {
+    chatId,
+    chatType: 'p2p',
+    openId: 'owner',
+    text: '',
+    messageType: 'image',
+    messageId,
+    mentioned: false,
+    resource: { kind: 'image', key: 'img_v3_harness_private' },
   }
 }
 
@@ -440,11 +459,13 @@ async function mount(
   humanInputCardCloseTimeoutMs?: number,
   rootOwnedCleanup = false,
   inboundTextFiles = false,
+  inboundImages = false,
 ): Promise<{
   ctx: Context
   bridge: LarkBridge
   client: HarnessClient
   workspaces: HarnessWorkspace[]
+  remountAttachmentStore(): Promise<void>
   dispose(): Promise<void>
 }> {
   const ctx = new Context()
@@ -457,6 +478,15 @@ async function mount(
     await ctx.plugin(StorageDomain, { backend: 'json' })
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
+    const attachmentConfig = {
+      dshHome: root,
+      maxImageBytes: 5 * 1024 * 1024,
+      maxImagesPerMessage: 20,
+      maxMessageImageBytes: 20 * 1024 * 1024,
+      maxImagePixels: 20_000_000,
+    }
+    let attachmentFiber = ctx.plugin(LocalAttachmentStore, attachmentConfig)
+    await attachmentFiber
     await ctx.plugin(SessionTitleService, {
       fallbackMaxWords: 6,
       fallbackMaxBytes: 120,
@@ -533,6 +563,7 @@ async function mount(
           humanInputTimeoutMs,
           humanInputCardCloseTimeoutMs,
           inboundTextFiles,
+          inboundImages,
           cwd: realWorkspaceCwd,
         })
         bridge = candidate
@@ -553,6 +584,11 @@ async function mount(
       bridge,
       client,
       workspaces,
+      async remountAttachmentStore() {
+        await attachmentFiber.dispose()
+        attachmentFiber = ctx.plugin(LocalAttachmentStore, attachmentConfig)
+        await attachmentFiber
+      },
       dispose() {
         disposal ??= (async () => {
           const failures = rootOwnedCleanup
@@ -634,6 +670,152 @@ test('harness e2e: an admitted text attachment reaches the model, persistence, a
   assert.match(resumedRequest, /durable attachment marker/u)
   assert.match(resumedRequest, /continue after attachment/u)
   assert.doesNotMatch(resumedRequest, /opaque-resource-key|harness-file-message/u)
+})
+
+test('harness e2e: a static inbound PNG survives attachment storage and cold resume', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-image-attachment-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const firstAdapter = new ModalScriptedAdapter(
+    [textResponse('image attachment received')],
+    ['text', 'image'],
+  )
+  const first = await mount(
+    root,
+    firstAdapter,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'zstd',
+    undefined,
+    undefined,
+    false,
+    false,
+    true,
+  )
+  first.client.downloadMessageResource = async (messageId, resource, options) => {
+    assert.equal(messageId, 'image-harness-first')
+    assert.deepEqual(resource, { kind: 'image', key: 'img_v3_harness_private' })
+    assert.equal(options.signal.aborted, false)
+    return { data: INBOUND_PNG, mediaType: 'image/png' }
+  }
+  await first.client.messageHandler?.(conversationImage(
+    'chat-image-attachment',
+    'image-harness-first',
+  ))
+  assert.deepEqual(first.client.sent, [])
+  await waitFor(() => firstAdapter.requests.length === 1)
+  const firstAgent = first.ctx.agents.list()[0]
+  assert.ok(firstAgent !== undefined)
+  await firstAgent.whenIdle()
+  assert.equal(await first.ctx.sessions.flush(firstAgent.session), true)
+
+  const firstRequest = JSON.stringify(firstAdapter.requests[0]?.messages)
+  assert.match(firstRequest, /"type":"image"/u)
+  assert.doesNotMatch(firstRequest, /img_v3_harness_private|iVBOR/u)
+  const image = firstAdapter.requests[0]?.messages
+    .flatMap(({ content }) => content)
+    .find((block): block is ImageBlock => block.type === 'image')
+  assert.ok(image !== undefined)
+  assert.equal(image.attachment.mediaType, 'image/png')
+  assert.equal(image.attachment.bytes, INBOUND_PNG.length)
+  assert.equal(image.attachment.name, undefined)
+  const stored = await first.ctx.attachments.readImage(image.attachment)
+  assert.deepEqual([...stored.data], [...INBOUND_PNG])
+  const fork = first.ctx.sessions.fork(firstAgent.session)
+  const forkImage = fork.deriveMessages()
+    .flatMap(({ content }) => content)
+    .find((block): block is ImageBlock => block.type === 'image')
+  assert.ok(forkImage !== undefined)
+  assert.deepEqual(forkImage.attachment, image.attachment)
+  const forkStored = await first.ctx.attachments.readImage(forkImage.attachment)
+  assert.deepEqual([...forkStored.data], [...INBOUND_PNG])
+  const persisted = JSON.stringify((await first.ctx.sessionPersistence.inspect(firstAgent.id)).events)
+  assert.match(persisted, new RegExp(String(image.attachment.attachmentId), 'u'))
+  assert.doesNotMatch(persisted, /img_v3_harness_private|iVBOR/u)
+  await first.dispose()
+
+  const resumedAdapter = new ModalScriptedAdapter(
+    [textResponse('continued with image attachment')],
+    ['text', 'image'],
+  )
+  const resumed = await mount(root, resumedAdapter, undefined, undefined, undefined, undefined, undefined, 'zstd')
+  t.after(() => resumed.dispose())
+  await resumed.client.messageHandler?.(conversationCommand(
+    'chat-image-attachment',
+    'continue after the stored image',
+  ))
+  await waitFor(() => resumedAdapter.requests.length === 1)
+  assert.match(JSON.stringify(resumedAdapter.requests[0]?.messages), new RegExp(
+    String(image.attachment.attachmentId),
+    'u',
+  ))
+  const reread = await resumed.ctx.attachments.readImage(image.attachment)
+  assert.deepEqual([...reread.data], [...INBOUND_PNG])
+})
+
+test('harness e2e: a real Cordis attachment remount after save leaves only an orphan', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-image-remount-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const adapter = new ModalScriptedAdapter([], ['text', 'image'])
+  const harness = await mount(
+    root,
+    adapter,
+    'en-US',
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    'none',
+    undefined,
+    undefined,
+    false,
+    false,
+    true,
+  )
+  t.after(() => harness.dispose())
+  harness.client.downloadMessageResource = async () => ({
+    data: INBOUND_PNG,
+    mediaType: 'image/png',
+  })
+  const original = (harness.ctx.attachments as unknown as Record<PropertyKey, unknown>)[
+    symbols.original
+  ]
+  assert.ok(original instanceof LocalAttachmentStore)
+  const originalSave = original.saveImage.bind(original)
+  const saveStarted = Promise.withResolvers<void>()
+  const releaseSave = Promise.withResolvers<void>()
+  let orphan: Awaited<ReturnType<typeof original.saveImage>> | undefined
+  original.saveImage = async (input) => {
+    saveStarted.resolve()
+    await releaseSave.promise
+    orphan = await originalSave(input)
+    return orphan
+  }
+
+  const delivery = harness.client.messageHandler?.(conversationImage(
+    'chat-image-remount',
+    'image-remount-message',
+  ))
+  assert.ok(delivery !== undefined)
+  await saveStarted.promise
+  await harness.remountAttachmentStore()
+  const replacement = (harness.ctx.attachments as unknown as Record<PropertyKey, unknown>)[
+    symbols.original
+  ]
+  assert.ok(replacement instanceof LocalAttachmentStore)
+  assert.notEqual(replacement, original)
+  releaseSave.resolve()
+  await delivery
+
+  assert.ok(orphan !== undefined)
+  assert.deepEqual([...((await replacement.readImage(orphan)).data)], [...INBOUND_PNG])
+  assert.equal(adapter.requests.length, 0)
+  assert.match(harness.client.sent.at(-1) ?? '', /another image is being processed/iu)
+  const agent = harness.ctx.agents.list()[0]
+  assert.ok(agent !== undefined)
+  assert.deepEqual(agent.session.deriveMessages(), [])
 })
 
 test('harness e2e: /new materializes and resumes its session across restart', async (t) => {

@@ -9,7 +9,7 @@
 - 同一个状态根目录只能由一个 Harness 进程写入；JSON 后端没有跨进程 writer lock。
 - 复制或恢复状态前必须优雅停止 Harness，并等待进程完全退出。在线执行 `cp`/`tar` 不构成一致性快照，也不能把 `kill -9` 当作备份边界。
 - 除非迁移明确要求，否则必须保持相同的 Lark app ID、状态根目录、启动 workspace、`defaultSessionId`、JSONL 压缩格式、canonical Workspace 路径、profile 配置与凭据来源。app ID 会参与存储 key 的哈希；更换后旧回执和绑定会像不存在一样。
-- Sessions、storage domains 与 Web profile 必须按同一时间点做快照。绝不能只恢复 `lark_conversations.json`、手工合并新旧 JSON，或编辑哈希/schema 字段。
+- Sessions、storage domains、attachments 与 Web profile 必须按同一时间点做快照。绝不能只恢复某个被引用附件或 `lark_conversations.json`、手工合并新旧 JSON，或编辑引用/哈希/schema 字段。
 - 所有快照都应视为敏感数据。Session 日志可能包含 prompt、工具结果和仓库数据；Workspace 状态包含路径；已选模型路由 ID 是明文。快照必须放在检出目录之外并限制访问，绝不能附到 issue。
 - 状态回滚不会撤销已经发送的消息、模型/provider 用量、工具副作用或 Workspace 中已修改的文件。项目目录必须使用自己的版本控制或备份保护。
 
@@ -21,10 +21,11 @@
 | --- | --- | --- |
 | 会话持久化 | `$DSH_HOME/sessions` | JSONL header、event、generation、cwd、preset 与 request header |
 | Storage domains | `$DSH_HOME/storages` | `lark_inbound.json`、`lark_conversations.json`、`workspace.json` 以及其他宿主 domain 状态 |
+| 附件存储 | `$DSH_HOME/attachments` | Session 事件引用的不可变图片对象；对象必须与日志保持一致 |
 | Web profile 安装 | `$DSH_HOME/profiles/web` | 插件规格、profile 依赖图与本地检出目录引用 |
 | 插件检出目录 | 传给 `dsh plugin --profile web add` 的绝对路径 | 本地安装可能持续链接该目录；回滚窗口关闭前必须保留旧检出目录 |
 
-overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为准。配置只能在本机检查，不要粘贴到工单。凭据和项目目录不属于上述三目录状态快照；请分别保留服务管理器/secret store 配置与仓库备份。
+overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为准。配置只能在本机检查，不要粘贴到工单。凭据和项目目录不属于上述四目录状态快照；请分别保留服务管理器/secret store 配置与仓库备份。
 
 ## 持久化状态历史
 
@@ -45,6 +46,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.6` | 不新增插件自有 schema。显式开启后，被接收的文本文件会成为 Session log 中的普通用户文本 block；resource key、下载状态与文件元数据不会加入回执或 binding。 | v0.9.5 可以读取包含这些普通文本 block 的 Session，但新文件消息会恢复为通用不支持路径。回滚不会从 Session 历史中删除已经提交的附件内容。 |
 | `0.9.7` | 不新增持久化 schema 或图片字节；在模型/Session 路由前读取现有精确模型可见 surface 与精确 adapter modality 元数据，不兼容检查不会写 binding。 | v0.9.6 会读取相同 binding 与 Session 事件，但移除图片历史 guard。由其他 surface 写入的 image block 仍会保留，并可能再次进入纯文本路由；provider 应在此默认拒绝。 |
 | `0.9.8` | 不新增持久化 schema。优雅停机时会通过有界、感知 signal 的最终 PATCH 尝试终态化每一张已知的运行中执行卡，不追加 Session 结果，也不发送 partial 输出。 | v0.9.7 会读取相同状态，但进程内 turn authority 消失后，已经投递的运行卡可能仍保留失效的“停止执行”控件。回滚前必须优雅停止 v0.9.8，并把仍显示运行中的旧卡视为 stale。 |
+| `0.9.9` | 不新增插件自有 schema。显式开启后，图片会在 Harness 附件 backend 发布不可变对象；Session 事件只保存已验证的内容寻址引用与元数据。 | v0.9.8 在部署提供附件服务时仍能保留并读取相同的 Session image block，但新的 Lark 图片会回到不支持路径。回滚代码不会删除对象或 orphan；附件 backend 必须与 Session log 保持一致。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -61,7 +63,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.8'
+target_tag='v0.9.9'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -107,32 +109,39 @@ test "$backup_parent" = "$backup_parent_input"
 case "$backup_parent" in
   "$dsh_state_root"|"$dsh_state_root"/*) exit 1 ;;
 esac
+umask 077
+test ! -L "$dsh_state_root/attachments"
+if test ! -e "$dsh_state_root/attachments"; then
+  install -d -m 700 -- "$dsh_state_root/attachments"
+fi
 test -d "$dsh_state_root/sessions"
 test -d "$dsh_state_root/storages"
+test -d "$dsh_state_root/attachments"
 test -d "$dsh_state_root/profiles/web"
 test -d "$backup_parent"
 test ! -L "$dsh_state_root/sessions"
 test ! -L "$dsh_state_root/storages"
+test ! -L "$dsh_state_root/attachments"
 test ! -L "$dsh_state_root/profiles"
 test ! -L "$dsh_state_root/profiles/web"
 command -v mountpoint >/dev/null
 ! mountpoint -q -- "$dsh_state_root/sessions"
 ! mountpoint -q -- "$dsh_state_root/storages"
+! mountpoint -q -- "$dsh_state_root/attachments"
 ! mountpoint -q -- "$dsh_state_root/profiles"
 ! mountpoint -q -- "$dsh_state_root/profiles/web"
 root_device="$(stat -c '%d' -- "$dsh_state_root")"
 root_mount="$(stat -c '%m' -- "$dsh_state_root")"
-for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
+for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/attachments" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
   test "$(stat -c '%d' -- "$active_unit")" = "$root_device"
   test "$(stat -c '%m' -- "$active_unit")" = "$root_mount"
 done
 
-required_kib="$(du -sk -- "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/profiles/web" | awk '{ total += $1 } END { print total }')"
+required_kib="$(du -sk -- "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/attachments" "$dsh_state_root/profiles/web" | awk '{ total += $1 } END { print total }')"
 available_kib="$(df -Pk -- "$backup_parent" | awk 'NR == 2 { print $4 }')"
 [[ "$required_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ ]]
 test "$available_kib" -gt "$required_kib"
 
-umask 077
 upgrade_snapshot="$(mktemp -d -- "$backup_parent/dsh-lark-pre-upgrade.XXXXXX")"
 test -d "$upgrade_snapshot"
 test ! -L "$upgrade_snapshot"
@@ -141,14 +150,16 @@ test "$(dirname -- "$upgrade_snapshot")" = "$backup_parent"
 case "$(basename -- "$upgrade_snapshot")" in dsh-lark-pre-upgrade.*) ;; *) exit 1 ;; esac
 cp -a -- "$dsh_state_root/sessions" "$upgrade_snapshot/sessions"
 cp -a -- "$dsh_state_root/storages" "$upgrade_snapshot/storages"
+cp -a -- "$dsh_state_root/attachments" "$upgrade_snapshot/attachments"
 cp -a -- "$dsh_state_root/profiles/web" "$upgrade_snapshot/web-profile"
 test -d "$upgrade_snapshot/sessions"
 test -d "$upgrade_snapshot/storages"
+test -d "$upgrade_snapshot/attachments"
 test -d "$upgrade_snapshot/web-profile"
 tree_digest() {
   tar --sort=name --format=posix \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
-    --numeric-owner -C "$1" -cf - sessions storages web-profile |
+    --numeric-owner -C "$1" -cf - sessions storages attachments web-profile |
     sha256sum | awk '{ print $1 }'
 }
 snapshot_digest="$(tree_digest "$upgrade_snapshot")"
@@ -164,7 +175,7 @@ printf 'completed snapshot: %s\n' "$upgrade_snapshot"
 )
 ```
 
-只有在三个目录复制完成后同时带有 `SNAPSHOT_SHA256` 与 `SNAPSHOT_COMPLETE` 的私有快照，才允许用于本恢复模板。checksum 用于发现意外损坏，受保护目录则构成它的信任边界；能够同时改写数据与 checksum 的攻击者不受它防护。修改 profile 前必须验证快照；不要移动或删除源状态。如果自定义后端横跨数据库、volume、mountpoint 或顶层 symlink，应改用能够建立共同一致时间点的后端原生快照。
+只有在四个目录复制完成后同时带有 `SNAPSHOT_SHA256` 与 `SNAPSHOT_COMPLETE` 的私有快照，才允许用于本恢复模板。checksum 用于发现意外损坏，受保护目录则构成它的信任边界；能够同时改写数据与 checksum 的攻击者不受它防护。修改 profile 前必须验证快照；不要移动或删除源状态。如果自定义后端横跨数据库、volume、mountpoint 或顶层 symlink，应改用能够建立共同一致时间点的后端原生快照。
 
 ## 升级与验证
 
@@ -200,18 +211,19 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 主机迁移属于冷迁移，不是蓝绿发布。必须先停止源端并保持停止；源端与目标端不能同时让 Harness 共享这份状态或连接同一个 Lark app。该标准流程只适用于迁移到空状态根目录的同 Linux 冷迁移，并且必须保留 numeric owner、mode、symlink target 以及完全相同的绝对 `DSH_HOME`、checkout、启动和 Workspace 路径。其他布局和 backend 尚未验证，必须使用其原生流程。
 
-目标端必须准备完全相同的 rc.6 版本组、源与目标插件版本共同支持的同一条 Node.js 版本线、目标与回滚插件 tag/commit、app ID、`defaultSessionId`、JSONL 压缩格式、启动 workspace 与凭据来源；本次状态传输期间不能切换 Node.js 版本线。通过认证通道传输一个已完成的三目录快照和所需的 immutable checkout，并在安装前重新计算和验证 `SNAPSHOT_SHA256`。Workspace 仓库不在状态快照内，必须单独复制并保持相同 canonical 路径和 commit。绝不能把目标端已有的 JSONL/JSON 与快照合并。验证目标端期间源端必须继续停止；任何源端回滚或重试之前也必须先停止目标端。
+目标端必须准备完全相同的 rc.6 版本组、源与目标插件版本共同支持的同一条 Node.js 版本线、目标与回滚插件 tag/commit、app ID、`defaultSessionId`、JSONL 压缩格式、启动 workspace 与凭据来源；本次状态传输期间不能切换 Node.js 版本线。通过认证通道传输一个已完成的四目录快照和所需的 immutable checkout，并在安装前重新计算和验证 `SNAPSHOT_SHA256`。Workspace 仓库不在状态快照内，必须单独复制并保持相同 canonical 路径和 commit。绝不能把目标端已有的 JSONL/JSON 或附件对象与快照合并。验证目标端期间源端必须继续停止；任何源端回滚或重试之前也必须先停止目标端。
 
 ## 回滚决策表
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.8 回滚到 | 状态处理方式 |
+| 从 v0.9.9 回滚到 | 状态处理方式 |
 | --- | --- |
+| v0.9.8 | 使用相同 binding、Session log 与图片路由 guard，但不再下载新的 Lark 图片。已有 image block 仍要求其引用对象与支持图片的路由。任何对象或 orphan 都不会被删除；附件存储必须随快照保留。 |
 | v0.9.7 | 使用相同持久化状态与图片路由 guard，但移除普通运行中执行卡的优雅停机终态化。进程退出后仍显示“运行/停止执行”的卡片已经没有实时 Stop authority；重启后必须检查 Session，再按需重试。 |
 | v0.9.6 | 使用相同持久化状态，但移除图片感知的模型与 Session 路由检查。其他 Harness surface 已写入的 image block 仍保留；恢复普通 prompt 服务前，必须确认每条受影响会话使用支持图片的路由。 |
 | v0.9.5 | 使用相同持久化状态，并会继续保留已经作为普通用户 block 提交的文本附件；但新文件消息会恢复为通用不支持提示，且绝不下载。必须先优雅停机；本功能没有附件 sidecar 或临时文件需要清理。 |
-| v0.9.4 | 使用相同持久化状态，但其可构造插件入口可能在 root unload 时丢失异步 disposer。pending 问题可能看似仍可交互，但进程内状态已经消失；对应工具调用会在冷恢复时按 interrupted 修复。优先前滚；必须回滚时，先优雅停止 v0.9.8，并把所有遗留 v0.9.4 卡片视为 stale。 |
+| v0.9.4 | 使用相同持久化状态，但其可构造插件入口可能在 root unload 时丢失异步 disposer。pending 问题可能看似仍可交互，但进程内状态已经消失；对应工具调用会在冷恢复时按 interrupted 修复。优先前滚；必须回滚时，先优雅停止 v0.9.9，并把所有遗留 v0.9.4 卡片视为 stale。 |
 | v0.9.3 | 使用相同的 v2 conversation binding、Workspace domain 与 Session log。结构化卡片处理能力及其进程内 pending 状态会消失；必须先优雅停机。已发送卡片会留在聊天中并处于终态或 stale，所有未完成操作都会被拒绝。已经作为普通工具结果提交的答案仍保留在 transcript 中。 |
 | v0.9.2 | 使用相同的 v2 conversation binding、Workspace domain 与 Session log。v0.9.3 选中的 Session 会继续保持 active，因为 v0.9.2 会遵循该已提交 binding；但 `/session` 列出/恢复命令会消失，回滚也不会恢复先前 active 的 Session。v0.9.3 没有引入归档、取消归档、删除或搜索状态。 |
 | v0.9.1 | 无需转换持久化状态。旧版 Card payload 可能被飞书拒绝，因此审批可能不可用，但仍保持默认拒绝；必须保留完整快照，并优先通过前滚恢复。 |
@@ -256,26 +268,30 @@ case "$upgrade_snapshot" in "$dsh_state_root"|"$dsh_state_root"/*) exit 1 ;; esa
 case "$dsh_state_root" in "$upgrade_snapshot"|"$upgrade_snapshot"/*) exit 1 ;; esac
 test -d "$upgrade_snapshot/sessions"
 test -d "$upgrade_snapshot/storages"
+test -d "$upgrade_snapshot/attachments"
 test -d "$upgrade_snapshot/web-profile"
 test -f "$upgrade_snapshot/SNAPSHOT_SHA256"
 test -f "$upgrade_snapshot/SNAPSHOT_COMPLETE"
 test -d "$dsh_state_root/sessions"
 test -d "$dsh_state_root/storages"
+test -d "$dsh_state_root/attachments"
 test -d "$dsh_state_root/profiles/web"
 test ! -L "$upgrade_snapshot/sessions"
 test ! -L "$upgrade_snapshot/storages"
+test ! -L "$upgrade_snapshot/attachments"
 test ! -L "$upgrade_snapshot/web-profile"
 test ! -L "$upgrade_snapshot/SNAPSHOT_SHA256"
 test ! -L "$upgrade_snapshot/SNAPSHOT_COMPLETE"
 test ! -L "$dsh_state_root/sessions"
 test ! -L "$dsh_state_root/storages"
+test ! -L "$dsh_state_root/attachments"
 test ! -L "$dsh_state_root/profiles"
 test ! -L "$dsh_state_root/profiles/web"
 
 root_device="$(stat -c '%d' -- "$dsh_state_root")"
 root_mount="$(stat -c '%m' -- "$dsh_state_root")"
 command -v mountpoint >/dev/null
-for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
+for active_unit in "$dsh_state_root/sessions" "$dsh_state_root/storages" "$dsh_state_root/attachments" "$dsh_state_root/profiles" "$dsh_state_root/profiles/web"; do
   ! mountpoint -q -- "$active_unit"
   test "$(stat -c '%d' -- "$active_unit")" = "$root_device"
   test "$(stat -c '%m' -- "$active_unit")" = "$root_mount"
@@ -284,13 +300,13 @@ done
 tree_digest() {
   tar --sort=name --format=posix \
     --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime \
-    --numeric-owner -C "$1" -cf - sessions storages web-profile |
+    --numeric-owner -C "$1" -cf - sessions storages attachments web-profile |
     sha256sum | awk '{ print $1 }'
 }
 expected_digest="$(< "$upgrade_snapshot/SNAPSHOT_SHA256")"
 [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
 test "$(tree_digest "$upgrade_snapshot")" = "$expected_digest"
-required_kib="$(du -sk -- "$upgrade_snapshot/sessions" "$upgrade_snapshot/storages" "$upgrade_snapshot/web-profile" | awk '{ total += $1 } END { print total }')"
+required_kib="$(du -sk -- "$upgrade_snapshot/sessions" "$upgrade_snapshot/storages" "$upgrade_snapshot/attachments" "$upgrade_snapshot/web-profile" | awk '{ total += $1 } END { print total }')"
 available_kib="$(df -Pk -- "$dsh_state_root" | awk 'NR == 2 { print $4 }')"
 [[ "$required_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ ]]
 test "$available_kib" -gt "$required_kib"
@@ -306,8 +322,9 @@ test "$(stat -c '%d' -- "$restore_stage")" = "$root_device"
 test "$(stat -c '%m' -- "$restore_stage")" = "$root_mount"
 cp -a -- "$upgrade_snapshot/sessions" "$restore_stage/sessions"
 cp -a -- "$upgrade_snapshot/storages" "$restore_stage/storages"
+cp -a -- "$upgrade_snapshot/attachments" "$restore_stage/attachments"
 cp -a -- "$upgrade_snapshot/web-profile" "$restore_stage/web-profile"
-for staged_unit in "$restore_stage/sessions" "$restore_stage/storages" "$restore_stage/web-profile"; do
+for staged_unit in "$restore_stage/sessions" "$restore_stage/storages" "$restore_stage/attachments" "$restore_stage/web-profile"; do
   test -d "$staged_unit"
   test ! -L "$staged_unit"
   test "$(stat -c '%d' -- "$staged_unit")" = "$root_device"
@@ -353,6 +370,7 @@ rollback_one() {
 rollback_all() {
   rollback_failed=0
   rollback_one "$dsh_state_root/profiles/web" "$rollback_hold/web-profile" "$restore_stage/web-profile" "$original_web_id" "$staged_web_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile profiles/web'; rollback_failed=1; }
+  rollback_one "$dsh_state_root/attachments" "$rollback_hold/attachments" "$restore_stage/attachments" "$original_attachments_id" "$staged_attachments_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile attachments'; rollback_failed=1; }
   rollback_one "$dsh_state_root/storages" "$rollback_hold/storages" "$restore_stage/storages" "$original_storages_id" "$staged_storages_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile storages'; rollback_failed=1; }
   rollback_one "$dsh_state_root/sessions" "$rollback_hold/sessions" "$restore_stage/sessions" "$original_sessions_id" "$staged_sessions_id" || { printf >&2 '%s\n' 'automatic rollback could not reconcile sessions'; rollback_failed=1; }
   return "$rollback_failed"
@@ -377,9 +395,11 @@ on_exit() {
 
 original_sessions_id="$(dir_id "$dsh_state_root/sessions")"
 original_storages_id="$(dir_id "$dsh_state_root/storages")"
+original_attachments_id="$(dir_id "$dsh_state_root/attachments")"
 original_web_id="$(dir_id "$dsh_state_root/profiles/web")"
 staged_sessions_id="$(dir_id "$restore_stage/sessions")"
 staged_storages_id="$(dir_id "$restore_stage/storages")"
+staged_attachments_id="$(dir_id "$restore_stage/attachments")"
 staged_web_id="$(dir_id "$restore_stage/web-profile")"
 rename_active=0
 rename_committed=0
@@ -391,28 +411,32 @@ trap 'exit 143' TERM
 rename_active=1
 rename_empty_target "$dsh_state_root/sessions" "$rollback_hold/sessions" "$original_sessions_id" || exit 1
 rename_empty_target "$dsh_state_root/storages" "$rollback_hold/storages" "$original_storages_id" || exit 1
+rename_empty_target "$dsh_state_root/attachments" "$rollback_hold/attachments" "$original_attachments_id" || exit 1
 rename_empty_target "$dsh_state_root/profiles/web" "$rollback_hold/web-profile" "$original_web_id" || exit 1
 rename_empty_target "$restore_stage/sessions" "$dsh_state_root/sessions" "$staged_sessions_id" || exit 1
 rename_empty_target "$restore_stage/storages" "$dsh_state_root/storages" "$staged_storages_id" || exit 1
+rename_empty_target "$restore_stage/attachments" "$dsh_state_root/attachments" "$staged_attachments_id" || exit 1
 rename_empty_target "$restore_stage/web-profile" "$dsh_state_root/profiles/web" "$staged_web_id" || exit 1
 test "$(dir_id "$dsh_state_root/sessions")" = "$staged_sessions_id"
 test "$(dir_id "$dsh_state_root/storages")" = "$staged_storages_id"
+test "$(dir_id "$dsh_state_root/attachments")" = "$staged_attachments_id"
 test "$(dir_id "$dsh_state_root/profiles/web")" = "$staged_web_id"
 test "$(dir_id "$rollback_hold/sessions")" = "$original_sessions_id"
 test "$(dir_id "$rollback_hold/storages")" = "$original_storages_id"
+test "$(dir_id "$rollback_hold/attachments")" = "$original_attachments_id"
 test "$(dir_id "$rollback_hold/web-profile")" = "$original_web_id"
-if path_present "$restore_stage/sessions" || path_present "$restore_stage/storages" || path_present "$restore_stage/web-profile"; then exit 1; fi
+if path_present "$restore_stage/sessions" || path_present "$restore_stage/storages" || path_present "$restore_stage/attachments" || path_present "$restore_stage/web-profile"; then exit 1; fi
 rename_committed=1
 trap - ERR EXIT HUP INT QUIT TERM
 printf 'active root: %s\nrollback hold: %s\nrestore stage: %s\n' "$dsh_state_root" "$rollback_hold" "$restore_stage"
 )
 ```
 
-该 subshell 会在校验、复制、checksum 或 rename 错误时 fail closed。rename 阶段的 `EXIT`/`HUP`/`INT`/`QUIT`/`TERM` trap 会使用不覆盖的移动和 device/inode 校验恢复原来的三个单元。SIGKILL、主机掉电和内核故障无法触发 trap。任何中断或不完整结果出现后，都必须让 Harness 保持停止，并根据记录的 invariant 核对输出的 active、hold 与 stage 路径；绝不能覆盖或合并它们。
+该 subshell 会在校验、复制、checksum 或 rename 错误时 fail closed。rename 阶段的 `EXIT`/`HUP`/`INT`/`QUIT`/`TERM` trap 会使用不覆盖的移动和 device/inode 校验恢复原来的四个单元。SIGKILL、主机掉电和内核故障无法触发 trap。任何中断或不完整结果出现后，都必须让 Harness 保持停止，并根据记录的 invariant 核对输出的 active、hold 与 stage 路径；绝不能覆盖或合并它们。
 
 恢复后的 profile 必须在停机前记录的同一绝对路径找到 immutable 原 checkout，且 commit 必须精确匹配。不能把它指向另一个目录，也不能用 `plugin add` 替代。使用相同 rc.6 版本组启动精确旧插件。`/api/lark/health` 只存在于 v0.5.0 及更高版本；v0.1.0–v0.4.0 必须使用历史 `[ws] ws client ready` gate，再完成一条可丢弃的端到端回复与会话恢复检查，不能仅因 HTTP 404 就判定插件失败。事件关闭前应保留 `rollback_hold`、`restore_stage`、快照以及 old/target 两个 immutable checkout。
 
-恢复快照会把 transcript、回执、Workspace 注册/排序、项目/模型绑定和 mutation 历史全部倒退到快照时间；磁盘上的 Workspace 与外部副作用仍停留在当前时间。允许新 turn 前必须显式检查这种时间分裂。
+恢复快照会把 transcript、被引用附件对象、回执、Workspace 注册/排序、项目/模型绑定和 mutation 历史全部倒退到快照时间；磁盘上的 Workspace、平台消息、provider 调用与其他外部副作用仍停留在当前时间。允许新 turn 前必须显式检查这种时间分裂。
 
 ## 故障恢复
 
