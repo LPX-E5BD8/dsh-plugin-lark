@@ -42,13 +42,13 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
 | `0.8.0`–`0.8.4` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x` | 支持原有 Node 22/Linux 基线；v0.8.4 新增不启动应用的 Web profile package lifecycle 门禁。 |
 
-必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、语义 checkpoint policy、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、本地 Attachment Store、Tools、User Questions、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更和经审批产物投递另有真实 Registry/持久化生命周期测试。CI 把官方 Lark SDK 精确固定为 `1.73.0`，在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.10 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
+必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、语义 checkpoint policy、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、本地 Attachment Store、Tools、User Questions、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更和经审批产物投递另有真实 Registry/持久化生命周期测试。CI 把官方 Lark SDK 精确固定为 `1.73.0`，在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.11 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
 
 Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
 
@@ -95,7 +95,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.11'
+version='0.9.12'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"

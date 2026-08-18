@@ -124,7 +124,7 @@ import {
   eventLogHasModelVisibleImage,
   eventLogMayContainImage,
   eventLogRequiresImageRouteRecovery,
-  sessionHasModelVisibleImage,
+  messagesHaveModelVisibleImage,
 } from './session-media.ts'
 
 export interface LarkBridgeOptions {
@@ -3055,7 +3055,7 @@ export class LarkBridge {
       output: {
         schema: {
           type: 'object',
-          properties: { sent: { type: 'boolean', const: true } },
+          properties: { sent: { type: 'boolean', const: true, required: true } },
           additionalProperties: false,
         },
         render: () => [{
@@ -3625,8 +3625,7 @@ export class LarkBridge {
       output: {
         schema: {
           type: 'object',
-          properties: { admitted: { type: 'boolean', const: true } },
-          required: ['admitted'],
+          properties: { admitted: { type: 'boolean', const: true, required: true } },
           additionalProperties: false,
         },
         render: () => [{ type: 'text' as const, text: this.text.notifyAdmitted }],
@@ -3711,17 +3710,16 @@ export class LarkBridge {
     if (this.stopping || this.notifyOutbox === undefined || !this.proactiveDelivery) return
     this.notifyDrainRequested = true
     if (this.notifyDrainWorker !== undefined) return
-    const worker = Promise.resolve().then(() => this.runNotifyDrainWorker())
-    this.notifyDrainWorker = worker.catch((error: unknown) => {
+    const worker = Promise.resolve().then(() => this.runNotifyDrainWorker()).catch((error: unknown) => {
       this.ctx.logger.error('[lark] notify drain failed: %s', messageOf(error))
     })
+    this.notifyDrainWorker = worker
     const cleanup = (): void => {
-      if (this.notifyDrainWorker === worker || this.notifyDrainWorker === undefined) {
-        this.notifyDrainWorker = undefined
-      }
+      if (this.notifyDrainWorker !== worker) return
+      this.notifyDrainWorker = undefined
       if (this.notifyDrainRequested && !this.stopping) this.requestNotifyDrain()
     }
-    void this.notifyDrainWorker.then(cleanup, cleanup)
+    void worker.then(cleanup)
   }
 
   private scheduleNotifyDrain(at: number): void {
@@ -5599,7 +5597,7 @@ export class LarkBridge {
       ? cached.hasImage || messages.slice(cached.messageCount).some((message) => (
           contentHasImage(message.content)
         ))
-      : sessionHasModelVisibleImage(session)
+      : messagesHaveModelVisibleImage(messages)
     const seq = candidate.seq
     const replaceGeneration = candidate.surface?.replaceGeneration
     if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0
@@ -6985,7 +6983,7 @@ export class LarkBridge {
             }
           })
         } catch {
-          this.retireCandidateHandleAfterIdle(sessionId, handle)
+          this.ctx.logger.error('[lark] retired candidate session maintenance failed; retaining its handle')
           return
         }
         if (!durable) {
