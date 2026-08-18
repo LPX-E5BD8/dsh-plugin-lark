@@ -19,6 +19,13 @@ import {
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { DurableNotifyOutbox } from './outbound-notify.ts'
 import { DurableConversationPolicyStore } from './conversation-policy.ts'
+import { pluginReleaseVersion } from './operator-status.ts'
+import {
+  DEFAULT_OWNER_TTL_MS,
+  MAX_OWNER_TTL_MS,
+  MIN_OWNER_TTL_MS,
+  RuntimeSupervisor,
+} from './runtime-supervision.ts'
 import { LarkSdkClient } from './lark.ts'
 import { LARK_LOCALES } from './locale.ts'
 import type { LarkLocale } from './locale.ts'
@@ -50,6 +57,8 @@ export interface LarkConfig {
   maxOutboundImagePixels?: number
   proactiveDelivery?: boolean
   operatorFrom?: string[]
+  runtimeDir?: string
+  runtimeOwnerTtlMs?: number
 }
 
 export const Config: Schema = Schema.object({
@@ -102,6 +111,11 @@ export const Config: Schema = Schema.object({
     .default(DEFAULT_CONFIG.maxOutboundImagePixels),
   proactiveDelivery: Schema.boolean().default(DEFAULT_CONFIG.proactiveDelivery),
   operatorFrom: Schema.array(Schema.string()).default([]),
+  runtimeDir: Schema.string().default(''),
+  runtimeOwnerTtlMs: Schema.natural()
+    .min(MIN_OWNER_TTL_MS)
+    .max(MAX_OWNER_TTL_MS)
+    .default(DEFAULT_OWNER_TTL_MS),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -117,11 +131,20 @@ async function cleanupRuntime(
   conversationBindings: DurableConversationBindingStore,
   notifyOutbox?: DurableNotifyOutbox,
   conversationPolicies?: DurableConversationPolicyStore,
+  supervisor?: RuntimeSupervisor,
 ): Promise<unknown[]> {
   const failures: unknown[] = []
   if (bridge !== undefined) {
     try {
       await bridge.stop()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  // Ownership is released only once this process has stopped serving.
+  if (supervisor !== undefined) {
+    try {
+      await supervisor.stop()
     } catch (error) {
       failures.push(error)
     }
@@ -216,7 +239,20 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
       config.proactiveDelivery === true,
     )
     let bridge: LarkBridge | undefined
+    let supervisor: RuntimeSupervisor | undefined
     try {
+      // Ownership is claimed before the first connection so a second process
+      // refuses to serve instead of competing for the same bot.
+      const runtimeDir = (config.runtimeDir ?? '').trim()
+      if (runtimeDir !== '') {
+        supervisor = await RuntimeSupervisor.start({
+          runtimeDir,
+          version: pluginReleaseVersion(),
+          ttlMs: config.runtimeOwnerTtlMs ?? DEFAULT_OWNER_TTL_MS,
+          logger: { error: (message) => ctx.logger.error(message) },
+          onOwnershipLost: () => { void bridge?.stop() },
+        })
+      }
       const client = new LarkSdkClient({
         appId,
         appSecret,
@@ -257,6 +293,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         conversationPolicies,
       })
       await bridge.start()
+      await supervisor?.markReady()
     } catch (error) {
       const failures = await cleanupRuntime(
         bridge,
@@ -264,6 +301,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         conversationBindings,
         notifyOutbox,
         conversationPolicies,
+        supervisor,
       )
       if (failures.length > 0) {
         throw new AggregateError([error, ...failures], 'lark: startup and cleanup failed')
@@ -279,6 +317,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
           conversationBindings,
           notifyOutbox,
           conversationPolicies,
+          supervisor,
         )
         if (failures.length > 0) throw new AggregateError(failures, 'lark: plugin teardown failed')
       })()

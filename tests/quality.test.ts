@@ -418,6 +418,26 @@ test('quality: upgrade guides track durable schemas and ship with the package', 
   }
   assert.ok(manifest.files?.includes('UPGRADING.md'))
   assert.ok(manifest.files?.includes('UPGRADING.zh-CN.md'))
+  // The supervision templates are only useful to an operator if they ship.
+  assert.ok(manifest.files?.includes('contrib'))
+  const unit = readFileSync(join(process.cwd(), 'contrib/systemd/dsh-plugin-lark.service'), 'utf8')
+  const readiness = readFileSync(join(process.cwd(), 'contrib/systemd/lark-readiness.sh'), 'utf8')
+  assert.match(unit, /KillSignal=SIGTERM/u)
+  assert.match(unit, /TimeoutStopSec=(\d+)/u)
+  assert.ok(Number(/TimeoutStopSec=(\d+)/u.exec(unit)?.[1]) > 5, 'stop must outlast the host grace')
+  assert.match(unit, /Restart=on-failure/u)
+  assert.ok(
+    Number(/RestartSec=(\d+)/u.exec(unit)?.[1]) * 1_000 >= 30_000,
+    'restart must wait out the default ownership ttl',
+  )
+  assert.match(unit, /StartLimitBurst=\d+/u)
+  assert.match(unit, /EnvironmentFile=/u)
+  assert.doesNotMatch(unit, /DSH_LARK_APP_SECRET=|DEEPSEEK_API_KEY=/u)
+  assert.match(unit, /ExecStartPre=.*lark-clear-stale-owner\.sh/u)
+  // The probes must stay independent of the profile they judge.
+  const recovery = readFileSync(join(process.cwd(), 'contrib/systemd/lark-clear-stale-owner.sh'), 'utf8')
+  assert.doesNotMatch(readiness, /dsh |node |npm /u)
+  assert.doesNotMatch(recovery, /dsh |node |npm /u)
 
   const inboundSource = readFileSync(join(process.cwd(), 'src/inbound-dedup.ts'), 'utf8')
   const bindingSource = readFileSync(join(process.cwd(), 'src/conversation-binding.ts'), 'utf8')

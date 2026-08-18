@@ -1,0 +1,62 @@
+# Reviewable systemd template for one supervised DSH Web profile that serves a
+# single Lark/Feishu bot. Copy it to /etc/systemd/system/, replace every <...>
+# placeholder, then `systemctl daemon-reload`.
+#
+# This unit supervises the process. It never edits plugins, profiles, or durable
+# state; recovery beyond a restart is an explicit operator action.
+
+[Unit]
+Description=DeepSeek Harness Web profile with the Lark channel
+Documentation=https://github.com/LPX-E5BD8/dsh-plugin-lark
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<service-user>
+Group=<service-group>
+WorkingDirectory=<dsh-home>
+
+# Credentials stay in the launch environment. Keep this file 0600 and owned by
+# <service-user>; never commit it and never place secrets in the unit itself.
+EnvironmentFile=<dsh-home>/lark.env
+Environment=DSH_HOME=<dsh-home>
+
+# Clearing an abandoned ownership record is a single-actor recovery step, so it
+# runs here rather than inside a starting instance. A live owner makes this fail
+# and the start is refused, which is the split-brain guard doing its job.
+ExecStartPre=<dsh-home>/contrib/systemd/lark-clear-stale-owner.sh <runtime-dir>
+ExecStart=<dsh-binary> serve --profile web
+
+# The plugin terminalizes running Cards inside the rc.6 five-second host grace,
+# so stop has to outlast that budget before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+# Bounded restart. RestartSec must exceed runtimeOwnerTtlMs so a crashed
+# instance's ownership record has expired before the replacement claims it.
+Restart=on-failure
+RestartSec=35
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Stable, greppable logs.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dsh-lark
+
+# The channel needs its runtime directory, the DSH home, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# runtimeDir must be inside <dsh-home>, or listed here as well.
+ReadWritePaths=<dsh-home>
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
