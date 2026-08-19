@@ -29,6 +29,17 @@ Feishu/Lark long-connection bridge for [DeepSeek Harness](https://github.com/dee
 - **Supervised runtime (optional):** claims cross-process ownership of the bot before connecting, publishes a status document an external probe can read without loading the Harness profile, and ships reviewable systemd and readiness templates.
 - **Fail-closed boundaries:** authorization defaults to deny, Lark app credentials stay launch-environment-only, media ingestion is opt-in and bounded, and approval failures never grant access.
 
+## Stability
+
+1.0 freezes two contracts. The public configuration surface is the 31 options above: a later 1.x release may add an optional option, and removing or renaming one is a breaking change that requires a major version. The durable storage domains are `lark_conversations`, `lark_inbound`, `lark_notify`, `lark_policy`, and `lark_tasks`, each at domain version 0; a version bump requires a migration path and an [UPGRADING.md](./UPGRADING.md) entry before it can ship. Both sets are enforced by a release gate, so drifting from them fails the build rather than reaching a deployment.
+
+Freezing these contracts is not a claim that every deployment path is verified. Two remain outside the evidence this project has:
+
+- **Credential-backed Web-profile startup.** The release gates install and upgrade the packed candidate into isolated stock profiles and verify composition, but they do not boot the app with real Feishu or Lark credentials. Startup with credentials, WebSocket readiness against the live platform, and persisted-state migration during a credential-backed upgrade are exercised only by the manual runbook in [SMOKE_TESTS.md](./SMOKE_TESTS.md).
+- **Long-running resource behaviour.** There is no soak test. Memory, handle, and durable-store growth over days of continuous operation are unmeasured. The bounded-residency, outbox, and task limits are enforced and unit-tested, but their behaviour over a long uptime is not evidence-backed.
+
+Treat both as unverified rather than as known-good. If you deploy 1.0 into a long-lived production channel, run the credential-backed smoke checklist first and watch resource use yourself.
+
 ## Requirements
 
 - Node.js 22.x, or Node.js 24.x with plugin v0.8.5 or newer
@@ -47,6 +58,7 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
+| `1.0.0`–`1.0.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | The same gates as the `0.9.x` row; 1.0 freezes the public configuration surface and the durable storage domains rather than widening this matrix. Credential-backed Web-profile startup and long-running resource behaviour remain unverified — see [Stability](#stability). |
 | `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds bounded exact-scope Session navigation; v0.9.4 adds direct Native structured human input; v0.9.5 makes Cordis own the async disposer and bounds terminal Card shutdown; v0.9.6 adds opt-in bounded inbound UTF-8 text files; v0.9.7 makes model and Session routing fail closed around image history; v0.9.8 terminalizes known running execution Cards during graceful shutdown; v0.9.9 adds opt-in bounded static inbound images; v0.9.10 adds approved outbound Workspace artifacts on the supported Linux descriptor boundary, failing closed elsewhere; v0.9.11 adds opt-in reliable notifications to a previously registered conversation; v0.9.12 makes later admits and backoff retries drain on the same process; v0.9.13 adds operator `/status` and `/diag`; v0.9.14 adds conversation-scoped policy; v0.9.15 gates Card callbacks by that policy and stops inferring bot health from a missing probe; v0.9.16 adds optional runtime supervision with cross-process channel ownership; v0.9.17 adds explicit bounded parallel tasks; v0.9.18 makes an unreadable ownership record fail closed; v0.9.19 adds optional document handoff; v0.9.20 reviews the shipped documentation against the code. |
 | `0.8.7`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 produces the canonical archive; Node 22 and 24 run adjacent-upgrade profile gates. GitHub-hosted macOS 26 arm64 additionally verifies Node 22 and 24 package/runtime compatibility, not Web-profile deployment. |
 | `0.8.6` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Ubuntu support; macOS 26 arm64 package/runtime evidence covers Node 22 only. |
@@ -100,7 +112,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.9.20'
+version='1.0.0'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
