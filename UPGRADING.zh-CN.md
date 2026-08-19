@@ -58,6 +58,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.18` | 不新增 schema。无法解析的通道归属记录被视为「本进程不得改写或删除的他方归属」，因此启动会拒绝、心跳会报告归属丢失。 | v0.9.17 会直接改写这类记录，可能覆盖写入方的内容。无需 sidecar 迁移。 |
 | `0.9.19` | 不新增 storage-domain schema。文档读取与发布只经过工具调用与工具结果事件；链接、文档 token、正文都不会写入插件 sidecar。 | v0.9.18 会忽略配置并不再注册这两个工具。回滚不会撤回已发布的文档，也不会删除它。 |
 | `0.9.20` | 不新增 schema。随包 patch 补齐了此前缺失的可配置项，取值与 schema 默认值一致。 | v0.9.19 忽略新增的键并回退到相同的 schema 默认值，因此行为不变。 |
+| `1.0.0` | 不新增 schema。冻结公开配置面（31 项）与五个 domain version 0 的持久化单元，并由发布门禁强制校验。 | v0.9.20 使用完全相同的配置与持久化状态；冻结只作用于后续变更，回滚不需要任何迁移。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -74,7 +75,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.20'
+target_tag='v1.0.0'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -228,8 +229,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.20 回滚到 | 状态处理方式 |
+| 从 v1.0.0 回滚到 | 状态处理方式 |
 | --- | --- |
+| v0.9.20 | 配置与持久化状态完全相同。 |
 | v0.9.19 | 相同持久化状态与相同实际配置；`/task` 不再出现在聊天内帮助里。 |
 | v0.9.18 | 相同持久化状态；两个文档工具消失。已经发布的文档仍留在租户内，不受影响。 |
 | v0.9.17 | 相同持久化状态；无法解析的归属记录会被改写而不是被尊重。若曾由更新版本写过 `owner.json`，回滚前请先检查它。 |

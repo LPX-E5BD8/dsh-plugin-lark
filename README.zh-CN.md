@@ -29,6 +29,17 @@
 - **可选的运行时监管：** 连接之前先跨进程认领该机器人的归属，并发布一份外部探针无需加载 Harness profile 就能读取的状态文档，同时提供可审阅的 systemd 与就绪检查模板。
 - **失败时默认拒绝：** 授权默认拒绝、Lark 应用凭据仅允许来自启动环境；媒体摄入必须显式开启且全程有界，审批失败也绝不会放行。
 
+## 稳定性
+
+1.0 冻结两份契约。公开配置面就是上面那 31 个选项：后续 1.x 可以新增可选项，删除或改名属于破坏性变更，需要主版本号。持久化 storage domain 为 `lark_conversations`、`lark_inbound`、`lark_notify`、`lark_policy`、`lark_tasks`，均为 domain version 0；提升版本必须先有迁移路径和 [UPGRADING.md](./UPGRADING.md) 条目才能发布。两者都有发布门禁强制校验，偏离会直接让构建失败，而不是流到部署里。
+
+冻结这两份契约，**不等于**声称每条部署路径都验证过。有两块仍在本项目的证据范围之外：
+
+- **带凭据的 Web profile 启动。** 发布门禁会把打好的候选包全新安装并升级进隔离的标准 profile 并校验组合结果，但**不会**用真实飞书/Lark 凭据启动应用。带凭据启动、对真实平台的 WebSocket readiness、以及带凭据升级过程中的持久状态迁移，只有 [SMOKE_TESTS.md](./SMOKE_TESTS.md) 里的人工清单覆盖。
+- **长时间运行的资源表现。** 没有 soak 测试。连续运行数天的内存、句柄、持久化存储增长都没有测量过。有界驻留、发件箱、任务上限本身有强制约束和单元测试，但它们在长时间在线下的表现没有证据支撑。
+
+请把这两项当作**未验证**，而不是"应该没问题"。如果要把 1.0 放进长期运行的生产通道，先跑一遍带凭据的冒烟清单，并自行观察资源占用。
+
 ## 环境要求
 
 - Node.js 22.x，或在插件 v0.8.5 及更高版本中使用 Node.js 24.x
@@ -47,6 +58,7 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
+| `1.0.0`–`1.0.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 与 `0.9.x` 行相同的门禁；1.0 冻结公开配置面与持久化 storage domain，而不是扩大这张矩阵。带凭据的 Web profile 启动与长时间运行的资源表现仍未验证——见[稳定性](#稳定性)。 |
 | `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`；v0.9.14 增加会话级策略；v0.9.15 让卡片回调也走同一策略，并且不再因为缺少健康探针就判定机器人正常；v0.9.16 增加可选的运行时监管与跨进程通道归属；v0.9.17 增加显式的有界并行任务；v0.9.18 让无法解析的归属记录失败关闭；v0.9.19 增加可选的文档交接；v0.9.20 对照代码全量复核随包文档。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
@@ -100,7 +112,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.20'
+version='1.0.0'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"

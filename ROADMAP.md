@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.20 are implemented in the current release line. The remaining work is the 1.0 stable-release gates.
+Every milestone through 1.0 is implemented. The 1.0 section records what that release freezes and what it deliberately leaves unverified.
 
 ## 0.1.1 — Reliability
 
@@ -255,11 +255,12 @@ Milestones through 0.9.20 are implemented in the current release line. The remai
 - Carry every configurable option in the bundled patch that both READMEs present as its defaults, and gate that against drift.
 - Give conversation policy, channel ownership, parallel tasks, and document handoff their own security boundaries and credential-backed smoke steps.
 
-## 1.0 — Stable release
+## 1.0.0 — Stable release
 
 - Complete the high-value 0.9 conversation, media, delivery, policy, and operations gates without weakening the existing authorization, durability, privacy, or reply-routing contracts.
-- Expand the verified matrix only after additional Harness cohorts, Node.js LTS majors, operating systems, and credential-backed Web-profile startup plus persisted-state upgrade paths pass their own evidence-backed gates.
-- Freeze public configuration and durable schemas only after cold upgrade, rollback, failure-injection, and long-running resource tests have passed on the supported deployment baseline.
+- Freeze the public configuration surface and the durable storage domains behind a release gate, so drifting from either fails the build. A later 1.x may add an optional configuration option; removing or renaming one, or bumping a domain version without a migration path, is a breaking change.
+- Keep the verified matrix exactly as the 0.9 line earned it. Additional Harness cohorts, Node.js majors, and operating systems are not claimed, because they have not passed their own gates.
+- State plainly what 1.0 does not verify: credential-backed Web-profile startup, and long-running resource behaviour. Both are covered only by the manual runbook, not by an automated gate, and neither may be presented as verified.
 
 ## Not planned
 

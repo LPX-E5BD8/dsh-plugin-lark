@@ -58,6 +58,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.18` | Adds no schema. An unreadable channel ownership record is treated as an owner this process must not rewrite or delete, so a start refuses and a heartbeat reports lost ownership. | v0.9.17 rewrites such a record instead, which can clobber whatever wrote it. No sidecar migration. |
 | `0.9.19` | Adds no storage-domain schema. Document reads and publishes travel through ordinary tool-call and tool-result events; links, document tokens, and bodies never enter plugin sidecars. | v0.9.18 ignores the configuration and no longer registers either tool. Rollback cannot retract an already published document or delete it. |
 | `0.9.20` | Adds no schema. The bundled patch now carries the configurable options it previously omitted, at values identical to the schema defaults. | v0.9.19 ignores the added keys and falls back to the same schema defaults, so behaviour is unchanged. |
+| `1.0.0` | Adds no schema. Freezes the 31-option public configuration surface and the five domain-version-0 durable units behind a release gate. | v0.9.20 uses exactly the same configuration and durable state; the freeze constrains later changes only, so rolling back needs no migration. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -74,7 +75,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.20'
+target_tag='v1.0.0'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -228,8 +229,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.20 | State handling |
+| Rollback target from v1.0.0 | State handling |
 | --- | --- |
+| v0.9.20 | Identical configuration and durable state. |
 | v0.9.19 | Same durable state and same effective configuration; `/task` disappears from the in-chat help. |
 | v0.9.18 | Same durable state; the document tools disappear. Documents already published stay in the tenant and are unaffected. |
 | v0.9.17 | Same durable state; an unreadable ownership record is rewritten rather than respected. Inspect `owner.json` before rolling back if a newer release ever wrote it. |
