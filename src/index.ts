@@ -20,6 +20,13 @@ import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { DurableNotifyOutbox } from './outbound-notify.ts'
 import { DurableConversationPolicyStore } from './conversation-policy.ts'
 import {
+  DEFAULT_DOCUMENT_HANDOFF,
+  DEFAULT_MAX_DOCUMENT_PUBLISH_BYTES,
+  DEFAULT_MAX_DOCUMENT_READ_BYTES,
+  MAX_DOCUMENT_PUBLISH_BYTES,
+  MAX_DOCUMENT_READ_BYTES,
+} from './document-handoff.ts'
+import {
   DEFAULT_MAX_PARALLEL_TASKS,
   DEFAULT_PARALLEL_TASKS,
   DurableParallelTaskStore,
@@ -68,6 +75,9 @@ export interface LarkConfig {
   parallelTasks?: boolean
   maxParallelTasks?: number
   taskWorkspaces?: 'exclusive' | 'shared'
+  documentHandoff?: boolean
+  maxDocumentReadBytes?: number
+  maxDocumentPublishBytes?: number
 }
 
 export const Config: Schema = Schema.object({
@@ -132,6 +142,15 @@ export const Config: Schema = Schema.object({
     .default(DEFAULT_MAX_PARALLEL_TASKS),
   taskWorkspaces: Schema.union([Schema.const('exclusive'), Schema.const('shared')])
     .default('exclusive'),
+  documentHandoff: Schema.boolean().default(DEFAULT_DOCUMENT_HANDOFF),
+  maxDocumentReadBytes: Schema.natural()
+    .min(1)
+    .max(MAX_DOCUMENT_READ_BYTES)
+    .default(DEFAULT_MAX_DOCUMENT_READ_BYTES),
+  maxDocumentPublishBytes: Schema.natural()
+    .min(1)
+    .max(MAX_DOCUMENT_PUBLISH_BYTES)
+    .default(DEFAULT_MAX_DOCUMENT_PUBLISH_BYTES),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -347,6 +366,10 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         maxParallelTasks: config.maxParallelTasks,
         taskWorkspaces: config.taskWorkspaces,
         parallelTaskStore,
+        domain: config.domain ?? DEFAULT_CONFIG.domain,
+        documentHandoff: config.documentHandoff,
+        maxDocumentReadBytes: config.maxDocumentReadBytes,
+        maxDocumentPublishBytes: config.maxDocumentPublishBytes,
       })
       await bridge.start()
       await supervisor?.markReady()
