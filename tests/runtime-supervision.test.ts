@@ -327,9 +327,14 @@ test('the shipped recovery script clears only an abandoned owner record', async 
   await live.release()
 })
 
-// macOS ships BSD date, which rejects the GNU `-d` form. Run the shipped script
-// against a BSD-shaped `date` so that platform is covered from Linux CI too.
-test('the readiness script reads a heartbeat with BSD date as well as GNU date', async (t) => {
+// macOS ships BSD date, which rejects the GNU `-d` form, so a GNU host runs the
+// shipped script against a BSD-shaped `date` to cover that branch too. A BSD
+// host already exercises it natively and cannot host the GNU-based shim.
+const hostDateIsGnu = spawnSync('date', ['--version'], { encoding: 'utf8' }).status === 0
+
+test('the readiness script reads a heartbeat with BSD date as well as GNU date', {
+  skip: hostDateIsGnu ? false : 'host date is already BSD, which the shipped script covers natively',
+}, async (t) => {
   const dir = await runtimeDir(t)
   const shimDir = await mkdtemp(join(tmpdir(), 'dsh-lark-bsd-date-'))
   t.after(() => rm(shimDir, { recursive: true, force: true }))
