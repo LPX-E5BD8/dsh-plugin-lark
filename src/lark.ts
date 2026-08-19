@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { publishedDocumentId, readDocumentResponse } from './document-handoff.ts'
 import { readFile } from 'node:fs/promises'
 import type { Readable } from 'node:stream'
 import type { HttpInstance, HttpRequestOptions } from '@larksuiteoapi/node-sdk'
@@ -128,6 +129,25 @@ export interface LarkConnectionHealth {
   nextAttemptAt?: string
 }
 
+export interface LarkDocumentContent {
+  readonly title: string
+  readonly text: string
+}
+
+export interface LarkDocumentReadOptions {
+  readonly signal: AbortSignal
+  readonly maxBytes: number
+}
+
+export interface LarkPublishedDocument {
+  readonly token: string
+  readonly title: string
+}
+
+export interface LarkDocumentPublishOptions {
+  readonly signal: AbortSignal
+}
+
 export interface LarkClientLike {
   readonly loadingImageKey?: string
   connectionHealth?(): LarkConnectionHealth
@@ -153,6 +173,15 @@ export interface LarkClientLike {
   sendCard?(chatId: string, card: unknown, options?: LarkDeliveryOptions): Promise<string | void>
   updateCard?(messageId: string, card: unknown, options?: Pick<LarkDeliveryOptions, 'signal'>): Promise<void>
   onCardAction?(handler: (action: LarkCardAction) => Promise<LarkCardActionResult>): void
+  fetchDocument?(
+    token: string,
+    options: LarkDocumentReadOptions,
+  ): Promise<LarkDocumentContent>
+  publishDocument?(
+    title: string,
+    markdown: string,
+    options: LarkDocumentPublishOptions,
+  ): Promise<LarkPublishedDocument>
 }
 
 export interface LarkSdkOptions {
@@ -168,6 +197,7 @@ export interface LarkSdkOptions {
 const TEXT_LIMIT = 4000
 const START_TIMEOUT_MS = 15_000
 const REST_REQUEST_TIMEOUT_MS = 15_000
+const DOCUMENT_TOKEN_PATTERN = /^[A-Za-z0-9]{16,64}$/u
 const RESOURCE_ID_CONTROL_PATTERN = /[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u
 const ARTIFACT_NAME_UNSAFE_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\/:*?"<>|]/u
 const ARTIFACT_IDEMPOTENCY_PATTERN = /^[A-Za-z0-9_-]{1,50}$/u
@@ -447,6 +477,9 @@ type LarkApiOperation =
   | 'message.update'
   | 'artifact.upload'
   | 'artifact.reply'
+  | 'document.meta'
+  | 'document.raw_content'
+  | 'document.create'
 
 function apiInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
@@ -1007,6 +1040,72 @@ export class LarkSdkClient implements LarkClientLike {
     const artifact = Object.freeze({ kind: input.kind })
     this.uploadedArtifacts.set(artifact, { kind: input.kind, key })
     return artifact
+  }
+
+  /**
+   * Read one document the user pointed at. Verified against the live docx API:
+   * the title and the readable body come from two different endpoints.
+   */
+  async fetchDocument(
+    token: string,
+    options: LarkDocumentReadOptions,
+  ): Promise<LarkDocumentContent> {
+    if (!DOCUMENT_TOKEN_PATTERN.test(token)) {
+      throw new TypeError('lark: document token is invalid')
+    }
+    if (this.rest === undefined) throw new Error('lark: document client is unavailable')
+    const meta = asRecord(await callQuiescentSignalBoundLarkApi(
+      'document.meta',
+      options.signal,
+      (signal) => this.rest!.request({
+        url: `/open-apis/docx/v1/documents/${token}`,
+        method: 'GET',
+        maxRedirects: 0,
+        signal,
+        timeout: REST_REQUEST_TIMEOUT_MS,
+      }),
+    ))
+    const raw = asRecord(await callQuiescentSignalBoundLarkApi(
+      'document.raw_content',
+      options.signal,
+      (signal) => this.rest!.request({
+        url: `/open-apis/docx/v1/documents/${token}/raw_content`,
+        method: 'GET',
+        maxRedirects: 0,
+        signal,
+        timeout: REST_REQUEST_TIMEOUT_MS,
+      }),
+    ))
+    return Object.freeze(readDocumentResponse(meta, raw))
+  }
+
+  /**
+   * Publish one report. The platform accepts Markdown directly on this endpoint
+   * with the title carried inline, so no block conversion is involved and no
+   * block-convert scope is required.
+   */
+  async publishDocument(
+    title: string,
+    markdown: string,
+    options: LarkDocumentPublishOptions,
+  ): Promise<LarkPublishedDocument> {
+    if (title.includes('<') || title.includes('>')) {
+      throw new TypeError('lark: document title must not contain angle brackets')
+    }
+    if (this.rest === undefined) throw new Error('lark: document client is unavailable')
+    const response = asRecord(await callQuiescentSignalBoundLarkApi(
+      'document.create',
+      options.signal,
+      (signal) => this.rest!.request({
+        url: '/open-apis/docs_ai/v1/documents',
+        method: 'POST',
+        data: { format: 'markdown', content: `<title>${title}</title>\n${markdown}` },
+        maxRedirects: 0,
+        signal,
+        timeout: REST_REQUEST_TIMEOUT_MS,
+      }),
+    ))
+    return Object.freeze({ token: publishedDocumentId(response), title })
   }
 
   async sendArtifact(
