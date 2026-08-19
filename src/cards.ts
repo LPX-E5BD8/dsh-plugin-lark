@@ -73,6 +73,7 @@ const CARD_ELEMENT = {
   status: 'status',
   diag: 'diag',
   policy: 'policy',
+  task: 'task',
 } as const
 
 export const CARD_ACTIONS = {
@@ -914,6 +915,35 @@ export interface OperatorCard {
   readonly locale?: LarkLocale
   readonly kind: 'status' | 'diag' | 'policy'
   readonly body: string
+}
+
+export interface TaskCard {
+  readonly locale?: LarkLocale
+  readonly kind: 'created' | 'list' | 'detail' | 'settled'
+  readonly body: string
+}
+
+export function renderTaskCard(card: TaskCard): Record<string, unknown> {
+  const locale = card.locale ?? DEFAULT_CONFIG.locale
+  const copy = localeCopy(locale).card
+  const title = card.kind === 'created'
+    ? copy.taskCreatedTitle
+    : card.kind === 'settled' ? copy.taskSettledTitle : copy.taskTitle
+  const payload = basePayload(title, [
+    markdownElement(
+      CARD_ELEMENT.task,
+      `**${escapeMarkdown(title)}**\n${escapeMarkdown(card.body)}`,
+    ),
+  ])
+  payload.header = {
+    title: { tag: CARD_STYLE.tagPlainText, content: title },
+    template: card.kind === 'settled' ? 'grey' : 'blue',
+    padding: CARD_STYLE.padding,
+  }
+  if (payloadBytes(payload) > CARD_LIMITS.maxBytes) {
+    throw new RangeError('lark: task card exceeds the plugin Card byte budget')
+  }
+  return payload
 }
 
 export function renderOperatorCard(card: OperatorCard): Record<string, unknown> {

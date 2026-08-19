@@ -38,6 +38,7 @@ import {
   renderHumanInputTerminalCard,
   renderNotifyCard,
   renderOperatorCard,
+  renderTaskCard,
   renderTurnCardWithMeta,
 } from './cards.ts'
 import type {
@@ -134,6 +135,23 @@ import {
   type EffectivePolicy,
 } from './conversation-policy.ts'
 import {
+  admitTask,
+  DEFAULT_MAX_PARALLEL_TASKS,
+  DEFAULT_PARALLEL_TASKS,
+  MAX_TASKS_LISTED,
+  newTaskReference,
+  ParallelTaskError,
+  parseTaskCommand,
+  taskBaseId,
+  taskIsLive,
+  taskTitle,
+  validateMaxParallelTasks,
+  workspaceCollisionKey,
+  type DurableParallelTaskStore,
+  type ParallelTaskRecord,
+  type TaskWorkspacePolicy,
+} from './parallel-tasks.ts'
+import {
   buildDiagChecks,
   classifyConversation,
   classifyOperatorFailure,
@@ -185,6 +203,10 @@ export interface LarkBridgeOptions {
   notifyOutbox?: DurableNotifyOutbox
   proactiveDelivery?: boolean
   conversationPolicies?: DurableConversationPolicyStore
+  parallelTasks?: boolean
+  maxParallelTasks?: number
+  taskWorkspaces?: TaskWorkspacePolicy
+  parallelTaskStore?: DurableParallelTaskStore
 }
 
 interface ConversationSession {
@@ -670,10 +692,12 @@ interface PendingStop {
 const SESSION_RESET_SEPARATOR = ':'
 const GROUP_SESSION_SCOPE_VERSION = 'group-v1'
 const RECENT_INBOUND_LIMIT = 1024
+const TASK_BASE_ID = /:task:([0-9a-f]{12})$/u
+const UNIDENTIFIED_TASK_WORKSPACE = '\u0000unidentified-task-directory'
 const RESET_SESSION_SUFFIX = /^(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const INBOUND_MUTATION_HASH_DOMAIN = 'dsh-plugin-lark/conversation-mutation/v1'
 const BRIDGE_COMMANDS = new Set([
-  'start', 'help', 'new', 'clear', 'project', 'session', 'model', 'status', 'diag', 'policy',
+  'start', 'help', 'new', 'clear', 'project', 'session', 'model', 'status', 'diag', 'policy', 'task',
 ])
 const UNSUPPORTED_RUNTIME_COMMANDS = new Set(['feedback', 'export'])
 const MODEL_CATALOG_PROVIDER_LIMIT = 32
@@ -1628,6 +1652,10 @@ export class LarkBridge {
   private readonly projectManageFrom: ReadonlySet<string>
   private readonly operatorFrom: ReadonlySet<string>
   private readonly conversationPolicies: DurableConversationPolicyStore | undefined
+  private readonly parallelTasks: boolean
+  private readonly maxParallelTasks: number
+  private readonly taskWorkspaces: TaskWorkspacePolicy
+  private readonly parallelTaskStore: DurableParallelTaskStore | undefined
   private readonly sharedSessionBaseId: string | undefined
   private readonly provider: string
   private readonly model: string
@@ -1730,6 +1758,12 @@ export class LarkBridge {
     this.notifyOutbox = options.notifyOutbox
     this.proactiveDelivery = options.proactiveDelivery === true
     this.conversationPolicies = options.conversationPolicies
+    this.parallelTasks = options.parallelTasks ?? DEFAULT_PARALLEL_TASKS
+    this.maxParallelTasks = validateMaxParallelTasks(
+      options.maxParallelTasks ?? DEFAULT_MAX_PARALLEL_TASKS,
+    )
+    this.taskWorkspaces = options.taskWorkspaces ?? 'exclusive'
+    this.parallelTaskStore = options.parallelTaskStore
     this.locale = options.locale ?? DEFAULT_CONFIG.locale
     this.text = localeCopy(this.locale).bridge
     this.allowFrom = new Set((options.allowFrom ?? []).map((openId) => openId.trim()).filter(Boolean))
@@ -4030,6 +4064,9 @@ export class LarkBridge {
       case '/policy':
         await this.handlePolicyCommand(route, text)
         break
+      case '/task':
+        await this.handleTaskCommand(route, text)
+        break
       default:
         await this.executeRuntimeCommand(route, text, command)
     }
@@ -4149,6 +4186,207 @@ export class LarkBridge {
       route.sessionBaseId,
       () => this.runPolicyCommand(route, text),
     )
+  }
+
+  private handleTaskCommand(route: MessageRoute, text: string): Promise<void> {
+    return this.enqueueConversationOperation(
+      route.sessionBaseId,
+      () => this.runTaskCommand(route, text),
+    )
+  }
+
+  private async runTaskCommand(route: MessageRoute, text: string): Promise<void> {
+    const store = this.parallelTaskStore
+    if (!this.parallelTasks || store === undefined) {
+      await this.safeSend(route.chatId, this.text.taskUnavailable, routeDeliveryOptions(route))
+      return
+    }
+    const command = parseTaskCommand(text)
+    if (command === undefined) {
+      await this.safeSend(route.chatId, this.text.taskUsage, routeDeliveryOptions(route))
+      return
+    }
+    const scopeId = this.policyScopeId(route.sessionBaseId)
+    if (command.kind === 'list') {
+      await this.replyTaskCard(route, 'list', this.taskListBody(store.list(scopeId)))
+      return
+    }
+    if (command.kind === 'inspect' || command.kind === 'stop') {
+      const record = store.read(command.reference)
+      if (record === undefined || record.scopeId !== scopeId) {
+        await this.safeSend(route.chatId, this.text.taskUnknown, routeDeliveryOptions(route))
+        return
+      }
+      if (command.kind === 'inspect') {
+        await this.replyTaskCard(route, 'detail', this.taskDetailBody(record))
+        return
+      }
+      await this.stopParallelTask(route, store, record)
+      return
+    }
+    await this.startParallelTask(route, store, scopeId, command.prompt)
+  }
+
+  private async startParallelTask(
+    route: MessageRoute,
+    store: DurableParallelTaskStore,
+    scopeId: string,
+    prompt: string,
+  ): Promise<void> {
+    const workspaceKey = await this.taskWorkspaceKey(route)
+    const reference = newTaskReference()
+    const now = Date.now()
+    try {
+      // Capacity and project exclusivity span conversations, so the read and the
+      // write that claims a project have to settle against one another.
+      await this.enqueueWorkspaceMutation(async () => {
+        admitTask(store.liveTasks(), {
+          scopeId,
+          maxParallelTasks: this.maxParallelTasks,
+          workspacePolicy: this.taskWorkspaces,
+          workspaceKey,
+        })
+        await store.put({
+          reference,
+          scopeId,
+          parentBaseId: route.sessionBaseId,
+          taskBaseId: taskBaseId(
+            DEFAULT_CONFIG.sessionPrefix,
+            GROUP_SESSION_SCOPE_VERSION,
+            route.chatId,
+            reference,
+          ),
+          chatId: route.chatId,
+          replyToMessageId: route.replyToMessageId,
+          title: taskTitle(prompt),
+          status: 'running',
+          createdAt: now,
+          updatedAt: now,
+          ...(route.replyInThread === true ? { replyInThread: true } : {}),
+          workspaceKey,
+        })
+      })
+    } catch (error) {
+      const code = error instanceof ParallelTaskError ? error.code : 'INVALID'
+      if (code === 'AT_CAPACITY' || code === 'WORKSPACE_BUSY') {
+        await this.safeSend(
+          route.chatId,
+          code === 'AT_CAPACITY' ? this.text.taskAtCapacity : this.text.taskWorkspaceBusy,
+          routeDeliveryOptions(route),
+        )
+        return
+      }
+      this.noteOperatorFailure(error)
+      this.ctx.logger.error('[lark] parallel task admission failed')
+      await this.safeSend(route.chatId, this.text.taskUnavailable, routeDeliveryOptions(route))
+      return
+    }
+    // The row is durable before the Agent runs, so a crash leaves a reconcilable
+    // task rather than untracked work.
+    const record = store.read(reference) as ParallelTaskRecord
+    const taskRoute: MessageRoute = {
+      chatId: record.chatId,
+      chatType: route.chatType,
+      mentioned: route.mentioned,
+      openId: route.openId,
+      replyToMessageId: record.replyToMessageId,
+      sessionBaseId: record.taskBaseId,
+      ...(record.replyInThread === true ? { replyInThread: true } : {}),
+    }
+    try {
+      await this.withConversation(record.taskBaseId, async (conversation) => {
+        await this.submitConversationFollowup(conversation, taskRoute, [{ type: 'text', text: prompt }])
+      })
+    } catch (error) {
+      this.ctx.logger.error('[lark] parallel task start failed: %s', messageOf(error))
+      await store.settle(reference, 'failed', Date.now()).catch(() => {})
+      await this.safeSend(route.chatId, this.text.followupFailure, routeDeliveryOptions(route))
+      return
+    }
+    await this.replyTaskCard(route, 'created', this.taskDetailBody(record))
+  }
+
+  private async stopParallelTask(
+    route: MessageRoute,
+    store: DurableParallelTaskStore,
+    record: ParallelTaskRecord,
+  ): Promise<void> {
+    if (!taskIsLive(record)) {
+      await this.safeSend(route.chatId, this.text.taskNotLive, routeDeliveryOptions(route))
+      return
+    }
+    // Settle first: cancelling ends the turn, and that end would otherwise label
+    // a deliberate stop as a failure.
+    await store.settle(record.reference, 'stopped', Date.now()).catch((error: unknown) => {
+      this.noteOperatorFailure(error)
+    })
+    const conversation = this.conversations.get(record.taskBaseId)
+    try {
+      conversation?.handle.agent.cancel({ kind: 'user' })
+    } catch (error) {
+      this.ctx.logger.error('[lark] parallel task cancel failed: %s', messageOf(error))
+    }
+    await this.safeSend(route.chatId, this.text.taskStopped, routeDeliveryOptions(route))
+    const settled = store.read(record.reference) ?? record
+    await this.replyTaskCard(route, 'settled', this.taskDetailBody(settled))
+  }
+
+  /**
+   * Collision identity for the directory a task writes to. A registered
+   * Workspace wins; otherwise the working directory itself is hashed so
+   * exclusivity still holds before a project is registered.
+   */
+  private async taskWorkspaceKey(route: MessageRoute): Promise<string> {
+    const namespace = this.sessionReferenceNamespace
+    try {
+      return await this.withConversation(route.sessionBaseId, (conversation) => {
+        // An unidentified directory must not silently disable the collision
+        // guard. Every such task shares one claim instead, so an exclusive
+        // deployment still runs at most one of them at a time.
+        const workspace = conversation.workspaceId
+          ?? conversation.handle.agent.session.header.cwd
+          ?? this.cwd
+          ?? UNIDENTIFIED_TASK_WORKSPACE
+        return workspaceCollisionKey(namespace, workspace)
+      })
+    } catch {
+      return workspaceCollisionKey(namespace, UNIDENTIFIED_TASK_WORKSPACE)
+    }
+  }
+
+  private taskListBody(records: readonly ParallelTaskRecord[]): string {
+    if (records.length === 0) return this.text.taskEmpty
+    return records.slice(0, MAX_TASKS_LISTED).map((record) => (
+      `- ${record.reference} [${record.status}] ${record.title}`
+    )).join('\n')
+  }
+
+  private taskDetailBody(record: ParallelTaskRecord): string {
+    return [
+      `${record.reference} [${record.status}]`,
+      record.title,
+    ].join('\n')
+  }
+
+  private async replyTaskCard(
+    route: MessageRoute,
+    kind: 'created' | 'list' | 'detail' | 'settled',
+    body: string,
+  ): Promise<void> {
+    if (this.client.sendCard === undefined) {
+      await this.safeSend(route.chatId, body, routeDeliveryOptions(route))
+      return
+    }
+    try {
+      await this.client.sendCard(
+        route.chatId,
+        renderTaskCard({ locale: this.locale, kind, body }),
+        routeDeliveryOptions(route),
+      )
+    } catch (error) {
+      this.noteOperatorFailure(error)
+      await this.safeSend(route.chatId, body, routeDeliveryOptions(route))
+    }
   }
 
   private async runPolicyCommand(route: MessageRoute, text: string): Promise<void> {
@@ -7533,9 +7771,23 @@ export class LarkBridge {
     this.fallbackFailedCard(state)
     turns?.delete(event.data.turn)
     if (turns?.size === 0) this.turns.delete(sessionId)
+    this.settleParallelTask(sessionId, terminal.status === 'completed' ? 'completed' : 'failed')
     if (this.activeRoutes.get(sessionId) === state.route) {
       this.activeRoutes.delete(sessionId)
     }
+  }
+
+  /** A task's own session ends its lifecycle; ordinary conversations have none. */
+  private settleParallelTask(sessionId: string, status: 'completed' | 'failed'): void {
+    const store = this.parallelTaskStore
+    if (store === undefined) return
+    const baseId = this.policyBaseIds.get(sessionId)
+    const reference = baseId === undefined ? undefined : TASK_BASE_ID.exec(baseId)?.[1]
+    if (reference === undefined) return
+    void store.settle(reference, status, Date.now()).catch((error: unknown) => {
+      this.noteOperatorFailure(error)
+      this.ctx.logger.error('[lark] parallel task settlement failed')
+    })
   }
 
   private handleToolCall(sessionId: string, event: Extract<SessionEvent, { type: 'tool/call' }>): void {

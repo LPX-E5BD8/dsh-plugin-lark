@@ -737,6 +737,138 @@ test('e2e: a group policy binds the whole group, not one reply tree', async () =
   await rm(root, { recursive: true, force: true })
 })
 
+test('e2e: parallel tasks are explicit, bounded, and never implicit', async () => {
+  const client = createClient()
+  const host = createHost()
+  const { DurableParallelTaskStore } = await import('../src/parallel-tasks.ts')
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const Storage = (await import('@deepseek-ai/dsh-storage')).default
+  const StorageDomain = await import('@deepseek-ai/dsh-storage-domain')
+  const StorageJson = await import('@deepseek-ai/dsh-storage-json')
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-tasks-e2e-'))
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  await ctx.plugin(StorageJson, { root })
+  await ctx.plugin(StorageDomain, { backend: 'json' })
+  const tasks = await DurableParallelTaskStore.open(ctx.storageDomain, 'cli_taske2e000001')
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner'],
+    parallelTasks: true,
+    maxParallelTasks: 1,
+    parallelTaskStore: tasks,
+  })
+  await bridge.start()
+
+  // An ordinary message is served by the conversation itself, never as a task.
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', 'please run the build in parallel'),
+    messageId: 'ordinary',
+  })
+  assert.equal(tasks.list().length, 0)
+  const conversationSessions = host.createdSessionIds().length
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/task run ship the docs'),
+    messageId: 'task-run',
+  })
+  const live = tasks.list('chat-a')
+  assert.equal(live.length, 1)
+  assert.equal(live[0]?.status, 'running')
+  assert.equal(live[0]?.title, 'ship the docs')
+  // The task runs in its own session, not the conversation's.
+  assert.ok(host.createdSessionIds().length > conversationSessions)
+  assert.match(JSON.stringify(client.cards.at(-1)), /"element_id":"task"/u)
+  assert.match(JSON.stringify(client.cards.at(-1)), /ship the docs/u)
+
+  // The bound is enforced, and the reference is required to act on a task.
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/task run a second one'),
+    messageId: 'task-run-2',
+  })
+  assert.match(client.sent.at(-1)?.text ?? '', /parallel task limit|已达上限/u)
+  assert.equal(tasks.list('chat-a').length, 1)
+
+  const reference = live[0]?.reference as string
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/task ffffffffffff'),
+    messageId: 'task-unknown',
+  })
+  assert.match(client.sent.at(-1)?.text ?? '', /No task matches|找不到该任务编号/u)
+
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', `/task stop ${reference}`),
+    messageId: 'task-stop',
+  })
+  assert.equal(tasks.read(reference)?.status, 'stopped')
+
+  // A settled task frees the bound for the next one.
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/task run after the stop'),
+    messageId: 'task-run-3',
+  })
+  assert.equal(tasks.liveTasks().length, 1)
+  assert.equal(tasks.list('chat-a').length, 2)
+
+  await bridge.stop()
+  await tasks.close()
+  await ctx.fiber.dispose()
+  await rm(root, { recursive: true, force: true })
+})
+
+test('e2e: project exclusivity holds across conversations racing one project', async () => {
+  const client = createClient()
+  const host = createHost()
+  const { DurableParallelTaskStore } = await import('../src/parallel-tasks.ts')
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { Context } = await import('@deepseek-ai/cordis')
+  const Storage = (await import('@deepseek-ai/dsh-storage')).default
+  const StorageDomain = await import('@deepseek-ai/dsh-storage-domain')
+  const StorageJson = await import('@deepseek-ai/dsh-storage-json')
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-tasks-race-'))
+  const ctx = new Context()
+  await ctx.plugin(Storage)
+  await ctx.plugin(StorageJson, { root })
+  await ctx.plugin(StorageDomain, { backend: 'json' })
+  const tasks = await DurableParallelTaskStore.open(ctx.storageDomain, 'cli_taskrace00001')
+  const bridge = new LarkBridge(host as never, {
+    client,
+    allowFrom: ['owner'],
+    parallelTasks: true,
+    maxParallelTasks: 4,
+    parallelTaskStore: tasks,
+  })
+  await bridge.start()
+
+  // Two conversations share one working directory, so only one may claim it.
+  await Promise.all([
+    client.messageHandler?.({
+      ...inbound('chat-a', 'owner', '/task run first claim'),
+      messageId: 'race-a',
+    }),
+    client.messageHandler?.({
+      ...inbound('chat-b', 'owner', '/task run second claim'),
+      messageId: 'race-b',
+    }),
+  ])
+
+  assert.equal(tasks.liveTasks().length, 1, 'two live tasks claimed one project')
+  assert.match(
+    client.sent.map((entry) => entry.text).join('\n'),
+    /holds this project|占用该项目/u,
+  )
+
+  await bridge.stop()
+  await tasks.close()
+  await ctx.fiber.dispose()
+  await rm(root, { recursive: true, force: true })
+})
+
 test('e2e: empty operatorFrom denies /status even for allowFrom users', async () => {
   const client = createClient()
   const host = createHost()
@@ -1275,6 +1407,7 @@ test('e2e: a durable receipt suppresses unsupported input after restart', async 
   await firstBridge.start()
   await firstClient.messageHandler?.(message)
   assert.equal(firstClient.sent.length, 1)
+  assert.match(firstClient.sent[0]?.text ?? '', /暂不支持图片、文件/u)
   await firstBridge.stop()
 
   const secondClient = createClient()
@@ -1869,6 +2002,9 @@ test('e2e: only the originating user and chat can decide an approval', async () 
   })
   assert.equal(await outcome, 'allowed-once')
   assert.equal(client.updated.length, 1)
+  // The one accepted decision must close the originating card, not any other.
+  assert.equal(client.updated[0]?.messageId, 'card-1')
+  assert.equal(requestId(client.updated[0]?.card), '')
   await bridge.stop()
 })
 

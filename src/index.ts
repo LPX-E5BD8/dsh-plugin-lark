@@ -19,6 +19,12 @@ import {
 import { DurableInboundDeduplicator } from './inbound-dedup.ts'
 import { DurableNotifyOutbox } from './outbound-notify.ts'
 import { DurableConversationPolicyStore } from './conversation-policy.ts'
+import {
+  DEFAULT_MAX_PARALLEL_TASKS,
+  DEFAULT_PARALLEL_TASKS,
+  DurableParallelTaskStore,
+  MAX_PARALLEL_TASKS_LIMIT,
+} from './parallel-tasks.ts'
 import { pluginReleaseVersion } from './operator-status.ts'
 import {
   DEFAULT_OWNER_TTL_MS,
@@ -59,6 +65,9 @@ export interface LarkConfig {
   operatorFrom?: string[]
   runtimeDir?: string
   runtimeOwnerTtlMs?: number
+  parallelTasks?: boolean
+  maxParallelTasks?: number
+  taskWorkspaces?: 'exclusive' | 'shared'
 }
 
 export const Config: Schema = Schema.object({
@@ -116,6 +125,13 @@ export const Config: Schema = Schema.object({
     .min(MIN_OWNER_TTL_MS)
     .max(MAX_OWNER_TTL_MS)
     .default(DEFAULT_OWNER_TTL_MS),
+  parallelTasks: Schema.boolean().default(DEFAULT_PARALLEL_TASKS),
+  maxParallelTasks: Schema.natural()
+    .min(1)
+    .max(MAX_PARALLEL_TASKS_LIMIT)
+    .default(DEFAULT_MAX_PARALLEL_TASKS),
+  taskWorkspaces: Schema.union([Schema.const('exclusive'), Schema.const('shared')])
+    .default('exclusive'),
 })
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -132,6 +148,7 @@ async function cleanupRuntime(
   notifyOutbox?: DurableNotifyOutbox,
   conversationPolicies?: DurableConversationPolicyStore,
   supervisor?: RuntimeSupervisor,
+  parallelTaskStore?: DurableParallelTaskStore,
 ): Promise<unknown[]> {
   const failures: unknown[] = []
   if (bridge !== undefined) {
@@ -166,6 +183,13 @@ async function cleanupRuntime(
       failures.push(error)
     }
   }
+  if (parallelTaskStore !== undefined) {
+    try {
+      await parallelTaskStore.close()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
   if (conversationPolicies !== undefined) {
     try {
       await conversationPolicies.close()
@@ -180,11 +204,13 @@ async function openRuntimeStorage(
   ctx: Context,
   appId: string,
   proactiveDelivery: boolean,
+  parallelTasks: boolean,
 ): Promise<{
   readonly deduplicator: DurableInboundDeduplicator
   readonly conversationBindings: DurableConversationBindingStore
   readonly notifyOutbox?: DurableNotifyOutbox
   readonly conversationPolicies: DurableConversationPolicyStore
+  readonly parallelTaskStore?: DurableParallelTaskStore
 }> {
   const deduplicator = await DurableInboundDeduplicator.open(ctx.storageDomain, appId)
   try {
@@ -196,13 +222,28 @@ async function openRuntimeStorage(
       await conversationBindings.close().catch(() => {})
       throw error
     }
+    let parallelTaskStore: DurableParallelTaskStore | undefined
+    if (parallelTasks) {
+      try {
+        parallelTaskStore = await DurableParallelTaskStore.open(ctx.storageDomain, appId)
+        // A process that died mid-task leaves running rows with no Agent behind
+        // them; retiring those frees their project for the next start.
+        await parallelTaskStore.reconcileOrphans(Date.now())
+      } catch (error) {
+        await parallelTaskStore?.close().catch(() => {})
+        await conversationPolicies.close().catch(() => {})
+        await conversationBindings.close().catch(() => {})
+        throw error
+      }
+    }
     if (!proactiveDelivery) {
-      return { deduplicator, conversationBindings, conversationPolicies }
+      return { deduplicator, conversationBindings, conversationPolicies, parallelTaskStore }
     }
     try {
       const notifyOutbox = await DurableNotifyOutbox.open(ctx.storageDomain, appId)
-      return { deduplicator, conversationBindings, notifyOutbox, conversationPolicies }
+      return { deduplicator, conversationBindings, notifyOutbox, conversationPolicies, parallelTaskStore }
     } catch (error) {
+      await parallelTaskStore?.close().catch(() => {})
       await conversationPolicies.close().catch(() => {})
       await conversationBindings.close().catch(() => {})
       throw error
@@ -233,10 +274,17 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
     throw new Error('lark: appId must match cli_<16 hexadecimal characters>')
   }
   return (async () => {
-    const { deduplicator, conversationBindings, notifyOutbox, conversationPolicies } = await openRuntimeStorage(
+    const {
+      deduplicator,
+      conversationBindings,
+      notifyOutbox,
+      conversationPolicies,
+      parallelTaskStore,
+    } = await openRuntimeStorage(
       ctx,
       appId,
       config.proactiveDelivery === true,
+      config.parallelTasks === true,
     )
     let bridge: LarkBridge | undefined
     let supervisor: RuntimeSupervisor | undefined
@@ -291,6 +339,10 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         proactiveDelivery: config.proactiveDelivery,
         operatorFrom: config.operatorFrom ?? [],
         conversationPolicies,
+        parallelTasks: config.parallelTasks,
+        maxParallelTasks: config.maxParallelTasks,
+        taskWorkspaces: config.taskWorkspaces,
+        parallelTaskStore,
       })
       await bridge.start()
       await supervisor?.markReady()
@@ -302,6 +354,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
         notifyOutbox,
         conversationPolicies,
         supervisor,
+        parallelTaskStore,
       )
       if (failures.length > 0) {
         throw new AggregateError([error, ...failures], 'lark: startup and cleanup failed')
@@ -318,6 +371,7 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
           notifyOutbox,
           conversationPolicies,
           supervisor,
+          parallelTaskStore,
         )
         if (failures.length > 0) throw new AggregateError(failures, 'lark: plugin teardown failed')
       })()

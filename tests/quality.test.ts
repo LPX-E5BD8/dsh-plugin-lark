@@ -10,6 +10,7 @@ import {
   renderApprovalDecisionCard,
   renderNotifyCard,
   renderOperatorCard,
+  renderTaskCard,
   renderTurnCard,
   renderTurnCardWithMeta,
 } from '../src/cards.ts'
@@ -624,6 +625,14 @@ test('quality: every Card 2.0 payload keeps platform element ids and column sets
     renderOperatorCard({
       kind: 'policy',
       body: 'Approvals: allowed\nExtra allowlist: 1 users',
+    }),
+    renderTaskCard({
+      kind: 'created',
+      body: 'abcdef012345 [running]\nship the docs',
+    }),
+    renderTaskCard({
+      kind: 'settled',
+      body: 'abcdef012345 [stopped]\nship the docs',
     }),
   ]
   const allowedColumnSetKeys = new Set([
