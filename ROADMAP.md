@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Every milestone through 1.0 is implemented. The 1.0 section records what that release freezes and what it deliberately leaves unverified.
+Every milestone through 1.1 is implemented. The 1.0 section records what that release freezes and what it deliberately leaves unverified; 1.1 moves the verified Harness cohort forward.
 
 ## 0.1.1 — Reliability
 
@@ -254,6 +254,12 @@ Every milestone through 1.0 is implemented. The 1.0 section records what that re
 - Advertise `/task` in the in-chat help wherever it is served, and nowhere else.
 - Carry every configurable option in the bundled patch that both READMEs present as its defaults, and gate that against drift.
 - Give conversation policy, channel ownership, parallel tasks, and document handoff their own security boundaries and credential-backed smoke steps.
+
+## 1.1.0 — Harness rc.7 cohort
+
+- Move the verified baseline to the `0.1.0-rc.7` Harness cohort, re-running the same Linux and macOS package/runtime gates rather than claiming the cohort untested.
+- Advance the pinned registry snapshot past that cohort's publication so the profile gate can resolve it reproducibly.
+- Leave the frozen configuration surface and durable storage domains untouched, and leave the two unverified deployment paths stated as they are.
 
 ## 1.0.0 — Stable release
 

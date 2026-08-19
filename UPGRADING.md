@@ -2,7 +2,7 @@
 
 English | [简体中文](./UPGRADING.zh-CN.md)
 
-This runbook covers `dsh-plugin-lark` on the supported DeepSeek Harness `0.1.0-rc.6` baseline with Node.js 22.x, or Node.js 24.x starting with plugin v0.8.5. It assumes the stock Web profile's JSONL session persistence and JSON storage-domain backend. For custom backends, use their native consistent-snapshot and restore procedures while preserving the same logical units. Upgrade the plugin on Node.js 22 before changing an existing deployment to Node.js 24; treat the runtime change as a separate cold restart and never combine it with a Harness-cohort or state migration. Every procedure below remains Linux-only: the macOS gates verify Node.js 22 package/runtime consumption from v0.8.6 and Node.js 22/24 consumption from v0.8.7, not Web-profile operation, upgrade, rollback, or state migration.
+This runbook covers `dsh-plugin-lark` on the supported DeepSeek Harness `0.1.0-rc.7` baseline with Node.js 22.x, or Node.js 24.x starting with plugin v0.8.5. It assumes the stock Web profile's JSONL session persistence and JSON storage-domain backend. For custom backends, use their native consistent-snapshot and restore procedures while preserving the same logical units. Upgrade the plugin on Node.js 22 before changing an existing deployment to Node.js 24; treat the runtime change as a separate cold restart and never combine it with a Harness-cohort or state migration. Every procedure below remains Linux-only: the macOS gates verify Node.js 22 package/runtime consumption from v0.8.6 and Node.js 22/24 consumption from v0.8.7, not Web-profile operation, upgrade, rollback, or state migration.
 
 ## Safety rules
 
@@ -59,6 +59,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.19` | Adds no storage-domain schema. Document reads and publishes travel through ordinary tool-call and tool-result events; links, document tokens, and bodies never enter plugin sidecars. | v0.9.18 ignores the configuration and no longer registers either tool. Rollback cannot retract an already published document or delete it. |
 | `0.9.20` | Adds no schema. The bundled patch now carries the configurable options it previously omitted, at values identical to the schema defaults. | v0.9.19 ignores the added keys and falls back to the same schema defaults, so behaviour is unchanged. |
 | `1.0.0` | Adds no schema. Freezes the 31-option public configuration surface and the five domain-version-0 durable units behind a release gate. | v0.9.20 uses exactly the same configuration and durable state; the freeze constrains later changes only, so rolling back needs no migration. |
+| `1.1.0` | Adds no schema. Moves the verified Harness cohort to `0.1.0-rc.7` and advances the pinned registry snapshot to `2026-08-18T00:00:00.000Z`. | v1.0.0 is verified against the rc.6 cohort. Durable state is identical, but the two cohorts are not meant to be mixed: roll the profile back to rc.6 alongside the plugin. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -75,7 +76,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v1.0.0'
+target_tag='v1.1.0'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -210,7 +211,7 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 Then:
 
-1. Start the same Harness `0.1.0-rc.6` profile from the same workspace with the same app ID, `defaultSessionId`, storage roots, JSONL compression, canonical Workspace paths, config overlays, and inherited credentials. DSH rc.6 rejects `DSH_*` application credentials in `.env`; use the launch/service environment described in the README.
+1. Start the same Harness `0.1.0-rc.7` profile from the same workspace with the same app ID, `defaultSessionId`, storage roots, JSONL compression, canonical Workspace paths, config overlays, and inherited credentials. DSH rc.6 rejects `DSH_*` application credentials in `.env`; use the launch/service environment described in the README.
 2. Require `/api/lark/health` to report HTTP 200 and `state: connected` when `webServer` is mounted.
 3. Check `/help`, then list `/project`, `/session`, and `/model`. In a disposable registered Workspace, resume one listed historical Session by its full opaque reference and verify the expected transcript, project, model, preset, and tools. The list may expose a bounded stored title derived from the first human prompt, so use non-sensitive test content.
 4. From a direct Native `ask_user_question` call, complete disposable single-choice, multiple-choice, free-text, and Cancel interactions in a real client. Verify the answer resumes the same turn and terminal Cards contain no answer or controls. A pending pre-upgrade Card is expected to be stale after restart; never put credentials in a question or answer.
@@ -229,8 +230,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v1.0.0 | State handling |
+| Rollback target from v1.1.0 | State handling |
 | --- | --- |
+| v1.0.0 | Identical durable state and configuration. Return the Harness profile to the `0.1.0-rc.6` cohort as part of the same rollback; a mixed cohort is not a supported combination. |
 | v0.9.20 | Identical configuration and durable state. |
 | v0.9.19 | Same durable state and same effective configuration; `/task` disappears from the in-chat help. |
 | v0.9.18 | Same durable state; the document tools disappear. Documents already published stay in the tenant and are unaffected. |

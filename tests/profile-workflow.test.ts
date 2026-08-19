@@ -139,7 +139,7 @@ test('profile lifecycle receives the pinned baseline and the dynamic tested cand
   }
   assert.equal(
     manifest.scripts?.['test:profile'],
-    'npm_config_before=2026-08-14T00:00:00.000Z npm exec --yes --package=@deepseek-ai/dsh@0.1.0-rc.6 --package=pnpm@10.15.0 -- node scripts/profile-smoke.mjs',
+    'npm_config_before=2026-08-18T00:00:00.000Z npm exec --yes --package=@deepseek-ai/dsh@0.1.0-rc.7 --package=pnpm@10.15.0 -- node scripts/profile-smoke.mjs',
   )
   assert.equal(manifest.devDependencies?.['@deepseek-ai/dsh'], undefined)
   assert.equal(manifest.devDependencies?.pnpm, undefined)
@@ -153,9 +153,9 @@ test('profile lifecycle receives the pinned baseline and the dynamic tested cand
 })
 
 test('profile smoke pins its tools and isolates every filesystem and credential input', () => {
-  assert.match(profileSmoke, /const expectedDshVersion = '0\.1\.0-rc\.6'/u)
+  assert.match(profileSmoke, /const expectedDshVersion = '0\.1\.0-rc\.7'/u)
   assert.match(profileSmoke, /const expectedPnpmVersion = '10\.15\.0'/u)
-  assert.match(profileSmoke, /const expectedNpmBefore = '2026-08-14T00:00:00\.000Z'/u)
+  assert.match(profileSmoke, /const expectedNpmBefore = '2026-08-18T00:00:00\.000Z'/u)
   assert.match(profileSmoke, /process\.env\.npm_config_before,[\s\S]*expectedNpmBefore/u)
   assert.match(profileSmoke, /const dshExecutable = await executableOnPath\('dsh', inheritedPath\)/u)
   assert.match(profileSmoke, /const pnpmExecutable = await executableOnPath\('pnpm', inheritedPath\)/u)

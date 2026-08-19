@@ -107,7 +107,7 @@ test('human input validates an atomic exact-order answer and preserves custom te
   }
 })
 
-test('human input compatibility gate matches the exact rc.6 ask tool definition', () => {
+test('human input compatibility gate matches the exact rc.7 ask tool definition', () => {
   let definition: ToolDefinition | undefined
   applyAskUserQuestion({
     tools: { register(value: ToolDefinition) { definition = value } },

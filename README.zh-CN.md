@@ -43,7 +43,7 @@
 ## 环境要求
 
 - Node.js 22.x，或在插件 v0.8.5 及更高版本中使用 Node.js 24.x
-- 一组版本一致的 DeepSeek Harness `0.1.0-rc.6` 软件包
+- 一组版本一致的 DeepSeek Harness `0.1.0-rc.7` 软件包
 - Harness `agents` 与 `sessions` 服务；标准 Web profile 已挂载两者
 - 结构化 Lark 输入还需要 Harness `tools`、Session 持久化与兼容的 rc.6 `ask_user_question` 定义；标准 Web profile 已挂载它们
 - 持久化的 `storageDomain` 服务；标准 Web profile 已提供基于 JSON 的完整存储栈
@@ -58,6 +58,7 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
+| `1.1.0`–`1.1.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.7` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 与 `1.0.x` 行相同的 Linux 与 macOS package/runtime 门禁，在 rc.7 版本组上重新跑过。被冻结的配置面与持久化 domain 没有变化。带凭据的 Web profile 启动与长时间运行的资源表现仍未验证——见[稳定性](#稳定性)。 |
 | `1.0.0`–`1.0.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 与 `0.9.x` 行相同的门禁；1.0 冻结公开配置面与持久化 storage domain，而不是扩大这张矩阵。带凭据的 Web profile 启动与长时间运行的资源表现仍未验证——见[稳定性](#稳定性)。 |
 | `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`；v0.9.14 增加会话级策略；v0.9.15 让卡片回调也走同一策略，并且不再因为缺少健康探针就判定机器人正常；v0.9.16 增加可选的运行时监管与跨进程通道归属；v0.9.17 增加显式的有界并行任务；v0.9.18 让无法解析的归属记录失败关闭；v0.9.19 增加可选的文档交接；v0.9.20 对照代码全量复核随包文档。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
@@ -67,7 +68,7 @@
 
 必需测试会组装真实的 rc.6 Cordis、Agent、Agent Loop、LLM、Session、语义 checkpoint policy、Session Title、SQLite Session Query 精确读取路径、JSONL 持久化、JSON storage-domain、本地 Attachment Store、Tools、User Questions、Approval 与 Workspace 服务；平台连接、模型 provider 和浏览器行为使用受控替身，项目变更和经审批产物投递另有真实 Registry/持久化生命周期测试。CI 把官方 Lark SDK 精确固定为 `1.73.0`，在 Node 22 上打出 canonical 候选包，把它全新安装到隔离的标准 rc.6 Web profile，并把第二个隔离 profile 从经过严格验证的 v0.9.12 Release package 升级到候选版本，同时保持用户 patch 不变。两条路径都必须匹配已安装 package 版本、唯一 bundle 注册和唯一组合后的 Lark 配置层。
 
-Profile 门禁还会把 npm 解析固定在 rc.6 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
+Profile 门禁还会把 npm 解析固定在 rc.7 版本组发布完成后的 registry 时间快照。Harness 预发布包内部使用 caret 范围，因此只把顶层写成精确 `dsh@0.1.0-rc.6`，在全新 npm-exec 环境中仍可能漂移到更晚的预发布版本；门禁仍会逐一要求所有已解析 DSH 包精确为 rc.6。
 
 从 v0.8.5 起，同一个 Linux Release 门禁随后会切到 Node 24，以 engine-strict 重新创建 `node_modules`，重跑完整源码/Harness 和独立 packed-consumer 门禁，再在隔离的标准 profile 中消费前面已经打好的同一份 canonical 候选包。v0.8.5 的基线 v0.8.4 只支持 Node 22，因此当时执行的是全新安装；从 v0.8.6 起，Node 24 还会验证从已经兼容的 v0.8.5 基线相邻升级。
 
@@ -112,7 +113,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='1.0.0'
+version='1.1.0'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -181,7 +182,7 @@ export DSH_LARK_APP_ID='<app-id>'
 export DSH_LARK_APP_SECRET='<app-secret>'
 ```
 
-这些 `DSH_*` 值必须由 DSH 启动进程继承。DSH `0.1.0-rc.6` 会拒绝调用目录 `.env` 和 `$DSH_HOME/.env` 中的所有 `DSH_*` 项；请在启动 shell 中 `export`，或通过服务管理器/容器环境注入。为兼容已有部署，`FEISHU_APP_SECRET` 仍可作为仅限启动环境的后备项。
+这些 `DSH_*` 值必须由 DSH 启动进程继承。DSH `0.1.0-rc.7` 会拒绝调用目录 `.env` 和 `$DSH_HOME/.env` 中的所有 `DSH_*` 项；请在启动 shell 中 `export`，或通过服务管理器/容器环境注入。为兼容已有部署，`FEISHU_APP_SECRET` 仍可作为仅限启动环境的后备项。
 
 模型凭据属于 Harness provider，不属于本插件。使用默认 provider 时，推荐通过 Web profile 的 Models 页面配置；也可以在权限为 `0600` 的 `$DSH_HOME/.credentials.yaml` 中保存以下映射：
 
