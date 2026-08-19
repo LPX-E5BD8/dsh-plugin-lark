@@ -4192,7 +4192,14 @@ export class LarkBridge {
             const help = block === undefined
               ? this.commandHelp(conversation.handle.agent)
               : `${this.text.help}\n\n${block}`
-            const text = this.isOperator(route) ? `${help}\n${this.text.operatorHelp}` : help
+            // /task is an ordinary user command, so it belongs in the ordinary
+            // help, but only where it is actually served.
+            const withTasks = this.parallelTasks && this.parallelTaskStore !== undefined
+              ? `${help}\n${this.text.taskHelp}`
+              : help
+            const text = this.isOperator(route)
+              ? `${withTasks}\n${this.text.operatorHelp}`
+              : withTasks
             await this.safeSend(
               route.chatId,
               text,

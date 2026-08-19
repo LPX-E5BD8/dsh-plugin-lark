@@ -11,6 +11,9 @@
         projectManageFrom: []
         operatorFrom: []
         defaultSessionId: ""
+        provider: deepseek-official
+        model: deepseek-v4-flash
+        streamUpdateIntervalMs: 1000
         maxConversationHandles: 32
         inboundTextFiles: false
         maxInboundTextFileBytes: 131072
@@ -24,3 +27,11 @@
         maxOutboundImageBytes: 5242880
         maxOutboundImagePixels: 20000000
         proactiveDelivery: false
+        runtimeDir: ""
+        runtimeOwnerTtlMs: 30000
+        parallelTasks: false
+        maxParallelTasks: 2
+        taskWorkspaces: exclusive
+        documentHandoff: false
+        maxDocumentReadBytes: 65536
+        maxDocumentPublishBytes: 262144

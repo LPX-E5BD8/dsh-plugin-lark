@@ -253,6 +253,26 @@ test('quality: tracked files contain no concrete Lark identities or private path
   }
 })
 
+// Both READMEs present the bundled patch as the deployment's defaults, so every
+// configurable option has to actually be in it.
+test('quality: the bundled patch carries every configurable option', () => {
+  const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8')
+  const block = /export const Config: Schema = Schema\.object\(\{([\s\S]*?)\n\}\)/u.exec(source)
+  assert.ok(block !== null)
+  const keys = [...(block[1] ?? '').matchAll(/^ {2}(\w+):/gmu)].map((match) => match[1] as string)
+  assert.ok(keys.length >= 31)
+
+  const patch = readFileSync(join(process.cwd(), 'cordis.patch.yml'), 'utf8')
+  const missing = keys.filter((key) => new RegExp(`^\\s+${key}:`, 'mu').exec(patch) === null)
+  assert.deepEqual(missing, [], `cordis.patch.yml omits ${missing.join(', ')}`)
+
+  for (const path of ['README.md', 'README.zh-CN.md']) {
+    const readme = readFileSync(join(process.cwd(), path), 'utf8')
+    const undocumented = keys.filter((key) => !readme.includes(key))
+    assert.deepEqual(undocumented, [], `${path} omits ${undocumented.join(', ')}`)
+  }
+})
+
 test('quality: lockfile artifacts use the public npm registry', () => {
   const lockfile = readFileSync(join(process.cwd(), 'package-lock.json'), 'utf8')
   const urls = [...lockfile.matchAll(/"resolved": "([^"]+)"/g)].map((match) => match[1])

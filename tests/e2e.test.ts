@@ -478,6 +478,8 @@ test('e2e: an authorized user is served without a conversation policy store', as
 
   assert.match(client.sent.at(-1)?.text ?? '', /\/new/u)
   assert.doesNotMatch(client.sent.at(-1)?.text ?? '', /permission|没有权限/u)
+  // A command that is not served must not be advertised.
+  assert.doesNotMatch(client.sent.at(-1)?.text ?? '', /\/task/u)
   await bridge.stop()
 })
 
@@ -791,6 +793,13 @@ test('e2e: parallel tasks are explicit, bounded, and never implicit', async () =
   })
   assert.match(client.sent.at(-1)?.text ?? '', /parallel task limit|已达上限/u)
   assert.equal(tasks.list('chat-a').length, 1)
+
+  // An enabled command is discoverable from inside the chat.
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/help'),
+    messageId: 'task-help',
+  })
+  assert.match(client.sent.at(-1)?.text ?? '', /\/task run/u)
 
   const reference = live[0]?.reference as string
   await client.messageHandler?.({

@@ -47,7 +47,7 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds bounded exact-scope Session navigation; v0.9.4 adds direct Native structured human input; v0.9.5 makes Cordis own the async disposer and bounds terminal Card shutdown; v0.9.6 adds opt-in bounded inbound UTF-8 text files; v0.9.7 makes model and Session routing fail closed around image history; v0.9.8 terminalizes known running execution Cards during graceful shutdown; v0.9.9 adds opt-in bounded static inbound images; v0.9.10 adds approved outbound Workspace artifacts on the supported Linux descriptor boundary, failing closed elsewhere; v0.9.11 adds opt-in reliable notifications to a previously registered conversation; v0.9.12 makes later admits and backoff retries drain on the same process; v0.9.13 adds operator `/status` and `/diag`; v0.9.14 adds conversation-scoped policy; v0.9.15 gates Card callbacks by that policy and stops inferring bot health from a missing probe; v0.9.16 adds optional runtime supervision with cross-process channel ownership; v0.9.17 adds explicit bounded parallel tasks; v0.9.18 makes an unreadable ownership record fail closed; v0.9.19 adds optional document handoff. |
+| `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds bounded exact-scope Session navigation; v0.9.4 adds direct Native structured human input; v0.9.5 makes Cordis own the async disposer and bounds terminal Card shutdown; v0.9.6 adds opt-in bounded inbound UTF-8 text files; v0.9.7 makes model and Session routing fail closed around image history; v0.9.8 terminalizes known running execution Cards during graceful shutdown; v0.9.9 adds opt-in bounded static inbound images; v0.9.10 adds approved outbound Workspace artifacts on the supported Linux descriptor boundary, failing closed elsewhere; v0.9.11 adds opt-in reliable notifications to a previously registered conversation; v0.9.12 makes later admits and backoff retries drain on the same process; v0.9.13 adds operator `/status` and `/diag`; v0.9.14 adds conversation-scoped policy; v0.9.15 gates Card callbacks by that policy and stops inferring bot health from a missing probe; v0.9.16 adds optional runtime supervision with cross-process channel ownership; v0.9.17 adds explicit bounded parallel tasks; v0.9.18 makes an unreadable ownership record fail closed; v0.9.19 adds optional document handoff; v0.9.20 reviews the shipped documentation against the code. |
 | `0.8.7`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 produces the canonical archive; Node 22 and 24 run adjacent-upgrade profile gates. GitHub-hosted macOS 26 arm64 additionally verifies Node 22 and 24 package/runtime compatibility, not Web-profile deployment. |
 | `0.8.6` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Ubuntu support; macOS 26 arm64 package/runtime evidence covers Node 22 only. |
 | `0.8.5` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 runs the canonical release and adjacent-upgrade gate; Node 24 repeats the source/Harness and packed-consumer gates, then clean-installs the exact canonical archive into a stock rc.6 Web profile. |
@@ -100,7 +100,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='0.9.19'
+version='0.9.20'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -195,37 +195,53 @@ The bundled Cordis patch uses these defaults:
 - id: lark
   name: dsh-plugin-lark
   config:
-    domain: feishu               # feishu / lark
-    locale: zh-CN                # zh-CN / en-US
+    domain: feishu                  # feishu / lark
+    locale: zh-CN                   # zh-CN / en-US
+
+    # Authorization. Every list is fail-closed and empty by default.
     allowAllUsers: false
-    allowFrom: []                # authorized Feishu/Lark open_id values
-    projectManageFrom: []        # open_id values allowed to register/remove in direct chats
-    operatorFrom: []            # open_id values allowed to run /status, /diag, and /policy
-    runtimeDir: ''               # absolute path enabling supervision; empty = off
-    parallelTasks: false         # enable /task
-    documentHandoff: false       # enable document read and publish tools
-    maxDocumentReadBytes: 65536
-    maxDocumentPublishBytes: 262144
-    maxParallelTasks: 2          # live tasks per conversation
-    taskWorkspaces: exclusive    # or shared, to allow one project per several tasks
-    runtimeOwnerTtlMs: 30000     # ownership heartbeat budget
-    defaultSessionId: ''         # empty = scoped private/group conversations
-    provider: deepseek-official # default when the conversation has no saved choice
-    model: deepseek-v4-flash    # default when the conversation has no saved choice
+    allowFrom: []                   # authorized Feishu/Lark open_id values
+    projectManageFrom: []           # open_id values allowed to register/remove in direct chats
+    operatorFrom: []                # open_id values allowed to run /status, /diag, and /policy
+
+    # Conversation routing.
+    defaultSessionId: ''            # empty = scoped private/group conversations
+    provider: deepseek-official     # default when the conversation has no saved choice
+    model: deepseek-v4-flash        # default when the conversation has no saved choice
     streamUpdateIntervalMs: 1000
-    maxConversationHandles: 32  # steady-state live conversation-handle target
-    inboundTextFiles: false     # opt in to bounded UTF-8 text-file messages
+    maxConversationHandles: 32      # steady-state live conversation-handle target
+
+    # Inbound media. Opt in per kind; every limit is bounded.
+    inboundTextFiles: false         # opt in to bounded UTF-8 text-file messages
     maxInboundTextFileBytes: 131072 # default 128 KiB; hard maximum 256 KiB
-    inboundImages: false        # opt in to one static PNG/JPEG direct message
-    maxInboundImageBytes: 5242880 # default/hard maximum 5 MiB
+    inboundImages: false            # opt in to one static PNG/JPEG direct message
+    maxInboundImageBytes: 5242880   # default/hard maximum 5 MiB
     maxInboundImagePixels: 20000000 # default/hard maximum 20M pixels
-    maxConversationImages: 4   # default 4; hard maximum 20
+    maxConversationImages: 4        # default 4; hard maximum 20
     maxConversationImageBytes: 20971520 # default/hard maximum 20 MiB
-    outboundArtifacts: false    # opt in to the approved Agent-scoped send tool
+
+    # Outbound artifacts. Linux-only and approval-gated.
+    outboundArtifacts: false        # opt in to the approved Agent-scoped send tool
     maxOutboundTextFileBytes: 131072 # default 128 KiB; hard maximum 256 KiB
-    maxOutboundImageBytes: 5242880 # default/hard maximum 5 MiB
+    maxOutboundImageBytes: 5242880  # default/hard maximum 5 MiB
     maxOutboundImagePixels: 20000000 # default/hard maximum 20M pixels
-    proactiveDelivery: false    # opt in to durable Agent notifications
+
+    # Proactive notification.
+    proactiveDelivery: false        # opt in to the Agent-scoped notify tool
+
+    # Runtime supervision. Empty runtimeDir leaves it off.
+    runtimeDir: ''                  # absolute path enabling supervision
+    runtimeOwnerTtlMs: 30000        # ownership heartbeat budget
+
+    # Explicit parallel tasks.
+    parallelTasks: false            # opt in to /task
+    maxParallelTasks: 2             # live tasks per conversation
+    taskWorkspaces: exclusive       # or shared, to let several tasks hold one project
+
+    # Document handoff. Needs its own Lark scopes.
+    documentHandoff: false          # opt in to the read and publish tools
+    maxDocumentReadBytes: 65536     # default 64 KiB; hard maximum 512 KiB
+    maxDocumentPublishBytes: 262144 # default 256 KiB; hard maximum 1 MiB
 ```
 
 The baseline requires `agents`, `sessions`, `tools`, and durable `storageDomain` services. Durable reset, project/model/session selection, cold recovery, and structured Lark questions also require `sessionPersistence`; `/project` requires `workspaceRegistry`, `/session` additionally requires `sessionQuery` plus durable conversation bindings, and `/model` requires the Harness `llm` service. An image-bearing Session additionally requires that service to expose exact `resolveModelInfo` modality metadata; inbound image admission also requires a compatible `attachments` service. Either absence leaves image work fail-closed without affecting text-only Sessions. Structured input requires the exact compatible rc.6 `ask_user_question` definition to remain visible to the Agent. A missing or incompatible definition is diagnosed and delegated rather than replaced by a second provider. A missing Session Query or Workspace capability makes session navigation return an unavailable result; a plain `/session` listing does not create an Agent. Approval cards and the readiness route depend on the optional `approval` and `webServer` services. The verified matrix uses the stock JSON/JSONL, local attachment, and SQLite exact-read implementations; alternative implementations remain unverified.
