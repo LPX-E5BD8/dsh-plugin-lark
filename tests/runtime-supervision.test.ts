@@ -326,3 +326,38 @@ test('the shipped recovery script clears only an abandoned owner record', async 
   await assert.doesNotReject(() => stat(ownerFile))
   await live.release()
 })
+
+// macOS ships BSD date, which rejects the GNU `-d` form. Run the shipped script
+// against a BSD-shaped `date` so that platform is covered from Linux CI too.
+test('the readiness script reads a heartbeat with BSD date as well as GNU date', async (t) => {
+  const dir = await runtimeDir(t)
+  const shimDir = await mkdtemp(join(tmpdir(), 'dsh-lark-bsd-date-'))
+  t.after(() => rm(shimDir, { recursive: true, force: true }))
+  const realDate = spawnSync('sh', ['-c', 'command -v date'], { encoding: 'utf8' }).stdout.trim()
+  assert.ok(realDate.length > 0)
+  await writeFile(join(shimDir, 'date'), [
+    '#!/bin/sh',
+    // BSD date has no --version and no GNU -d; both must fail here.
+    '[ "$1" = "--version" ] && exit 1',
+    '[ "$2" = "-d" ] && exit 1',
+    `[ "$2" = "-j" ] && exec ${realDate} -u -d "$5" "$6"`,
+    `exec ${realDate} "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 })
+
+  await writeRuntimeStatus(dir, runtimeStatusDocument({
+    instanceId: randomUUID(),
+    version: '0.9.16',
+    state: 'ready',
+    ready: true,
+    startedAt: Date.now() - 1_000,
+    now: Date.now(),
+  }))
+  const script = join(process.cwd(), 'contrib', 'systemd', 'lark-readiness.sh')
+  const result = spawnSync('sh', [script, dir], {
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH ?? ''}` },
+  })
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`)
+  assert.match(result.stdout, /state=ready/u)
+})

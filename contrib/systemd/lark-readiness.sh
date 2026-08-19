@@ -35,7 +35,19 @@ if [ -z "$state" ] || [ -z "$heartbeat" ]; then
   exit 2
 fi
 
-heartbeat_epoch=$(date -u -d "$heartbeat" +%s 2>/dev/null || echo '')
+# GNU and BSD date parse timestamps with different flags, and this script has to
+# run on both. `date --version` succeeds only on GNU coreutils.
+iso_to_epoch() {
+  stamp=${1%Z}
+  stamp=${stamp%.*}
+  if date --version >/dev/null 2>&1; then
+    date -u -d "$stamp" +%s 2>/dev/null || echo ''
+  else
+    date -u -j -f '%Y-%m-%dT%H:%M:%S' "$stamp" +%s 2>/dev/null || echo ''
+  fi
+}
+
+heartbeat_epoch=$(iso_to_epoch "$heartbeat")
 if [ -z "$heartbeat_epoch" ]; then
   echo 'lark: runtime status heartbeat is unreadable' >&2
   exit 2
