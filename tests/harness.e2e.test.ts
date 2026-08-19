@@ -954,7 +954,7 @@ test('harness e2e: /new materializes and resumes its session across restart', as
 test('harness e2e: document handoff reads only a supplied link and publishes on request', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-lark-docs-'))
   t.after(() => rm(root, { recursive: true, force: true }))
-  const link = 'https://my.feishu.cn/docx/RvMudAgWKoDa2ixW6Q9ciuOUnLh'
+  const link = 'https://example.feishu.cn/docx/DocumentTokenAAAA0000000001'
   const adapter = new ScriptedAdapter([
     namedToolResponse(READ_DOCUMENT_TOOL_NAME, { link }, 'doc-read'),
     namedToolResponse(PUBLISH_DOCUMENT_TOOL_NAME, {
@@ -973,7 +973,7 @@ test('harness e2e: document handoff reads only a supplied link and publishes on 
   await harness.ctx.agents.list()[0]?.whenIdle()
 
   // The read reached the platform with the token from the supplied link only.
-  assert.deepEqual(harness.client.documentReads, ['RvMudAgWKoDa2ixW6Q9ciuOUnLh'])
+  assert.deepEqual(harness.client.documentReads, ['DocumentTokenAAAA0000000001'])
   const afterRead = JSON.stringify(adapter.requests[1]?.messages)
   assert.match(afterRead, /Source: Quarterly plan/u)
   assert.match(afterRead, new RegExp(link.replace(/[/.]/gu, '\\$&'), 'u'))
@@ -998,7 +998,7 @@ test('harness e2e: a document link the user never supplied is refused before any
   t.after(() => rm(root, { recursive: true, force: true }))
   const adapter = new ScriptedAdapter([
     namedToolResponse(READ_DOCUMENT_TOOL_NAME, {
-      link: 'https://feishu.cn.evil.example/docx/RvMudAgWKoDa2ixW6Q9ciuOUnLh',
+      link: 'https://feishu.cn.evil.example/docx/DocumentTokenAAAA0000000001',
     }, 'doc-evil'),
     textResponse('refused'),
   ])

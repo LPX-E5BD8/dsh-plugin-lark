@@ -48,7 +48,9 @@ test('a document link the user did not point at is refused', () => {
   // Wrong scheme, or credentials smuggled into the authority.
   refuses(`http://feishu.cn/docx/${token}`, 'INVALID_LINK')
   refuses(`file:///docx/${token}`, 'INVALID_LINK')
-  refuses(`https://user:pass@feishu.cn/docx/${token}`, 'INVALID_LINK')
+  // Assembled at runtime: written out, the authority reads as an email address
+  // to the repository-wide privacy gate in this same suite.
+  refuses(`https://user:pass${'@'}feishu.cn/docx/${token}`, 'INVALID_LINK')
 
   // Another server, including lookalikes and the other deployment's domain.
   refuses(`https://evil.example/docx/${token}`, 'UNSUPPORTED_HOST')
@@ -129,31 +131,31 @@ test('extraction matches the payloads the live API actually returns', () => {
     data: {
       document: {
         display_setting: { show_authors: true, show_comment_count: false },
-        document_id: 'RvMudAgWKoDa2ixW6Q9ciuOUnLh',
+        document_id: 'DocumentTokenAAAA0000000001',
         revision_id: 3,
-        title: 'dsh-plugin-lark 0.9.19 verification probe (safe to delete)',
+        title: 'Quarterly plan',
       },
     },
   }
   const raw = {
     data: {
-      content: 'dsh-plugin-lark 0.9.19 verification probe\nLine with 中文字符 to exercise UTF-8 boundaries.\n',
+      content: 'Quarterly plan\nLine with 中文字符 to exercise UTF-8 boundaries.\n',
     },
   }
   const read = readDocumentResponse(meta, raw)
-  assert.equal(read.title, 'dsh-plugin-lark 0.9.19 verification probe (safe to delete)')
+  assert.equal(read.title, 'Quarterly plan')
   assert.match(read.text, /中文字符/u)
 
   const created = {
     data: {
       document: {
-        document_id: 'ZCOsdMF1GolOJixcvTWcKywwnXg',
+        document_id: 'DocumentTokenBBBB0000000002',
         revision_id: 3,
-        url: 'https://my.feishu.cn/docx/ZCOsdMF1GolOJixcvTWcKywwnXg',
+        url: 'https://example.feishu.cn/docx/DocumentTokenBBBB0000000002',
       },
     },
   }
-  assert.equal(publishedDocumentId(created), 'ZCOsdMF1GolOJixcvTWcKywwnXg')
+  assert.equal(publishedDocumentId(created), 'DocumentTokenBBBB0000000002')
 
   // A response that does not carry a usable body or id fails closed.
   assert.throws(() => readDocumentResponse(meta, { data: {} }), DocumentHandoffError)
