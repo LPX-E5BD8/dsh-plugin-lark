@@ -524,7 +524,7 @@ test('e2e: /policy is operator-only and can only narrow notify', async () => {
     messageId: 'policy-users',
   })
   const userCard = JSON.stringify(client.cards.at(-1))
-  assert.match(userCard, /Extra allowlist: 1 users|额外授权：1 人/u)
+  assert.match(userCard, /Extra allowlist: 1 user\b|额外授权：1 人/u)
   await client.messageHandler?.({
     ...inbound('chat-a', 'owner', '/policy set projects add ws-a'),
     messageId: 'policy-projects',
@@ -532,7 +532,7 @@ test('e2e: /policy is operator-only and can only narrow notify', async () => {
   // Every counted line carries its unit, so the card reads consistently.
   assert.match(
     JSON.stringify(client.cards.at(-1)),
-    /Visible projects: 1 projects|可见项目：1 个/u,
+    /Visible projects: 1 project\b|可见项目：1 个/u,
   )
   assert.doesNotMatch(userCard, /guest|ou_|owner/u)
   await client.messageHandler?.({
@@ -707,7 +707,7 @@ test('e2e: a group policy binds the whole group, not one reply tree', async () =
     openId: 'owner',
     mentioned: true,
   }))
-  assert.match(JSON.stringify(client.cards.at(-1)), /Extra allowlist: 1 users|额外授权：1 人/u)
+  assert.match(JSON.stringify(client.cards.at(-1)), /Extra allowlist: 1 user\b|额外授权：1 人/u)
 
   // A different reply tree in the same group must inherit the group policy.
   await client.messageHandler?.(groupInbound({
@@ -812,6 +812,23 @@ test('e2e: parallel tasks are explicit, bounded, and never implicit', async () =
   })
   assert.equal(tasks.liveTasks().length, 1)
   assert.equal(tasks.list('chat-a').length, 2)
+
+  // A list longer than the display bound says so instead of silently dropping rows.
+  const { MAX_TASKS_LISTED } = await import('../src/parallel-tasks.ts')
+  for (let index = 0; index < MAX_TASKS_LISTED; index += 1) {
+    const filler = tasks.list('chat-a')[0]
+    await tasks.put({
+      ...(filler as NonNullable<typeof filler>),
+      reference: `${index}`.padStart(12, 'a'),
+      status: 'completed',
+      createdAt: 100 + index,
+    })
+  }
+  await client.messageHandler?.({
+    ...inbound('chat-a', 'owner', '/task list'),
+    messageId: 'task-list',
+  })
+  assert.match(JSON.stringify(client.cards.at(-1)), /not shown|未显示/u)
 
   await bridge.stop()
   await tasks.close()

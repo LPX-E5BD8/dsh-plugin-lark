@@ -298,7 +298,11 @@ export const apply = (ctx: Context, config: LarkConfig): Promise<() => Promise<v
           version: pluginReleaseVersion(),
           ttlMs: config.runtimeOwnerTtlMs ?? DEFAULT_OWNER_TTL_MS,
           logger: { error: (message) => ctx.logger.error(message) },
-          onOwnershipLost: () => { void bridge?.stop() },
+          onOwnershipLost: () => {
+            void bridge?.stop().catch((error: unknown) => {
+              ctx.logger.error('[lark] stop after lost ownership failed: %s', String(error))
+            })
+          },
         })
       }
       const client = new LarkSdkClient({

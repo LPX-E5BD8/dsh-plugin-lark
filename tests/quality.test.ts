@@ -624,7 +624,7 @@ test('quality: every Card 2.0 payload keeps platform element ids and column sets
     }),
     renderOperatorCard({
       kind: 'policy',
-      body: 'Approvals: allowed\nExtra allowlist: 1 users',
+      body: 'Approvals: allowed\nExtra allowlist: 1 user',
     }),
     renderTaskCard({
       kind: 'created',

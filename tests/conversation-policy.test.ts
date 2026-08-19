@@ -133,7 +133,7 @@ test('policy mutations parse only the bounded operator vocabulary', () => {
     proactiveDelivery: true,
   }, restricted), 'en-US')
   assert.doesNotMatch(body, /oc_|ou_|secret|[0-9a-f]{64}/u)
-  assert.match(body, /Extra allowlist: 1 users/u)
+  assert.match(body, /Extra allowlist: 1 user\b/u)
   assert.equal(applyPolicyMutation(restricted, {
     kind: 'users',
     action: 'remove',
@@ -162,6 +162,36 @@ test('policy mutations separate a full list from an invalid principal hash', () 
     () => applyPolicyMutation(base, { kind: 'users', action: 'add', openId: 'ou_bad' }, () => 'not-a-hash'),
     TypeError,
   )
+})
+
+test('the English policy card agrees with its own counts', () => {
+  const one = intersectPolicy({ outboundArtifacts: true, proactiveDelivery: true }, {
+    mention: 'default',
+    approvals: true,
+    outboundArtifacts: true,
+    notify: true,
+    allowFrom: [hashUser('ou_a')],
+    workspaceIds: ['ws-a'],
+    models: [{ provider: 'p', model: 'm' }],
+  })
+  const singular = formatPolicyBody(one, 'en-US')
+  assert.match(singular, /Extra allowlist: 1 user$/mu)
+  assert.match(singular, /Visible projects: 1 project$/mu)
+  assert.match(singular, /Selectable models: 1 route$/mu)
+
+  const many = intersectPolicy({ outboundArtifacts: true, proactiveDelivery: true }, {
+    mention: 'default',
+    approvals: true,
+    outboundArtifacts: true,
+    notify: true,
+    allowFrom: [hashUser('ou_a'), hashUser('ou_b')],
+    workspaceIds: ['ws-a', 'ws-b'],
+    models: [{ provider: 'p', model: 'm' }, { provider: 'p', model: 'n' }],
+  })
+  const plural = formatPolicyBody(many, 'en-US')
+  assert.match(plural, /Extra allowlist: 2 users$/mu)
+  assert.match(plural, /Visible projects: 2 projects$/mu)
+  assert.match(plural, /Selectable models: 2 routes$/mu)
 })
 
 test('durable policy store survives reopen without secrets', async (t) => {

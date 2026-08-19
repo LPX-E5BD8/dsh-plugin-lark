@@ -217,7 +217,7 @@ export class DurableParallelTaskStore {
     return this.table.get(taskKey(this.namespace, reference))
   }
 
-  /** Live tasks first, newest first, bounded for display. */
+  /** Live tasks first, then newest first. Callers bound what they display. */
   list(scopeId?: string): readonly ParallelTaskRecord[] {
     const rows: ParallelTaskRecord[] = []
     for (const [, record] of this.table.entries()) {

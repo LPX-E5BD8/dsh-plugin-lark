@@ -131,6 +131,23 @@ test('a corrupt owner record refuses a start instead of being overwritten', asyn
   await lock.release()
 })
 
+// A record this process cannot parse -- a newer format, say -- belongs to
+// something else. Rewriting it would clobber that writer.
+test('an owner record that becomes unreadable is lost ownership, not ours', async (t) => {
+  const dir = await runtimeDir(t)
+  const ownerFile = join(dir, RUNTIME_OWNER_FILE)
+  const lock = await ChannelOwnershipLock.acquire(dir, 1_000)
+  assert.equal(await lock.heartbeat(2_000), true)
+
+  await writeFile(ownerFile, '{"instanceId":"from-a-newer-release"', 'utf8')
+  assert.equal(await lock.heartbeat(3_000), false, 'an unreadable record was treated as ours')
+  assert.equal(await readFile(ownerFile, 'utf8'), '{"instanceId":"from-a-newer-release"')
+
+  // Releasing must not delete it either.
+  await lock.release()
+  assert.equal(await readFile(ownerFile, 'utf8'), '{"instanceId":"from-a-newer-release"')
+})
+
 test('the status document is readable, private, and free of identifiers', async (t) => {
   const dir = await runtimeDir(t)
   const instanceId = randomUUID()

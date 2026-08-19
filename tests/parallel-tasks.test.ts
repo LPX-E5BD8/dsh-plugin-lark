@@ -12,6 +12,7 @@ import {
   DurableParallelTaskStore,
   MAX_PARALLEL_TASKS_LIMIT,
   MAX_TASK_PROMPT_RUNES,
+  MAX_TASKS_LISTED,
   MAX_TASK_TITLE_RUNES,
   newTaskReference,
   ParallelTaskError,
@@ -181,6 +182,15 @@ test('tasks persist, settle once, and list live work first', async (t) => {
     (error: unknown) => error instanceof ParallelTaskError && error.code === 'UNKNOWN',
   )
   assert.equal(store.read('not-a-reference'), undefined)
+})
+
+test('the store returns every row and leaves display bounds to its caller', async (t) => {
+  const { store } = await openStore(t)
+  for (let index = 0; index < MAX_TASKS_LISTED + 3; index += 1) {
+    await store.put(record({ createdAt: 1_000 + index, title: `task ${index}` }))
+  }
+  // The docstring used to claim a bound the store never applied.
+  assert.equal(store.list('oc_chat').length, MAX_TASKS_LISTED + 3)
 })
 
 test('a task list is scoped to its own conversation', async (t) => {
