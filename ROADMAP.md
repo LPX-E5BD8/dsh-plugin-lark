@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.17 are implemented in the current release line. The next planned independently reviewable capability is 0.9.18.
+Milestones through 0.9.18 are implemented in the current release line. The next planned independently reviewable capability is 0.9.19.
 
 ## 0.1.1 — Reliability
 
@@ -237,7 +237,13 @@ Milestones through 0.9.17 are implemented in the current release line. The next 
 - Keep ordinary consecutive messages serialized; never reinterpret them as implicit parallel work.
 - Define project-level write-collision policy and concurrency limits so parallel tasks cannot silently modify the same Workspace without an explicit safe configuration.
 
-## 0.9.18 — Optional document handoff
+## 0.9.18 — Ownership and surface follow-ups
+
+- Treat a channel ownership record this process cannot parse as an owner it must not rewrite or delete, rather than as its own.
+- Surface a truncated task list instead of silently dropping older rows, and keep counted Card lines grammatical.
+- Carry the underlying error text into policy-mutation logs, and never drop the shutdown promise taken after lost ownership.
+
+## 0.9.19 — Optional document handoff
 
 - Read only an explicitly supplied, authorized Lark document link through a separately permissioned tool with bounded content and clear source attribution.
 - Publish a long final report as a document on explicit request, then return its link in the originating conversation while preserving the normal chat answer and delivery receipt.

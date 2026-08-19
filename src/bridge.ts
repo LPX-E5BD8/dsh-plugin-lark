@@ -4356,9 +4356,15 @@ export class LarkBridge {
 
   private taskListBody(records: readonly ParallelTaskRecord[]): string {
     if (records.length === 0) return this.text.taskEmpty
-    return records.slice(0, MAX_TASKS_LISTED).map((record) => (
+    const lines = records.slice(0, MAX_TASKS_LISTED).map((record) => (
       `- ${record.reference} [${record.status}] ${record.title}`
-    )).join('\n')
+    ))
+    // Truncation is stated rather than silent, so an older task is not mistaken
+    // for one that no longer exists.
+    if (records.length > MAX_TASKS_LISTED) {
+      lines.push(this.text.taskListTruncated(records.length - MAX_TASKS_LISTED))
+    }
+    return lines.join('\n')
   }
 
   private taskDetailBody(record: ParallelTaskRecord): string {
@@ -4420,7 +4426,7 @@ export class LarkBridge {
         return
       }
       this.noteOperatorFailure(error)
-      this.ctx.logger.error('[lark] conversation policy mutation failed')
+      this.ctx.logger.error('[lark] conversation policy mutation failed: %s', messageOf(error))
       await this.safeSend(route.chatId, this.text.policyUnavailable, routeDeliveryOptions(route))
       return
     }

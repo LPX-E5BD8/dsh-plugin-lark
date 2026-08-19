@@ -257,14 +257,17 @@ export function formatPolicyBody(
       `可选模型：${policy.models === undefined ? '全部可解析' : `${policy.models.length} 条`}`,
     ].join('\n')
   }
+  const plural = (count: number, unit: string): string => (
+    `${count} ${unit}${count === 1 ? '' : 's'}`
+  )
   return [
     `Approvals: ${policy.approvals ? 'allowed' : 'off'}`,
     `Outbound artifacts: ${policy.outboundArtifacts ? 'allowed' : 'off'}`,
     `Proactive notify: ${policy.notify ? 'allowed' : 'off'}`,
     `Group mention: ${policy.mention === 'always' ? 'always required' : 'default'}`,
-    `Extra allowlist: ${policy.allowFrom === undefined ? 'none (global only)' : `${policy.allowFrom.length} users`}`,
-    `Visible projects: ${policy.workspaceIds === undefined ? 'all registered' : `${policy.workspaceIds.length} projects`}`,
-    `Selectable models: ${policy.models === undefined ? 'all resolvable' : `${policy.models.length} routes`}`,
+    `Extra allowlist: ${policy.allowFrom === undefined ? 'none (global only)' : plural(policy.allowFrom.length, 'user')}`,
+    `Visible projects: ${policy.workspaceIds === undefined ? 'all registered' : plural(policy.workspaceIds.length, 'project')}`,
+    `Selectable models: ${policy.models === undefined ? 'all resolvable' : plural(policy.models.length, 'route')}`,
   ].join('\n')
 }
 

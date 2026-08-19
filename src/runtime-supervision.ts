@@ -119,9 +119,10 @@ async function readOwner(path: string): Promise<ChannelOwnerRecord | undefined> 
   try {
     return Object.freeze(ownerSchema.parse(JSON.parse(raw)))
   } catch {
-    // A truncated or foreign file is not a live owner, but it is also not ours to
-    // interpret; treat it as an expired record so an operator can recover by TTL.
-    return undefined
+    // A truncated or foreign record -- including one written by a newer release
+    // -- is not proof that the channel is free, and it is not ours to rewrite.
+    // Callers must treat this as an owner they cannot reason about.
+    throw new ChannelOwnershipError('UNAVAILABLE', 'lark: runtime owner record is unreadable')
   }
 }
 
@@ -174,7 +175,15 @@ export class ChannelOwnershipLock {
     // would race every other contender doing the same, and two owners of one bot
     // is exactly what this guards against. Clearing an abandoned record is a
     // single-actor recovery step, not something a starting instance may do.
-    const current = await readOwner(path)
+    let current: ChannelOwnerRecord | undefined
+    try {
+      current = await readOwner(path)
+    } catch {
+      throw new ChannelOwnershipError(
+        'HELD',
+        'lark: an unreadable channel owner record remains; inspect it before starting a replacement',
+      )
+    }
     if (current !== undefined && ownerRecordIsStale(current, now)) {
       throw new ChannelOwnershipError(
         'STALE',
@@ -193,7 +202,14 @@ export class ChannelOwnershipLock {
    */
   async heartbeat(now: number): Promise<boolean> {
     if (this.released) return false
-    const current = await readOwner(this.path)
+    let current: ChannelOwnerRecord | undefined
+    try {
+      current = await readOwner(this.path)
+    } catch {
+      // Rewriting a record this process cannot parse would clobber whatever
+      // wrote it, so treat it as ownership already lost.
+      return false
+    }
     if (current !== undefined && current.instanceId !== this.instanceId) return false
     const body = `${JSON.stringify(ownerRecord(this.instanceId, now, this.ttlMs, this.acquiredAt))}\n`
     await writeFileAtomically(this.path, body)
@@ -203,7 +219,8 @@ export class ChannelOwnershipLock {
   async release(): Promise<void> {
     if (this.released) return
     this.released = true
-    const current = await readOwner(this.path).catch(() => undefined)
+    const current = await readOwner(this.path).catch(() => 'unreadable' as const)
+    if (current === 'unreadable') return
     if (current !== undefined && current.instanceId !== this.instanceId) return
     await rm(this.path, { force: true })
   }

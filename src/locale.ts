@@ -158,6 +158,7 @@ interface LocaleCopy {
     readonly taskNotLive: string
     readonly taskEmpty: string
     readonly taskStopped: string
+    readonly taskListTruncated: (hidden: number) => string
     readonly denied: string
     readonly unsupportedInput: string
     readonly inboundTextFileInvalid: string
@@ -388,6 +389,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       taskNotLive: '该任务已经结束。',
       taskEmpty: '本会话还没有并行任务。',
       taskStopped: '已停止该任务。',
+      taskListTruncated: (hidden) => `…另有 ${hidden} 个较早的任务未显示。`,
       denied: '没有权限。',
       unsupportedInput: '暂不支持图片、文件或其他非文本消息，请改用文字发送。',
       inboundTextFileInvalid: '无法读取该附件。仅支持安全文件名的 UTF-8 .txt、.log、.patch 和 .diff 文本文件。',
@@ -648,6 +650,7 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       taskNotLive: 'That task has already finished.',
       taskEmpty: 'This conversation has no parallel tasks yet.',
       taskStopped: 'Stopped that task.',
+      taskListTruncated: (hidden) => `…and ${hidden} older task${hidden === 1 ? '' : 's'} not shown.`,
       denied: "You don't have permission.",
       unsupportedInput: 'Images, files, and other non-text messages are not supported yet. Please send text.',
       inboundTextFileInvalid: 'This attachment cannot be read. Only UTF-8 .txt, .log, .patch, and .diff files with safe names are accepted.',
