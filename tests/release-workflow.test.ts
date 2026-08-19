@@ -170,7 +170,7 @@ test('release workflow carries the exact pack-smoke archive into the privileged 
 
   const packScript = readFileSync('scripts/pack-smoke.mjs', 'utf8')
   assert.match(packScript, /pinnedConsumerPackages/u)
-  assert.match(packScript, /@deepseek-ai\/dsh-workspace@0\.1\.0-rc\.6/u)
+  assert.match(packScript, /@deepseek-ai\/dsh-workspace@0\.1\.0-rc\.7/u)
   assert.match(packScript, /npm pack is not reproducible within one clean build/u)
   assert.match(packScript, /DSH_PACK_ARTIFACT_DIR must be absolute/u)
   assert.match(packScript, /DSH_PACK_ARTIFACT_DIR must be empty/u)

@@ -44,8 +44,8 @@ const pinnedConsumerPackages = Object.entries(sourceLock.packages ?? {})
     return `${path.slice('node_modules/'.length)}@${entry.version}`
   })
   .sort()
-assert.ok(pinnedConsumerPackages.includes('@deepseek-ai/dsh-agent@0.1.0-rc.6'))
-assert.ok(pinnedConsumerPackages.includes('@deepseek-ai/dsh-workspace@0.1.0-rc.6'))
+assert.ok(pinnedConsumerPackages.includes('@deepseek-ai/dsh-agent@0.1.0-rc.7'))
+assert.ok(pinnedConsumerPackages.includes('@deepseek-ai/dsh-workspace@0.1.0-rc.7'))
 
 async function verifyConsumer(archivePath) {
   const consumer = join(temporary, 'consumer')
@@ -98,7 +98,7 @@ async function verifyConsumer(archivePath) {
       assert.equal(name, '@deepseek-ai/dsh-user-approval', `${name} was not installed`)
       continue
     }
-    assert.deepEqual([...resolved], ['0.1.0-rc.6'], `${name} resolved a mixed Harness cohort`)
+    assert.deepEqual([...resolved], ['0.1.0-rc.7'], `${name} resolved a mixed Harness cohort`)
   }
   await writeFile(join(consumer, 'smoke.mjs'), [
     "import assert from 'node:assert/strict'",

@@ -43,7 +43,7 @@ Treat both as unverified rather than as known-good. If you deploy 1.0 into a lon
 ## Requirements
 
 - Node.js 22.x, or Node.js 24.x with plugin v0.8.5 or newer
-- One coherent DeepSeek Harness `0.1.0-rc.6` package cohort
+- One coherent DeepSeek Harness `0.1.0-rc.7` package cohort
 - The Harness `agents` and `sessions` services; the stock Web profile mounts both
 - The Harness `tools` service, Session persistence, and the compatible rc.6 `ask_user_question` definition for structured Lark input; the stock Web profile mounts them
 - A durable `storageDomain` service; the stock Web profile supplies its JSON-backed storage stack
@@ -58,6 +58,7 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 | Plugin release | DeepSeek Harness cohort | Host libraries | Node.js | Verification |
 | --- | --- | --- | --- | --- |
+| `1.1.0`–`1.1.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.7` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | The same Linux and macOS package/runtime gates as the `1.0.x` row, re-run against the rc.7 cohort. The frozen configuration surface and durable domains are unchanged. Credential-backed Web-profile startup and long-running resource behaviour remain unverified — see [Stability](#stability). |
 | `1.0.0`–`1.0.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | The same gates as the `0.9.x` row; 1.0 freezes the public configuration surface and the durable storage domains rather than widening this matrix. Credential-backed Web-profile startup and long-running resource behaviour remain unverified — see [Stability](#stability). |
 | `0.9.0`–`0.9.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Same Linux and macOS package/runtime gates as v0.8.7. v0.9.0 adds the real rc.6 Workspace Registry lifecycle; v0.9.1 adds owner-context service-dependency and first-command cold-recovery coverage; v0.9.2 corrects Feishu Card 2.0 element compatibility and sanitizes classified SDK failures; v0.9.3 adds bounded exact-scope Session navigation; v0.9.4 adds direct Native structured human input; v0.9.5 makes Cordis own the async disposer and bounds terminal Card shutdown; v0.9.6 adds opt-in bounded inbound UTF-8 text files; v0.9.7 makes model and Session routing fail closed around image history; v0.9.8 terminalizes known running execution Cards during graceful shutdown; v0.9.9 adds opt-in bounded static inbound images; v0.9.10 adds approved outbound Workspace artifacts on the supported Linux descriptor boundary, failing closed elsewhere; v0.9.11 adds opt-in reliable notifications to a previously registered conversation; v0.9.12 makes later admits and backoff retries drain on the same process; v0.9.13 adds operator `/status` and `/diag`; v0.9.14 adds conversation-scoped policy; v0.9.15 gates Card callbacks by that policy and stops inferring bot health from a missing probe; v0.9.16 adds optional runtime supervision with cross-process channel ownership; v0.9.17 adds explicit bounded parallel tasks; v0.9.18 makes an unreadable ownership record fail closed; v0.9.19 adds optional document handoff; v0.9.20 reviews the shipped documentation against the code. |
 | `0.8.7`–`0.8.x` | every resolved `@deepseek-ai/dsh-*` package at `0.1.0-rc.6` | Cordis `4.0.1`; Schemastery `3.18.1` | `22.x`; `24.x` | Supported on GitHub-hosted Ubuntu x64. Node 22 produces the canonical archive; Node 22 and 24 run adjacent-upgrade profile gates. GitHub-hosted macOS 26 arm64 additionally verifies Node 22 and 24 package/runtime compatibility, not Web-profile deployment. |
@@ -67,7 +68,7 @@ Each supported row is an exact release-tested baseline. A version accepted by a 
 
 The required tests assemble the real rc.6 Cordis, Agent, Agent Loop, LLM, Session, semantic checkpoint policy, Session Title, SQLite Session Query exact-read path, JSONL persistence, JSON storage-domain, local Attachment Store, Tools, User Questions, Approval, and Workspace services. Platform connection, model provider, and browser behavior use controlled doubles; project mutation and approved artifact delivery also have real Registry/persistence lifecycle tests. CI pins the official Lark SDK to `1.73.0`, packs the canonical candidate on Node 22, clean-installs it into an isolated stock rc.6 Web profile, and upgrades a second isolated profile from the strictly verified v0.9.12 Release package while preserving its user patch. Both paths require the installed package version, a single bundle registration, and exactly one composed Lark configuration layer.
 
-The profile gate also pins npm resolution to the registry snapshot immediately after the rc.6 cohort was published. Harness prerelease packages use caret ranges internally, so an exact top-level `dsh@0.1.0-rc.6` alone can otherwise drift to a later prerelease in a clean npm-exec environment; every resolved DSH package is still checked as exactly rc.6.
+The profile gate also pins npm resolution to the registry snapshot immediately after the rc.7 cohort was published. Harness prerelease packages use caret ranges internally, so an exact top-level `dsh@0.1.0-rc.6` alone can otherwise drift to a later prerelease in a clean npm-exec environment; every resolved DSH package is still checked as exactly rc.6.
 
 Starting with v0.8.5, that same Linux release gate then switches to Node 24, recreates `node_modules` with engine-strict enabled, repeats the complete source/Harness and independent packed-consumer gates, and consumes the already packed canonical candidate in an isolated stock profile. The v0.8.5 gate used a clean install because its v0.8.4 baseline supported only Node 22; starting with v0.8.6, Node 24 also verifies the adjacent upgrade from the now-compatible v0.8.5 baseline.
 
@@ -112,7 +113,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='1.0.0'
+version='1.1.0'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -181,7 +182,7 @@ export DSH_LARK_APP_ID='<app-id>'
 export DSH_LARK_APP_SECRET='<app-secret>'
 ```
 
-These `DSH_*` values must be inherited by the DSH launch process. DSH `0.1.0-rc.6` rejects `DSH_*` entries in both the invocation directory's `.env` and `$DSH_HOME/.env`; export them in the launching shell or inject them through the service/container environment. `FEISHU_APP_SECRET` remains a launch-environment-only fallback for existing deployments.
+These `DSH_*` values must be inherited by the DSH launch process. DSH `0.1.0-rc.7` rejects `DSH_*` entries in both the invocation directory's `.env` and `$DSH_HOME/.env`; export them in the launching shell or inject them through the service/container environment. `FEISHU_APP_SECRET` remains a launch-environment-only fallback for existing deployments.
 
 Model credentials belong to the Harness provider rather than this plugin. For the default provider, use the Web profile's Models page or store the following mapping in `$DSH_HOME/.credentials.yaml` with file mode `0600`:
 

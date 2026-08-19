@@ -106,7 +106,7 @@ test('static image inspector accepts PNG and baseline/progressive JPEG with exac
   assert.equal(progressive.input.mediaType, 'image/jpeg')
 })
 
-test('real rc.6 attachment-local saves and rereads inspected baseline/progressive JPEG', async (t) => {
+test('real rc.7 attachment-local saves and rereads inspected baseline/progressive JPEG', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-lark-static-jpeg-'))
   const ctx = new Context()
   t.after(async () => {

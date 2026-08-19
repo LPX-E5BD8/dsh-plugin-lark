@@ -288,7 +288,7 @@ test('quality: publishing targets the public npm registry', () => {
 })
 
 test('quality: compatibility contract matches the manifest, lockfile, docs, and CI', () => {
-  const harnessVersion = '0.1.0-rc.6'
+  const harnessVersion = '0.1.0-rc.7'
   const cordisVersion = '4.0.1'
   const schemasteryVersion = '3.18.1'
   const nodeRange = '>=22 <23 || >=24 <25'

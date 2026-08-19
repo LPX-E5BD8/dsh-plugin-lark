@@ -2,7 +2,7 @@
 
 [English](./UPGRADING.md) | 简体中文
 
-本手册适用于受支持的 DeepSeek Harness `0.1.0-rc.6` 基线：Node.js 22.x，或从插件 v0.8.5 起使用 Node.js 24.x。默认使用标准 Web profile 的 JSONL 会话持久化与 JSON storage-domain 后端。自定义后端必须使用自身提供的一致性快照与恢复机制，但仍需把下文列出的逻辑单元作为同一个时间点处理。现有部署必须先在 Node.js 22 上升级插件，再通过单独的冷重启切换到 Node.js 24；绝不能把 runtime 变更与 Harness 版本组或状态迁移放进同一个窗口。下文所有流程仍只适用于 Linux：macOS 门禁从 v0.8.6 起验证 Node.js 22 package/runtime 消费，从 v0.8.7 起验证 Node.js 22/24 消费，但不验证 Web profile 运行、升级、回滚或状态迁移。
+本手册适用于受支持的 DeepSeek Harness `0.1.0-rc.7` 基线：Node.js 22.x，或从插件 v0.8.5 起使用 Node.js 24.x。默认使用标准 Web profile 的 JSONL 会话持久化与 JSON storage-domain 后端。自定义后端必须使用自身提供的一致性快照与恢复机制，但仍需把下文列出的逻辑单元作为同一个时间点处理。现有部署必须先在 Node.js 22 上升级插件，再通过单独的冷重启切换到 Node.js 24；绝不能把 runtime 变更与 Harness 版本组或状态迁移放进同一个窗口。下文所有流程仍只适用于 Linux：macOS 门禁从 v0.8.6 起验证 Node.js 22 package/runtime 消费，从 v0.8.7 起验证 Node.js 22/24 消费，但不验证 Web profile 运行、升级、回滚或状态迁移。
 
 ## 安全规则
 
@@ -59,6 +59,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.19` | 不新增 storage-domain schema。文档读取与发布只经过工具调用与工具结果事件；链接、文档 token、正文都不会写入插件 sidecar。 | v0.9.18 会忽略配置并不再注册这两个工具。回滚不会撤回已发布的文档，也不会删除它。 |
 | `0.9.20` | 不新增 schema。随包 patch 补齐了此前缺失的可配置项，取值与 schema 默认值一致。 | v0.9.19 忽略新增的键并回退到相同的 schema 默认值，因此行为不变。 |
 | `1.0.0` | 不新增 schema。冻结公开配置面（31 项）与五个 domain version 0 的持久化单元，并由发布门禁强制校验。 | v0.9.20 使用完全相同的配置与持久化状态；冻结只作用于后续变更，回滚不需要任何迁移。 |
+| `1.1.0` | 不新增 schema。已验证的 Harness 版本组前移到 `0.1.0-rc.7`，注册表快照相应推进到 `2026-08-18T00:00:00.000Z`。 | v1.0.0 针对 rc.6 版本组验证。持久化状态相同，但两个版本组不应混用：回滚插件时请把 profile 一并退回 rc.6。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -75,7 +76,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v1.0.0'
+target_tag='v1.1.0'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -210,7 +211,7 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 然后：
 
-1. 使用相同的 app ID、`defaultSessionId`、存储 root、JSONL 压缩格式、canonical Workspace 路径、配置 overlay 与继承凭据，从相同 workspace 启动同一个 Harness `0.1.0-rc.6` profile。DSH rc.6 会拒绝 `.env` 中的 `DSH_*` 应用凭据；请按 README 使用启动进程/服务环境。
+1. 使用相同的 app ID、`defaultSessionId`、存储 root、JSONL 压缩格式、canonical Workspace 路径、配置 overlay 与继承凭据，从相同 workspace 启动同一个 Harness `0.1.0-rc.7` profile。DSH rc.6 会拒绝 `.env` 中的 `DSH_*` 应用凭据；请按 README 使用启动进程/服务环境。
 2. 挂载 `webServer` 时，必须确认 `/api/lark/health` 返回 HTTP 200 且 `state: connected`。
 3. 先检查 `/help`，再列出 `/project`、`/session` 和 `/model`。在可丢弃的已注册 Workspace 中，用完整不透明引用恢复一条列表中的历史 Session，并核对预期 transcript、项目、模型、preset 与工具。列表可能显示由首条人类 prompt 派生的有界持久标题，因此只能使用非敏感测试内容。
 4. 在真实客户端中，通过直接 Native `ask_user_question` 完成可丢弃的单选、多选、自由文本与取消交互；确认答案恢复同一个 turn，终态卡片不包含答案或控件。升级前仍在等待的卡片重启后应失效；问题和答案中绝不能包含凭据。
@@ -229,8 +230,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v1.0.0 回滚到 | 状态处理方式 |
+| 从 v1.1.0 回滚到 | 状态处理方式 |
 | --- | --- |
+| v1.0.0 | 持久化状态与配置完全相同。回滚插件时请把 Harness profile 一并退回 `0.1.0-rc.6` 版本组；混用版本组不是受支持的组合。 |
 | v0.9.20 | 配置与持久化状态完全相同。 |
 | v0.9.19 | 相同持久化状态与相同实际配置；`/task` 不再出现在聊天内帮助里。 |
 | v0.9.18 | 相同持久化状态；两个文档工具消失。已经发布的文档仍留在租户内，不受影响。 |
