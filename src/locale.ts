@@ -150,6 +150,14 @@ interface LocaleCopy {
     readonly policyUsage: string
     readonly policyUnavailable: string
     readonly policyFull: string
+    readonly taskUnavailable: string
+    readonly taskUsage: string
+    readonly taskAtCapacity: string
+    readonly taskWorkspaceBusy: string
+    readonly taskUnknown: string
+    readonly taskNotLive: string
+    readonly taskEmpty: string
+    readonly taskStopped: string
     readonly denied: string
     readonly unsupportedInput: string
     readonly inboundTextFileInvalid: string
@@ -316,6 +324,9 @@ interface LocaleCopy {
     readonly statusTitle: string
     readonly diagTitle: string
     readonly policyTitle: string
+    readonly taskTitle: string
+    readonly taskCreatedTitle: string
+    readonly taskSettledTitle: string
   }
   readonly event: {
     readonly command: string
@@ -364,6 +375,19 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       ].join('\n'),
       policyUnavailable: '会话策略暂不可用。',
       policyFull: '该策略列表已满，请先移除条目。',
+      taskUnavailable: '并行任务未启用。',
+      taskUsage: [
+        '用法：/task 或 /task list — 列出本会话的并行任务',
+        '/task run <指令> — 新建一个并行任务',
+        '/task <编号> — 查看某个任务',
+        '/task stop <编号> — 停止某个任务',
+      ].join('\n'),
+      taskAtCapacity: '本会话的并行任务已达上限，请先停止一个。',
+      taskWorkspaceBusy: '已有并行任务占用该项目。请等它结束，或改为共享项目配置。',
+      taskUnknown: '找不到该任务编号。',
+      taskNotLive: '该任务已经结束。',
+      taskEmpty: '本会话还没有并行任务。',
+      taskStopped: '已停止该任务。',
       denied: '没有权限。',
       unsupportedInput: '暂不支持图片、文件或其他非文本消息，请改用文字发送。',
       inboundTextFileInvalid: '无法读取该附件。仅支持安全文件名的 UTF-8 .txt、.log、.patch 和 .diff 文本文件。',
@@ -562,6 +586,9 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       statusTitle: '通道状态',
       diagTitle: '通道诊断',
       policyTitle: '会话策略',
+      taskTitle: '并行任务',
+      taskCreatedTitle: '任务已启动',
+      taskSettledTitle: '任务已结束',
     },
     event: {
       command: '命令',
@@ -608,6 +635,19 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       ].join('\n'),
       policyUnavailable: 'Conversation policy is unavailable.',
       policyFull: 'This policy list is full. Remove an entry first.',
+      taskUnavailable: 'Parallel tasks are not enabled.',
+      taskUsage: [
+        'Usage: /task or /task list — list this conversation\'s parallel tasks',
+        '/task run <instruction> — start one parallel task',
+        '/task <reference> — inspect one task',
+        '/task stop <reference> — stop one task',
+      ].join('\n'),
+      taskAtCapacity: 'This conversation is at its parallel task limit. Stop one first.',
+      taskWorkspaceBusy: 'Another parallel task holds this project. Wait for it, or configure shared projects.',
+      taskUnknown: 'No task matches that reference.',
+      taskNotLive: 'That task has already finished.',
+      taskEmpty: 'This conversation has no parallel tasks yet.',
+      taskStopped: 'Stopped that task.',
       denied: "You don't have permission.",
       unsupportedInput: 'Images, files, and other non-text messages are not supported yet. Please send text.',
       inboundTextFileInvalid: 'This attachment cannot be read. Only UTF-8 .txt, .log, .patch, and .diff files with safe names are accepted.',
@@ -801,6 +841,9 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
       statusTitle: 'Channel status',
       diagTitle: 'Channel diagnostic',
       policyTitle: 'Conversation policy',
+      taskTitle: 'Parallel tasks',
+      taskCreatedTitle: 'Task started',
+      taskSettledTitle: 'Task finished',
     },
     event: {
       command: 'Command',

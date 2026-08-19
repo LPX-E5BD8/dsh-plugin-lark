@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.16 are implemented in the current release line. The next planned independently reviewable capability is 0.9.17.
+Milestones through 0.9.17 are implemented in the current release line. The next planned independently reviewable capability is 0.9.18.
 
 ## 0.1.1 — Reliability
 

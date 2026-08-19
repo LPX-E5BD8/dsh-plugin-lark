@@ -54,6 +54,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.14` | 新增 `lark_policy` storage-domain 单元（`policies`）。行以聊天或群的加盐哈希为键，只保存提及模式、工具/审批开关，以及有界的 Workspace、模型与加盐哈希用户名单。不保存明文 open ID、chat ID 或任何密钥。 | v0.9.13 会忽略该单元，不再应用会话级收窄，会话回到全局默认拒绝配置。不做任何迁移；再次升级后需要重新执行 `/policy`。 |
 | `0.9.15` | 不新增持久化 schema。卡片回调与入站消息解析同一份 `lark_policy` 文档；客户端未提供健康探针时 `/diag` 报告“无法确认”。 | v0.9.14 读取同一单元，但只对入站消息生效，因此在卡片投递之后才收紧的会话仍可能被该卡片按钮驱动。无需 sidecar 迁移。 |
 | `0.9.16` | 不新增 storage-domain schema。可选的 `runtimeDir` 监管会在该目录下写两个文件：归属心跳与状态文档。两者都不含凭据、平台标识、会话范围，也不含该目录之外的路径。 | v0.9.15 忽略 `runtimeDir`，不会认领归属，因此第二个进程又能服务同一个机器人。回滚后请删除该运行目录；残留的归属记录在 v0.9.15 不起作用，但会让 v0.9.16 拒绝启动，直到 `contrib/systemd/lark-clear-stale-owner.sh` 清理它。 |
+| `0.9.17` | 新增 `lark_tasks` storage-domain 单元（`tasks`）。行以不透明任务编号的加盐哈希为键，保存会话范围、聊天、回复目标、由指令派生的有界标题、项目冲突键的加盐哈希、状态与时间戳。不保存指令正文、文件系统路径或凭据。 | v0.9.16 会忽略该单元且不再提供 `/task`，因此存活行会一直保持 `running`，其项目也一直被占用直到再次升级。回滚前请先停止所有任务，或清空该单元。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -70,7 +71,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.16'
+target_tag='v0.9.17'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -224,8 +225,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v0.9.16 回滚到 | 状态处理方式 |
+| 从 v0.9.17 回滚到 | 状态处理方式 |
 | --- | --- |
+| v0.9.16 | 保留 `lark_tasks` 行但不再提供 `/task`。残留为 `running` 的行会在下一次 v0.9.17 启动时退役为 `orphaned`，v0.9.16 不会处理。 |
 | v0.9.15 | 相同持久化状态；不再维护通道归属与运行状态文档。读取 `status.json` 的 supervisor 会看到心跳停止推进，回滚前请先停用该探针。 |
 | v0.9.14 | 相同持久化状态；会话策略不再约束卡片回调，且只要没观察到失败 `/diag` 就会把机器人报成正常。 |
 | v0.9.13 | 保留 `lark_policy` 行但不再读取，所有会话回退到全局配置。原本被收窄的会话会放宽到全局门禁允许的范围；回滚前请重新确认 `allowFrom`、`operatorFrom`、`outboundArtifacts` 与 `proactiveDelivery`。 |
