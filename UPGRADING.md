@@ -57,6 +57,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.17` | Adds the `lark_tasks` storage-domain unit (`tasks`). Rows are keyed by a salted hash of an opaque task reference and store the conversation scope, chat, reply target, a bounded title derived from the instruction, a salted-hash project collision key, status, and timestamps. No prompt body, filesystem path, or credential is stored. | v0.9.16 ignores the new unit and no longer serves `/task`, so live rows stay `running` and their projects stay claimed for a later roll-forward. Stop every task before rolling back, or clear the unit. |
 | `0.9.18` | Adds no schema. An unreadable channel ownership record is treated as an owner this process must not rewrite or delete, so a start refuses and a heartbeat reports lost ownership. | v0.9.17 rewrites such a record instead, which can clobber whatever wrote it. No sidecar migration. |
 | `0.9.19` | Adds no storage-domain schema. Document reads and publishes travel through ordinary tool-call and tool-result events; links, document tokens, and bodies never enter plugin sidecars. | v0.9.18 ignores the configuration and no longer registers either tool. Rollback cannot retract an already published document or delete it. |
+| `0.9.20` | Adds no schema. The bundled patch now carries the configurable options it previously omitted, at values identical to the schema defaults. | v0.9.19 ignores the added keys and falls back to the same schema defaults, so behaviour is unchanged. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -73,7 +74,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v0.9.19'
+target_tag='v0.9.20'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -227,8 +228,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v0.9.19 | State handling |
+| Rollback target from v0.9.20 | State handling |
 | --- | --- |
+| v0.9.19 | Same durable state and same effective configuration; `/task` disappears from the in-chat help. |
 | v0.9.18 | Same durable state; the document tools disappear. Documents already published stay in the tenant and are unaffected. |
 | v0.9.17 | Same durable state; an unreadable ownership record is rewritten rather than respected. Inspect `owner.json` before rolling back if a newer release ever wrote it. |
 | v0.9.16 | Keeps the `lark_tasks` rows but stops serving `/task`. Rows left `running` are retired to `orphaned` on the next v0.9.17 start, not on v0.9.16. |

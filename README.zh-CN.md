@@ -47,7 +47,7 @@
 
 | 插件版本 | DeepSeek Harness 版本组 | 宿主库 | Node.js | 验证状态 |
 | --- | --- | --- | --- | --- |
-| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`；v0.9.14 增加会话级策略；v0.9.15 让卡片回调也走同一策略，并且不再因为缺少健康探针就判定机器人正常；v0.9.16 增加可选的运行时监管与跨进程通道归属；v0.9.17 增加显式的有界并行任务；v0.9.18 让无法解析的归属记录失败关闭；v0.9.19 增加可选的文档交接。 |
+| `0.9.0`–`0.9.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 沿用 v0.8.7 的 Linux 与 macOS package/runtime 门禁。v0.9.0 增加真实 rc.6 Workspace Registry 生命周期测试；v0.9.1 增加 owner context 服务依赖与首条命令冷恢复覆盖；v0.9.2 修正飞书 Card 2.0 元素兼容性并脱敏分类 SDK 失败；v0.9.3 增加有界精确范围 Session 导航；v0.9.4 增加直接 Native 结构化人工输入；v0.9.5 让 Cordis 真正拥有异步 disposer 并限制终态 Card 的停机预算；v0.9.6 增加可选、有界的入站 UTF-8 文本文件；v0.9.7 让模型与 Session 路由对图片历史默认拒绝不兼容目标；v0.9.8 在优雅停机时终态化已知的运行中执行卡；v0.9.9 增加可选、有界的静态入站图片；v0.9.10 在受支持的 Linux descriptor 边界上增加经审批的 Workspace 产物发送，其他平台失败关闭；v0.9.11 增加对已注册会话的可靠主动通知；v0.9.12 让同一进程内后续受理与退避重试继续排空发件箱；v0.9.13 增加运维 `/status` 与 `/diag`；v0.9.14 增加会话级策略；v0.9.15 让卡片回调也走同一策略，并且不再因为缺少健康探针就判定机器人正常；v0.9.16 增加可选的运行时监管与跨进程通道归属；v0.9.17 增加显式的有界并行任务；v0.9.18 让无法解析的归属记录失败关闭；v0.9.19 增加可选的文档交接；v0.9.20 对照代码全量复核随包文档。 |
 | `0.8.7`–`0.8.x` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 生成 canonical archive；Node 22 与 24 都执行相邻版本升级 profile 门禁。GitHub 托管的 macOS 26 arm64 还验证 Node 22 和 24 的 package/runtime 兼容性，但不验证 Web profile 部署。 |
 | `0.8.6` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | Ubuntu 支持范围相同；macOS 26 arm64 的 package/runtime 证据只覆盖 Node 22。 |
 | `0.8.5` | 所有已解析的 `@deepseek-ai/dsh-*` 软件包均为 `0.1.0-rc.6` | Cordis `4.0.1`；Schemastery `3.18.1` | `22.x`；`24.x` | 支持 GitHub 托管的 Ubuntu x64。Node 22 执行 canonical Release 与相邻版本升级门禁；Node 24 重跑源码/Harness 和 packed-consumer 门禁，再把同一份 canonical archive 全新安装到标准 rc.6 Web profile。 |
@@ -100,7 +100,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='0.9.19'
+version='0.9.20'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"
@@ -195,37 +195,53 @@ export DEEPSEEK_API_KEY='<provider-api-key>'
 - id: lark
   name: dsh-plugin-lark
   config:
-    domain: feishu               # feishu / lark
-    locale: zh-CN                # zh-CN / en-US
+    domain: feishu                  # feishu / lark
+    locale: zh-CN                   # zh-CN / en-US
+
+    # 鉴权。所有名单默认拒绝且默认为空。
     allowAllUsers: false
-    allowFrom: []                # 已授权的飞书/Lark open_id
-    projectManageFrom: []        # 允许在私聊中注册/移除项目的 open_id
-    operatorFrom: []            # 允许使用 /status、/diag 和 /policy 的 open_id
-    runtimeDir: ''               # 绝对路径，设置后开启监管；留空为关闭
-    parallelTasks: false         # 是否开启 /task
-    documentHandoff: false       # 是否开启文档读取与发布工具
-    maxDocumentReadBytes: 65536
-    maxDocumentPublishBytes: 262144
-    maxParallelTasks: 2          # 单个会话同时存活的任务数上限
-    taskWorkspaces: exclusive    # 或 shared，允许多个任务共用一个项目
-    runtimeOwnerTtlMs: 30000     # 归属心跳预算
-    defaultSessionId: ''         # 留空 = 按私聊/群聊范围隔离
-    provider: deepseek-official # 会话没有已保存选择时的默认 provider
-    model: deepseek-v4-flash    # 会话没有已保存选择时的默认 model
+    allowFrom: []                   # 已授权的飞书/Lark open_id
+    projectManageFrom: []           # 允许在私聊中注册/移除项目的 open_id
+    operatorFrom: []                # 允许使用 /status、/diag 和 /policy 的 open_id
+
+    # 会话路由。
+    defaultSessionId: ''            # 留空 = 按私聊/群会话分别隔离
+    provider: deepseek-official     # 会话没有保存选择时的默认值
+    model: deepseek-v4-flash        # 会话没有保存选择时的默认值
     streamUpdateIntervalMs: 1000
-    maxConversationHandles: 32  # 进程内活跃会话句柄的稳态目标
-    inboundTextFiles: false     # 显式开启有界 UTF-8 文本文件消息
+    maxConversationHandles: 32      # 稳态常驻会话句柄目标值
+
+    # 入站媒体。按类型分别开启，每项都有上限。
+    inboundTextFiles: false         # 开启有界 UTF-8 文本文件消息
     maxInboundTextFileBytes: 131072 # 默认 128 KiB；硬上限 256 KiB
-    inboundImages: false        # 显式开启一个静态 PNG/JPEG 私聊消息
-    maxInboundImageBytes: 5242880 # 默认值/硬上限 5 MiB
-    maxInboundImagePixels: 20000000 # 默认值/硬上限 2000 万像素
-    maxConversationImages: 4   # 默认 4；硬上限 20
-    maxConversationImageBytes: 20971520 # 默认值/硬上限 20 MiB
-    outboundArtifacts: false    # 显式开启经审批的 Agent 作用域发送工具
+    inboundImages: false            # 开启单张静态 PNG/JPEG 私聊图片
+    maxInboundImageBytes: 5242880   # 默认/硬上限 5 MiB
+    maxInboundImagePixels: 20000000 # 默认/硬上限 2000 万像素
+    maxConversationImages: 4        # 默认 4；硬上限 20
+    maxConversationImageBytes: 20971520 # 默认/硬上限 20 MiB
+
+    # 出站产物。仅 Linux，且必须经过审批。
+    outboundArtifacts: false        # 开启经审批的 Agent 作用域发送工具
     maxOutboundTextFileBytes: 131072 # 默认 128 KiB；硬上限 256 KiB
-    maxOutboundImageBytes: 5242880 # 默认值/硬上限 5 MiB
-    maxOutboundImagePixels: 20000000 # 默认值/硬上限 2000 万像素
-    proactiveDelivery: false    # 显式开启可靠的 Agent 通知
+    maxOutboundImageBytes: 5242880  # 默认/硬上限 5 MiB
+    maxOutboundImagePixels: 20000000 # 默认/硬上限 2000 万像素
+
+    # 主动通知。
+    proactiveDelivery: false        # 开启 Agent 作用域通知工具
+
+    # 运行时监管。runtimeDir 留空即关闭。
+    runtimeDir: ''                  # 绝对路径，设置后开启监管
+    runtimeOwnerTtlMs: 30000        # 归属心跳预算
+
+    # 显式并行任务。
+    parallelTasks: false            # 开启 /task
+    maxParallelTasks: 2             # 单个会话同时存活的任务数上限
+    taskWorkspaces: exclusive       # 或 shared，允许多个任务共用一个项目
+
+    # 文档交接。需要独立的飞书权限。
+    documentHandoff: false          # 开启文档读取与发布工具
+    maxDocumentReadBytes: 65536     # 默认 64 KiB；硬上限 512 KiB
+    maxDocumentPublishBytes: 262144 # 默认 256 KiB；硬上限 1 MiB
 ```
 
 这组基线要求宿主提供 `agents`、`sessions`、`tools` 和持久化 `storageDomain` 服务。需要持久化的重置、项目/会话/模型选择、冷恢复与结构化 Lark 问题还要求 `sessionPersistence`；`/project` 依赖 `workspaceRegistry`，`/session` 还依赖 `sessionQuery` 与持久化会话绑定，`/model` 依赖 Harness `llm` 服务。含图片的 Session 还要求该服务公开精确 `resolveModelInfo` modality 元数据；摄入图片还要求兼容的 `attachments` 服务。任一能力缺失时图片工作默认拒绝，但纯文本 Session 不受影响。结构化输入要求 Agent 仍能看到精确兼容的 rc.6 `ask_user_question` 定义；缺失或不兼容时会记录诊断并委派，而不会注册第二个 provider。缺少 Session Query 或 Workspace 能力时，会话导航会返回不可用；单独执行 `/session` 列表不会创建 Agent。审批卡片和 readiness 路由分别依赖可选的 `approval` 与 `webServer` 服务。已验证矩阵使用标准 JSON/JSONL、本地附件和 SQLite 精确读取实现，替代实现仍未验证。

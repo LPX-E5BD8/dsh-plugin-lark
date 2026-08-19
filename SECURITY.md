@@ -38,6 +38,30 @@ Proactive delivery is disabled by default. Enabling it exposes one Agent-scoped 
 
 The `lark_notify` sidecar hashes storage keys. Destination rows store the chat/user/message IDs required to deliver after restart—the same class of necessary platform identifiers as selected model route IDs. Outbox rows store kind, a bounded summary, mention tokens, retry/expiry, and terminal status. Report any path that accepts a model-supplied destination, retries a delivered idempotency key, or exposes destination IDs in tool results, logs, receipts, or Cards beyond the required `@` mention on the delivered card. A successful platform write followed by a crash before the outbox is marked delivered is recovered as pending and retried with the same idempotency key so the platform can deduplicate.
 
+## Conversation policy boundary
+
+Conversation policy is operator-only and can only narrow the global fail-closed configuration. A local rule never grants access: extra user allowlists intersect `allowFrom`, `mention always` only adds a requirement, Workspace and model lists only remove names from listing and selection, and approvals, `send_lark_artifact`, and `notify_lark` stay off whenever either the global flag or the local flag is off. Operators bypass the local user allowlist so a conversation they lock down stays recoverable.
+
+One policy document covers a chat or a whole group, including every reply tree and native thread inside it, and it gates interactive Card callbacks as well as inbound messages. Report any path where a narrowed conversation can be driven through a Card delivered before the narrowing, where a new reply tree escapes a group policy, or where a local rule widens anything. The `lark_policy` sidecar keys rows by a salted hash and stores salted hashes rather than plaintext open IDs; the Card shows counts only.
+
+## Channel ownership boundary
+
+Optional runtime supervision claims ownership of the bot by exclusive file creation before the first connection, so a second process on the same runtime directory refuses to start rather than competing. A starting instance never removes another record: a live one refuses the start, an abandoned one refuses it too, and an unreadable one — including a record written by a newer release — refuses it as well, because a contender that deleted records would race every other contender doing the same. Clearing an abandoned record is a single-actor recovery step performed by the supervisor or an operator, never by a starting instance.
+
+The guarantee is per runtime directory. Two deployments with separate runtime directories pointed at one bot remain an unsupported configuration. Report any path where a starting instance rewrites or deletes a record it did not write, or where an instance keeps serving after losing ownership. The status document carries no credential, platform identifier, conversation scope, or path beyond its own directory.
+
+## Parallel task boundary
+
+Only the explicit `/task` vocabulary creates parallel work; an ordinary message, whatever it says, is served by its own conversation in order. Each task runs in its own conversation scope and Session, so it never shares a barrier with the chat that started it, while the chat stays resolvable so conversation policy still applies.
+
+Live tasks are bounded per conversation, and the default exclusive policy refuses a second live task in a project another task holds. That claim is checked and written under one serialized queue because it spans conversations. When neither a registered Workspace nor a working directory can be identified, every such task shares one claim rather than losing the guard. Report any path where two live tasks hold one project without `taskWorkspaces: shared`, or where an ordinary message becomes parallel work. Stored rows hold a bounded title derived from the instruction, never the instruction body, a path, or a credential.
+
+## Document handoff boundary
+
+Document handoff is disabled by default and requires its own Lark scopes; enabling it registers two Agent-scoped tools and does not widen the core channel's permissions to the Docs, Calendar, Base, Sheets, Tasks, Wiki, or Drive surfaces.
+
+A read resolves only an absolute `https` link to a `docx` or `wiki` path on one of the deployment's own hosts, exactly as the user supplied it. A bare token, a relative path, credentials in the authority, a lookalike host, another deployment's domain, and `drive`/`base`/`sheets` links are refused before any request. Content is bounded on a character boundary, truncation is always reported, and the result states its source and that the content is untrusted external data rather than an instruction. Report any path where a model-constructed link reaches the platform, where truncation is hidden, or where document text is presented without that framing. Publishing adds a document and returns its link; it never replaces the ordinary chat answer or its delivery receipt, and rollback cannot retract an already published document.
+
 ## Card shutdown boundary
 
 Graceful shutdown makes a bounded attempt to remove live Stop authority from every known running execution Card before the Lark REST client closes. Ordinary Card writes use per-turn cancellation, and one dedicated terminal PATCH has a two-second whole-chain deadline. That PATCH contains a fixed statement that live execution was interrupted and the durable result is unconfirmed; it does not create a Session result, send a partial answer, or grant a pending tool approval.

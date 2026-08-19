@@ -2,7 +2,7 @@
 
 This roadmap records intended outcomes rather than release dates. Priorities may change as the project gains operational feedback.
 
-Milestones through 0.9.19 are implemented in the current release line. The remaining work is the 1.0 stable-release gates.
+Milestones through 0.9.20 are implemented in the current release line. The remaining work is the 1.0 stable-release gates.
 
 ## 0.1.1 — Reliability
 
@@ -248,6 +248,12 @@ Milestones through 0.9.19 are implemented in the current release line. The remai
 - Read only an explicitly supplied, authorized Lark document link through a separately permissioned tool with bounded content and clear source attribution.
 - Publish a long final report as a document on explicit request, then return its link in the originating conversation while preserving the normal chat answer and delivery receipt.
 - Keep the general Docs, Calendar, Base, Sheets, Tasks, Wiki, and Drive API surface in separate optional tools rather than expanding the core channel's default permissions.
+
+## 0.9.20 — Documentation review
+
+- Advertise `/task` in the in-chat help wherever it is served, and nowhere else.
+- Carry every configurable option in the bundled patch that both READMEs present as its defaults, and gate that against drift.
+- Give conversation policy, channel ownership, parallel tasks, and document handoff their own security boundaries and credential-backed smoke steps.
 
 ## 1.0 — Stable release
 

@@ -145,6 +145,7 @@ interface LocaleCopy {
   readonly bridge: {
     readonly help: string
     readonly operatorHelp: string
+    readonly taskHelp: string
     readonly operatorOnly: string
     readonly policyUpdated: string
     readonly policyUsage: string
@@ -358,6 +359,12 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
         '/session resume <会话引用> — 继续一条已有会话',
         '/model [提供方 ID] [模型 ID] — 查看或切换模型',
         '/help — 显示帮助',
+      ].join('\n'),
+      taskHelp: [
+        '/task [list] — 列出本会话的并行任务',
+        '/task run <指令> — 新建一个并行任务',
+        '/task <编号> — 查看某个任务',
+        '/task stop <编号> — 停止某个任务',
       ].join('\n'),
       operatorHelp: [
         '/status — 查看当前通道状态（仅运维）',
@@ -623,6 +630,12 @@ const COPY: Record<LarkLocale, LocaleCopy> = {
         '/session resume <reference> — continue an existing session',
         '/model [provider ID] [model ID] — list or switch models',
         '/help — show this help',
+      ].join('\n'),
+      taskHelp: [
+        '/task [list] — list this conversation\'s parallel tasks',
+        '/task run <instruction> — start one parallel task',
+        '/task <reference> — inspect one task',
+        '/task stop <reference> — stop one task',
       ].join('\n'),
       operatorHelp: [
         '/status — show channel status (operators only)',

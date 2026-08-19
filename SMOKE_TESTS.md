@@ -9,7 +9,7 @@ In the matching developer console (`open.feishu.cn` or `open.larksuite.com`):
 1. Select long connection for event delivery.
 2. Subscribe to `im.message.receive_v1`.
 3. Register the `card.action.trigger` callback.
-4. Grant the bot permission to receive and send messages. Grant `im:resource` when inbound text files, inbound images, outbound artifacts, or the animated loading image are being checked.
+4. Grant the bot permission to receive and send messages. Grant `im:resource` when inbound text files, inbound images, outbound artifacts, or the animated loading image are being checked. Grant `docx:document:readonly` and `docx:document:create` only when document handoff is being checked; they are not part of the core channel's permissions.
 5. Add the tester's `open_id` to local `allowFrom`, `projectManageFrom`, and `operatorFrom` overlays. Do not use `allowAllUsers: true` for a shared or production app.
 
 Build and install the exact checkout being tested:
@@ -57,6 +57,10 @@ Create an overlay outside the checkout, such as `/tmp/dsh-lark-smoke.yml`:
     maxOutboundImageBytes: 5242880
     maxOutboundImagePixels: 20000000
     proactiveDelivery: true
+    parallelTasks: true
+    maxParallelTasks: 2
+    documentHandoff: true
+    runtimeDir: /tmp/dsh-lark-smoke-runtime # create it first, 0700, owned by the tester
 ```
 
 Start the Web profile. The Web app intentionally accepts loopback only; Feishu/Lark event delivery uses the outbound WebSocket and does not require a public HTTP listener.
@@ -131,6 +135,10 @@ Repeat these group-chat checks:
 9. As a configured project manager, send project register/remove commands in a group with and without a mention. Both must return the direct-chat-only boundary and perform no Registry mutation.
 10. Create separate committed Sessions in reply root A, reply root B, and a native thread. Verify each `/session` list and reference stays inside its own lineage and cannot resume either peer. With an explicit disposable `defaultSessionId`, verify the list, bounded title metadata, references, and resume choice are intentionally shared with every authorized chat using that global scope.
 11. Approve one disposable outbound artifact in reply root A and one in a native thread. Verify each artifact replies only to its own triggering message/thread, another group member cannot approve it, and no model-supplied destination can redirect either upload.
+12. As an `operatorFrom` user, send `/policy set users add <own open_id>` in reply root A. Verify the Card reports counts only—no open ID, chat ID, or hash—and that another authorized group member is then refused in reply root B and in a native thread, proving the document covers the whole group rather than one reply tree. Deliver an Approval or human-input Card, narrow the policy afterwards, and verify the excluded member's button press is refused. Then `/policy set mention always` and verify an unmentioned group command is ignored while a mentioned one is served. Restore with `/policy set users clear` and `/policy set mention default`.
+13. With `runtimeDir` set, start the profile and verify `contrib/systemd/lark-readiness.sh <runtime-dir>` exits 0 while serving. Start a second process against the same runtime directory and verify it refuses to start rather than connecting. Stop the first cleanly, verify the readiness probe stops reporting ready, and verify the second process now starts. Kill a process without a clean stop, verify a replacement refuses to start, then run `contrib/systemd/lark-clear-stale-owner.sh <runtime-dir>` and verify it clears only the abandoned record and the replacement starts. Point the script at a live owner and verify it refuses.
+14. Send `/help` and verify `/task` appears only when `parallelTasks` is enabled. Send an ordinary message asking for parallel work in prose and verify no task is created. Send `/task run <disposable instruction>` and verify one lifecycle Card, an opaque reference, and its own Session. With `maxParallelTasks: 2`, verify a third live task is refused, and from a second conversation sharing the same project verify the exclusive default refuses a task while `taskWorkspaces: shared` permits it. Verify `/task`, `/task <reference>`, and `/task stop <reference>` list, inspect, and stop, that a reference from another conversation is not found, and that a list longer than ten rows states how many are hidden. Restart with a live task and verify it is retired rather than left running, freeing its project.
+15. Ask the Agent to call `read_lark_document` with a disposable document link you supplied in the chat. Verify the reply attributes the source and link, states that the content is untrusted data, and reports truncation when the document exceeds `maxDocumentReadBytes`. Then verify a bare token, a relative path, an `http` link, a link carrying credentials, a lookalike host, the other deployment's domain, and `drive`/`base`/`sheets` links each perform zero platform request. Ask for `publish_lark_document` and verify one document is created, its link is returned in the originating conversation, and the ordinary chat answer and its delivery receipt still arrive. Finally restart with `documentHandoff: false` and verify both tools are absent.
 
 ## Record and clean up
 
