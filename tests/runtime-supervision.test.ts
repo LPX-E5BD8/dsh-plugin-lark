@@ -232,7 +232,11 @@ test('a supervisor displaced by a mis-recovery reports degraded and stops servin
   const usurper = await ChannelOwnershipLock.acquire(dir, clock, MIN_OWNER_TTL_MS)
   t.after(() => usurper.release())
 
-  await new Promise((resolve) => setTimeout(resolve, Math.floor(MIN_OWNER_TTL_MS / 3) + 400))
+  // The heartbeat interval plus its file IO is not a fixed cost, so wait for the
+  // observable outcome instead of sleeping for one expected duration.
+  for (let attempt = 0; lost === 0 && attempt < 200; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
   assert.equal(lost, 1, 'the displaced supervisor never reported lost ownership')
   const degraded = JSON.parse(await readFile(join(dir, RUNTIME_STATUS_FILE), 'utf8')) as {
     state: string
