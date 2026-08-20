@@ -60,6 +60,7 @@ overlay 可以覆盖任意标准路径，因此应以本机组合后的配置为
 | `0.9.20` | 不新增 schema。随包 patch 补齐了此前缺失的可配置项，取值与 schema 默认值一致。 | v0.9.19 忽略新增的键并回退到相同的 schema 默认值，因此行为不变。 |
 | `1.0.0` | 不新增 schema。冻结公开配置面（31 项）与五个 domain version 0 的持久化单元，并由发布门禁强制校验。 | v0.9.20 使用完全相同的配置与持久化状态；冻结只作用于后续变更，回滚不需要任何迁移。 |
 | `1.1.0` | 不新增 schema。已验证的 Harness 版本组前移到 `0.1.0-rc.7`，注册表快照相应推进到 `2026-08-18T00:00:00.000Z`。 | v1.0.0 针对 rc.6 版本组验证。持久化状态相同，但两个版本组不应混用：回滚插件时请把 profile 一并退回 rc.6。 |
+| `1.1.1` | 不新增 schema，仅文档：新增 registry 安装路径。 | v1.1.0 是同一份产物，行为完全相同。 |
 
 DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。本项目不声明跨 Harness 版本的迁移支持；插件升级与 Harness 版本组升级必须拆成两个变更，不能放进同一个恢复窗口。
 
@@ -76,7 +77,7 @@ DSH JSONL 格式和 Workspace domain 属于 Harness rc.6，而不是本插件。
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v1.1.0'
+target_tag='v1.1.1'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -230,8 +231,9 @@ DSH_HOME="$dsh_state_root" dsh --profile web --dump-config >/dev/null
 
 回滚到任意早于 v0.9.2 的版本都会恢复旧 Card payload 契约。飞书可能在创建阶段拒绝其中的审批卡，使受保护调用不可用但仍保持默认拒绝；这一共同影响叠加在下表各目标版本的状态后果之上。
 
-| 从 v1.1.0 回滚到 | 状态处理方式 |
+| 从 v1.1.1 回滚到 | 状态处理方式 |
 | --- | --- |
+| v1.1.0 | 代码与持久化状态完全相同，仅文档差异。 |
 | v1.0.0 | 持久化状态与配置完全相同。回滚插件时请把 Harness profile 一并退回 `0.1.0-rc.6` 版本组；混用版本组不是受支持的组合。 |
 | v0.9.20 | 配置与持久化状态完全相同。 |
 | v0.9.19 | 相同持久化状态与相同实际配置；`/task` 不再出现在聊天内帮助里。 |

@@ -80,7 +80,13 @@ Profile 门禁还会把 npm 解析固定在 rc.7 版本组发布完成后的 reg
 
 ## 安装
 
-克隆仓库、构建，然后将检出目录添加到 Harness profile：
+把已发布的包装进 Harness profile：
+
+```sh
+dsh plugin --profile web add dsh-plugin-lark
+```
+
+或者从检出目录构建——发布门禁验证的正是这条路径：
 
 ```sh
 git clone https://github.com/LPX-E5BD8/dsh-plugin-lark.git
@@ -92,7 +98,7 @@ dsh plugin --profile web add .
 
 本 README 中的 `dsh plugin` 安装与运维流程仍只由 Ubuntu/Linux 门禁验证。macOS 门禁只验证打包模块，不代表标准 Web profile 部署已受支持。
 
-profile 使用该插件期间请保留检出目录，无需等待 npm registry 发布。
+同一版本的 registry 包与 GitHub Release 归档是同一份产物：发布门禁只打包一次，以独立消费者身份验证它，然后发布这份完全相同的归档。使用前如何校验见 [Release 来源证明](#release-来源证明)。如果改用检出目录安装，则 profile 使用期间请保留该目录。
 
 替换该检出目录或回滚带持久化状态的版本前，请遵循 [UPGRADING.zh-CN.md](./UPGRADING.zh-CN.md) 中的冷备份流程和 schema 边界。插件代码降级并不等于持久化状态可以自动降级。
 
@@ -113,7 +119,7 @@ profile 使用该插件期间请保留检出目录，无需等待 npm registry �
 ```sh
 set -eu
 
-version='1.1.0'
+version='1.1.1'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"

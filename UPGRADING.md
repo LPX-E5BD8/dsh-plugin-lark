@@ -60,6 +60,7 @@ An overlay can replace any stock path, so the composed local configuration is au
 | `0.9.20` | Adds no schema. The bundled patch now carries the configurable options it previously omitted, at values identical to the schema defaults. | v0.9.19 ignores the added keys and falls back to the same schema defaults, so behaviour is unchanged. |
 | `1.0.0` | Adds no schema. Freezes the 31-option public configuration surface and the five domain-version-0 durable units behind a release gate. | v0.9.20 uses exactly the same configuration and durable state; the freeze constrains later changes only, so rolling back needs no migration. |
 | `1.1.0` | Adds no schema. Moves the verified Harness cohort to `0.1.0-rc.7` and advances the pinned registry snapshot to `2026-08-18T00:00:00.000Z`. | v1.0.0 is verified against the rc.6 cohort. Durable state is identical, but the two cohorts are not meant to be mixed: roll the profile back to rc.6 alongside the plugin. |
+| `1.1.1` | Adds no schema. Documentation only: adds the registry install path. | v1.1.0 is the same artifact and behaves identically. |
 
 The DSH JSONL format and Workspace domain belong to Harness rc.6 rather than this plugin. This project does not claim cross-Harness migration support. Upgrade the plugin and Harness cohort as separate changes, never in one recovery window.
 
@@ -76,7 +77,7 @@ Prepare and verify a sibling checkout before downtime. Replace the example paths
 set -Eeuo pipefail
 
 target_checkout_input='/srv/dsh-plugin-lark-next'
-target_tag='v1.1.0'
+target_tag='v1.1.1'
 
 case "$target_checkout_input" in /*) ;; *) exit 1 ;; esac
 test ! -e "$target_checkout_input"
@@ -230,8 +231,9 @@ Prepare the destination with the exact rc.6 cohort, one Node.js line supported b
 
 Every rollback target older than v0.9.2 restores the previous Card payload contract. Feishu can reject its approval card at creation, making the protected call unavailable while remaining fail-closed; this shared behavior is in addition to the target-specific state consequences below.
 
-| Rollback target from v1.1.0 | State handling |
+| Rollback target from v1.1.1 | State handling |
 | --- | --- |
+| v1.1.0 | Identical code and durable state; documentation only. |
 | v1.0.0 | Identical durable state and configuration. Return the Harness profile to the `0.1.0-rc.6` cohort as part of the same rollback; a mixed cohort is not a supported combination. |
 | v0.9.20 | Identical configuration and durable state. |
 | v0.9.19 | Same durable state and same effective configuration; `/task` disappears from the in-chat help. |
