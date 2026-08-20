@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-lark",
   "description": "Feishu/Lark bridge for DeepSeek Harness with execution cards, structured input, approved artifacts, and reliable notifications",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "LPX-E5BD8",
   "type": "module",
   "repository": {

@@ -80,7 +80,13 @@ Direct host peers are pinned to this baseline, and every DSH package in the reso
 
 ## Install
 
-Clone the repository, build it, and add the checkout to a Harness profile:
+Install the published package into a Harness profile:
+
+```sh
+dsh plugin --profile web add dsh-plugin-lark
+```
+
+Or build from a checkout, which is what the release gates exercise:
 
 ```sh
 git clone https://github.com/LPX-E5BD8/dsh-plugin-lark.git
@@ -92,7 +98,7 @@ dsh plugin --profile web add .
 
 The `dsh plugin` installation and operational procedures in this README remain verified on the Ubuntu/Linux gate. The macOS gate verifies the packaged module only; it does not establish stock Web-profile deployment support.
 
-Keep the checkout in place while the profile uses it. An npm registry release is not required.
+The registry package and the GitHub Release archive for a given version are the same artifact: the release gates pack it once, verify it as an independent consumer, and publish that exact archive. [Release provenance](#release-provenance) covers verifying it before use. When installing from a checkout instead, keep that checkout in place while the profile uses it.
 
 Before replacing that checkout or rolling back a state-bearing release, follow the cold-snapshot and schema boundaries in [UPGRADING.md](./UPGRADING.md). A plugin downgrade is not automatically a durable-state downgrade.
 
@@ -113,7 +119,7 @@ Download and verify a release package with GitHub CLI:
 ```sh
 set -eu
 
-version='1.1.0'
+version='1.1.1'
 repository='LPX-E5BD8/dsh-plugin-lark'
 archive="dsh-plugin-lark-${version}.tgz"
 tag="v${version}"

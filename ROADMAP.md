@@ -255,6 +255,11 @@ Every milestone through 1.1 is implemented. The 1.0 section records what that re
 - Carry every configurable option in the bundled patch that both READMEs present as its defaults, and gate that against drift.
 - Give conversation policy, channel ownership, parallel tasks, and document handoff their own security boundaries and credential-backed smoke steps.
 
+## 1.1.1 — Registry install path
+
+- Document installing the published registry package alongside building from a checkout, now that a release reaches the registry.
+- State that the registry package and the GitHub Release archive for a version are the same packed, independently verified artifact.
+
 ## 1.1.0 — Harness rc.7 cohort
 
 - Move the verified baseline to the `0.1.0-rc.7` Harness cohort, re-running the same Linux and macOS package/runtime gates rather than claiming the cohort untested.
